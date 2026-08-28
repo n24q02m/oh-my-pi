@@ -15,6 +15,9 @@ import {
 } from "../../src/launch/remote-transport";
 
 const TOKEN = "test-wire-token";
+// Windows exposes no O_NOFOLLOW primitive here; cert/key reads fail closed.
+const tlsFileTest = process.platform === "win32" ? it.skip : it;
+const brokerFileTest = process.platform === "win32" ? it.skip : it;
 
 async function privateTempDir(prefix: string): Promise<string> {
 	const base = process.platform === "win32" ? os.homedir() : os.tmpdir();
@@ -230,104 +233,214 @@ describe("native remote transport sockets", () => {
 		}
 	}, 15_000);
 
-	it("serves TLS, discovers only a certificate fingerprint, and pins it after trust failure", async () => {
-		const fixture = await writeTlsFixture();
-		const target = { transport: "tls" as const, host: "127.0.0.1", port: await freePort() };
-		let server: DaemonNativeRemoteServer | undefined;
-		try {
-			server = await createDaemonNativeServer(
-				{ target, certFile: fixture.certFile, keyFile: fixture.keyFile },
-				_socket => undefined,
-				{ limits: { globalMaxAttempts: 8, sourceMaxAttempts: 8, windowMs: 1_000 } },
-			);
-			if (!server.fingerprint256) throw new Error("TLS server did not expose a certificate fingerprint");
-			expect(server.discovery.fingerprint256).toBe(server.fingerprint256);
-			expect(JSON.stringify(server.discovery)).not.toContain(TOKEN);
-			const pinnedTarget = { ...target, fingerprint256: server.fingerprint256 };
-			const socket = await connectDaemonNativeRemote(pinnedTarget, { timeoutMs: 1_000 });
-			socket.destroy();
-			await waitForClose(socket);
-		} finally {
-			await closeNativeServer(server);
-			await fs.rm(fixture.directory, { recursive: true, force: true });
-		}
-	}, 15_000);
-	it("rejects a mismatched TLS certificate fingerprint", async () => {
-		const fixture = await writeTlsFixture();
-		const target = { transport: "tls" as const, host: "127.0.0.1", port: await freePort() };
-		let server: DaemonNativeRemoteServer | undefined;
-		try {
-			server = await createDaemonNativeServer(
-				{ target, certFile: fixture.certFile, keyFile: fixture.keyFile },
-				_socket => undefined,
-			);
-			await expect(
-				connectDaemonNativeRemote({ ...target, fingerprint256: "00".repeat(32) }, { timeoutMs: 1_000 }),
-			).rejects.toThrow(/fingerprint/i);
-		} finally {
-			await closeNativeServer(server);
-			await fs.rm(fixture.directory, { recursive: true, force: true });
-		}
-	}, 15_000);
+	it.skipIf(process.platform !== "win32")(
+		"fails closed when Windows lacks reparse-safe nofollow",
+		async () => {
+			const fixture = await writeTlsFixture();
+			const target = { transport: "tls" as const, host: "127.0.0.1", port: await freePort() };
+			try {
+				await expect(
+					createDaemonNativeServer(
+						{ target, certFile: fixture.certFile, keyFile: fixture.keyFile },
+						_socket => undefined,
+					),
+				).rejects.toThrow(/O_NOFOLLOW is unavailable/u);
+			} finally {
+				await fs.rm(fixture.directory, { recursive: true, force: true });
+			}
+		},
+		15_000,
+	);
 
-	it("accounts for pre-handshake TLS sockets and completes close", async () => {
-		const fixture = await writeTlsFixture();
+	it.skipIf(process.platform !== "win32")(
+		"fails closed when Windows lacks reparse-safe nofollow for broker tokens",
+		async () => {
+			const projectDir = await privateTempDir("omp-native-token-project-");
+			const runtimeRoot = await privateTempDir("omp-native-token-runtime-");
+			const runtimeDir = path.join(runtimeRoot, "runtime");
+			await fs.mkdir(runtimeDir, { recursive: true });
+			await fs.writeFile(path.join(runtimeDir, "broker.token"), TOKEN, { mode: 0o600 });
+			try {
+				await expect(
+					createDaemonBrokerClient(projectDir, {
+						runtimeDir,
+						target: { transport: "tcp", host: "127.0.0.1", port: 1 },
+					}),
+				).rejects.toThrow(/O_NOFOLLOW is unavailable/u);
+			} finally {
+				await fs.rm(projectDir, { recursive: true, force: true });
+				await fs.rm(runtimeRoot, { recursive: true, force: true });
+			}
+		},
+		15_000,
+	);
+
+	tlsFileTest(
+		"serves TLS, discovers only a certificate fingerprint, and pins it after trust failure",
+		async () => {
+			const fixture = await writeTlsFixture();
+			const target = { transport: "tls" as const, host: "127.0.0.1", port: await freePort() };
+			let server: DaemonNativeRemoteServer | undefined;
+			try {
+				server = await createDaemonNativeServer(
+					{ target, certFile: fixture.certFile, keyFile: fixture.keyFile },
+					_socket => undefined,
+					{ limits: { globalMaxAttempts: 8, sourceMaxAttempts: 8, windowMs: 1_000 } },
+				);
+				if (!server.fingerprint256) throw new Error("TLS server did not expose a certificate fingerprint");
+				expect(server.discovery.fingerprint256).toBe(server.fingerprint256);
+				expect(JSON.stringify(server.discovery)).not.toContain(TOKEN);
+				const pinnedTarget = { ...target, fingerprint256: server.fingerprint256 };
+				const socket = await connectDaemonNativeRemote(pinnedTarget, { timeoutMs: 1_000 });
+				socket.destroy();
+				await waitForClose(socket);
+			} finally {
+				await closeNativeServer(server);
+				await fs.rm(fixture.directory, { recursive: true, force: true });
+			}
+		},
+		15_000,
+	);
+	tlsFileTest(
+		"rejects a mismatched TLS certificate fingerprint",
+		async () => {
+			const fixture = await writeTlsFixture();
+			const target = { transport: "tls" as const, host: "127.0.0.1", port: await freePort() };
+			let server: DaemonNativeRemoteServer | undefined;
+			try {
+				server = await createDaemonNativeServer(
+					{ target, certFile: fixture.certFile, keyFile: fixture.keyFile },
+					_socket => undefined,
+				);
+				await expect(
+					connectDaemonNativeRemote({ ...target, fingerprint256: "00".repeat(32) }, { timeoutMs: 1_000 }),
+				).rejects.toThrow(/fingerprint/i);
+			} finally {
+				await closeNativeServer(server);
+				await fs.rm(fixture.directory, { recursive: true, force: true });
+			}
+		},
+		15_000,
+	);
+
+	tlsFileTest(
+		"accounts for pre-handshake TLS sockets and completes close",
+		async () => {
+			const fixture = await writeTlsFixture();
+			const target = { transport: "tls" as const, host: "127.0.0.1", port: await freePort() };
+			let server: DaemonNativeRemoteServer | undefined;
+			let raw: net.Socket | undefined;
+			try {
+				server = await createDaemonNativeServer(
+					{ target, certFile: fixture.certFile, keyFile: fixture.keyFile },
+					_socket => undefined,
+				);
+				raw = net.createConnection({ host: target.host, port: target.port });
+				if (!raw) throw new Error("TLS test socket was not created");
+				const { promise: connected, resolve, reject } = Promise.withResolvers<void>();
+				raw.once("connect", resolve);
+				raw.once("error", reject);
+				await connected;
+				await Promise.race([
+					server.close(),
+					Bun.sleep(1_000).then(() => {
+						throw new Error("native TLS server close timed out with a pending handshake");
+					}),
+				]);
+				await waitForClose(raw);
+			} finally {
+				raw?.destroy();
+				await closeNativeServer(server);
+				await fs.rm(fixture.directory, { recursive: true, force: true });
+			}
+		},
+		15_000,
+	);
+
+	tlsFileTest(
+		"keeps a live TLS connection past the handshake deadline and cleans up",
+		async () => {
+			const fixture = await writeTlsFixture();
+			const target = { transport: "tls" as const, host: "127.0.0.1", port: await freePort() };
+			let server: DaemonNativeRemoteServer | undefined;
+			let client: net.Socket | undefined;
+			try {
+				const accepted = Promise.withResolvers<net.Socket>();
+				server = await createDaemonNativeServer(
+					{ target, certFile: fixture.certFile, keyFile: fixture.keyFile },
+					socket => accepted.resolve(socket),
+				);
+				if (!server.fingerprint256) throw new Error("TLS server did not expose a certificate fingerprint");
+				client = await connectDaemonNativeRemote(
+					{ ...target, fingerprint256: server.fingerprint256 },
+					{ timeoutMs: 2_000 },
+				);
+				const acceptedSocket = await accepted.promise;
+				const { promise: deadline, resolve: resolveDeadline } = Promise.withResolvers<void>();
+				setTimeout(resolveDeadline, 2_250);
+				await deadline;
+				expect(client.destroyed).toBe(false);
+				expect(acceptedSocket.destroyed).toBe(false);
+				client.destroy();
+				expect(client.destroyed).toBe(true);
+			} finally {
+				client?.destroy();
+				await closeNativeServer(server);
+				await fs.rm(fixture.directory, { recursive: true, force: true });
+			}
+		},
+		15_000,
+	);
+
+	it("aborts an in-flight native TLS connect 50ms after a handshake stall", async () => {
 		const target = { transport: "tls" as const, host: "127.0.0.1", port: await freePort() };
-		let server: DaemonNativeRemoteServer | undefined;
-		let raw: net.Socket | undefined;
+		const accepted = Promise.withResolvers<void>();
+		let stalledSocket: net.Socket | undefined;
+		const stalledServer = net.createServer(socket => {
+			stalledSocket = socket;
+			accepted.resolve();
+		});
+		const { promise: listening, resolve: resolveListening, reject: rejectListening } = Promise.withResolvers<void>();
+		stalledServer.once("error", rejectListening);
+		stalledServer.listen({ host: target.host, port: target.port }, resolveListening);
+		await listening;
+		const projectDir = await privateTempDir("omp-native-tls-stall-project-");
+		let client: DaemonBrokerClient | undefined;
 		try {
-			server = await createDaemonNativeServer(
-				{ target, certFile: fixture.certFile, keyFile: fixture.keyFile },
-				_socket => undefined,
-			);
-			raw = net.createConnection({ host: target.host, port: target.port });
-			if (!raw) throw new Error("TLS test socket was not created");
-			const { promise: connected, resolve, reject } = Promise.withResolvers<void>();
-			raw.once("connect", resolve);
-			raw.once("error", reject);
-			await connected;
-			await Promise.race([
-				server.close(),
-				Bun.sleep(1_000).then(() => {
-					throw new Error("native TLS server close timed out with a pending handshake");
+			client = await createDaemonBrokerClient(projectDir, { target, token: TOKEN, connectTimeoutMs: 10_000 });
+			const connecting = client.request({ op: "ping" }).then(
+				() => ({ status: "resolved" as const }),
+				error => ({
+					status: "rejected" as const,
+					error: error instanceof Error ? error : new Error(String(error)),
 				}),
-			]);
-			await waitForClose(raw);
-		} finally {
-			raw?.destroy();
-			await closeNativeServer(server);
-			await fs.rm(fixture.directory, { recursive: true, force: true });
-		}
-	}, 15_000);
-
-	it("keeps a live TLS connection past the handshake deadline and cleans up", async () => {
-		const fixture = await writeTlsFixture();
-		const target = { transport: "tls" as const, host: "127.0.0.1", port: await freePort() };
-		let server: DaemonNativeRemoteServer | undefined;
-		let client: net.Socket | undefined;
-		try {
-			const accepted = Promise.withResolvers<net.Socket>();
-			server = await createDaemonNativeServer(
-				{ target, certFile: fixture.certFile, keyFile: fixture.keyFile },
-				socket => accepted.resolve(socket),
 			);
-			if (!server.fingerprint256) throw new Error("TLS server did not expose a certificate fingerprint");
-			client = await connectDaemonNativeRemote(
-				{ ...target, fingerprint256: server.fingerprint256 },
-				{ timeoutMs: 2_000 },
-			);
-			const acceptedSocket = await accepted.promise;
-			const { promise: deadline, resolve: resolveDeadline } = Promise.withResolvers<void>();
-			setTimeout(resolveDeadline, 2_250);
-			await deadline;
-			expect(client.destroyed).toBe(false);
-			expect(acceptedSocket.destroyed).toBe(false);
-			client.destroy();
-			expect(client.destroyed).toBe(true);
+			const { promise: acceptedOrTimedOut, resolve: resolveAcceptedOrTimedOut } = Promise.withResolvers<boolean>();
+			const acceptTimer = setTimeout(() => resolveAcceptedOrTimedOut(false), 1_000);
+			accepted.promise.then(() => resolveAcceptedOrTimedOut(true));
+			expect(await acceptedOrTimedOut).toBe(true);
+			clearTimeout(acceptTimer);
+			await Bun.sleep(50);
+			const closedAt = Date.now();
+			client.close();
+			const { promise: connectOutcomeTimeout, resolve: resolveConnectOutcomeTimeout } = Promise.withResolvers<{
+				status: "timeout";
+			}>();
+			const connectTimer = setTimeout(() => resolveConnectOutcomeTimeout({ status: "timeout" }), 500);
+			const outcome = await Promise.race([connecting, connectOutcomeTimeout]);
+			clearTimeout(connectTimer);
+			expect(outcome.status).toBe("rejected");
+			if (outcome.status === "rejected") expect(outcome.error.message).toMatch(/abort|closed/i);
+			expect(Date.now() - closedAt).toBeLessThan(500);
 		} finally {
-			client?.destroy();
-			await closeNativeServer(server);
-			await fs.rm(fixture.directory, { recursive: true, force: true });
+			client?.close();
+			stalledSocket?.destroy();
+			if (stalledServer.listening) {
+				const { promise: closed, resolve: resolveClosed, reject: rejectClosed } = Promise.withResolvers<void>();
+				stalledServer.close(error => (error ? rejectClosed(error) : resolveClosed()));
+				await closed;
+			}
+			await fs.rm(projectDir, { recursive: true, force: true });
 		}
 	}, 15_000);
 
@@ -383,48 +496,52 @@ describe("native remote transport sockets", () => {
 		}
 	});
 
-	it("serves the local endpoint and native endpoint concurrently", async () => {
-		const projectDir = await privateTempDir("omp-native-concurrent-project-");
-		const runtimeRoot = await privateTempDir("omp-native-concurrent-runtime-");
-		const runtimeDir = path.join(runtimeRoot, "runtime");
-		await fs.mkdir(runtimeDir, { recursive: true });
-		await fs.writeFile(path.join(runtimeDir, "broker.token"), TOKEN, { mode: 0o600 });
-		const target = { transport: "tcp" as const, host: "127.0.0.1" as const, port: await freePort() };
-		const endpoint = daemonBrokerEndpoint(projectDir, runtimeDir);
-		const savedProject = process.env.OMP_DAEMON_PROJECT_DIR;
-		const savedRuntime = process.env.OMP_DAEMON_RUNTIME_DIR;
-		const savedGrace = process.env.OMP_DAEMON_IDLE_GRACE_MS;
-		let brokerPromise: Promise<void> | undefined;
-		let localSocket: net.Socket | undefined;
-		let nativeSocket: net.Socket | undefined;
-		try {
-			process.env.OMP_DAEMON_PROJECT_DIR = projectDir;
-			process.env.OMP_DAEMON_RUNTIME_DIR = runtimeDir;
-			process.env.OMP_DAEMON_IDLE_GRACE_MS = "200";
-			brokerPromise = startDaemonBrokerFromEnvironment({ nativeServer: { target } });
-			localSocket = await connectEndpoint(endpoint);
-			nativeSocket = await connectNativeEndpoint(target);
-			const [localResponse, nativeResponse] = await Promise.all([sendPing(localSocket), sendPing(nativeSocket)]);
-			const expected = expect.objectContaining({
-				ok: true,
-				result: expect.objectContaining({ op: "ping", projectDir }),
-			});
-			expect(localResponse).toEqual(expected);
-			expect(nativeResponse).toEqual(expected);
-		} finally {
-			localSocket?.destroy();
-			nativeSocket?.destroy();
-			await brokerPromise?.catch(() => undefined);
-			if (savedProject === undefined) delete process.env.OMP_DAEMON_PROJECT_DIR;
-			else process.env.OMP_DAEMON_PROJECT_DIR = savedProject;
-			if (savedRuntime === undefined) delete process.env.OMP_DAEMON_RUNTIME_DIR;
-			else process.env.OMP_DAEMON_RUNTIME_DIR = savedRuntime;
-			if (savedGrace === undefined) delete process.env.OMP_DAEMON_IDLE_GRACE_MS;
-			else process.env.OMP_DAEMON_IDLE_GRACE_MS = savedGrace;
-			await fs.rm(projectDir, { recursive: true, force: true });
-			await fs.rm(runtimeRoot, { recursive: true, force: true });
-		}
-	}, 15_000);
+	brokerFileTest(
+		"serves the local endpoint and native endpoint concurrently",
+		async () => {
+			const projectDir = await privateTempDir("omp-native-concurrent-project-");
+			const runtimeRoot = await privateTempDir("omp-native-concurrent-runtime-");
+			const runtimeDir = path.join(runtimeRoot, "runtime");
+			await fs.mkdir(runtimeDir, { recursive: true });
+			await fs.writeFile(path.join(runtimeDir, "broker.token"), TOKEN, { mode: 0o600 });
+			const target = { transport: "tcp" as const, host: "127.0.0.1" as const, port: await freePort() };
+			const endpoint = daemonBrokerEndpoint(projectDir, runtimeDir);
+			const savedProject = process.env.OMP_DAEMON_PROJECT_DIR;
+			const savedRuntime = process.env.OMP_DAEMON_RUNTIME_DIR;
+			const savedGrace = process.env.OMP_DAEMON_IDLE_GRACE_MS;
+			let brokerPromise: Promise<void> | undefined;
+			let localSocket: net.Socket | undefined;
+			let nativeSocket: net.Socket | undefined;
+			try {
+				process.env.OMP_DAEMON_PROJECT_DIR = projectDir;
+				process.env.OMP_DAEMON_RUNTIME_DIR = runtimeDir;
+				process.env.OMP_DAEMON_IDLE_GRACE_MS = "200";
+				brokerPromise = startDaemonBrokerFromEnvironment({ nativeServer: { target } });
+				localSocket = await connectEndpoint(endpoint);
+				nativeSocket = await connectNativeEndpoint(target);
+				const [localResponse, nativeResponse] = await Promise.all([sendPing(localSocket), sendPing(nativeSocket)]);
+				const expected = expect.objectContaining({
+					ok: true,
+					result: expect.objectContaining({ op: "ping", projectDir }),
+				});
+				expect(localResponse).toEqual(expected);
+				expect(nativeResponse).toEqual(expected);
+			} finally {
+				localSocket?.destroy();
+				nativeSocket?.destroy();
+				await brokerPromise?.catch(() => undefined);
+				if (savedProject === undefined) delete process.env.OMP_DAEMON_PROJECT_DIR;
+				else process.env.OMP_DAEMON_PROJECT_DIR = savedProject;
+				if (savedRuntime === undefined) delete process.env.OMP_DAEMON_RUNTIME_DIR;
+				else process.env.OMP_DAEMON_RUNTIME_DIR = savedRuntime;
+				if (savedGrace === undefined) delete process.env.OMP_DAEMON_IDLE_GRACE_MS;
+				else process.env.OMP_DAEMON_IDLE_GRACE_MS = savedGrace;
+				await fs.rm(projectDir, { recursive: true, force: true });
+				await fs.rm(runtimeRoot, { recursive: true, force: true });
+			}
+		},
+		15_000,
+	);
 	it("bounds client response and line buffering", async () => {
 		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-native-response-project-"));
 		const target = { transport: "tcp" as const, host: "127.0.0.1" as const, port: await freePort() };
@@ -447,44 +564,48 @@ describe("native remote transport sockets", () => {
 		}
 	});
 
-	it("bounds unauthenticated native broker guesses", async () => {
-		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-native-auth-project-"));
-		const runtimeRoot = await privateTempDir("omp-native-auth-runtime-");
-		const runtimeDir = path.join(runtimeRoot, "runtime");
-		await fs.mkdir(runtimeDir, { recursive: true });
-		await fs.writeFile(path.join(runtimeDir, "broker.token"), TOKEN, { mode: 0o600 });
-		const target = { transport: "tcp" as const, host: "127.0.0.1" as const, port: await freePort() };
-		const savedProject = process.env.OMP_DAEMON_PROJECT_DIR;
-		const savedRuntime = process.env.OMP_DAEMON_RUNTIME_DIR;
-		const savedGrace = process.env.OMP_DAEMON_IDLE_GRACE_MS;
-		let brokerPromise: Promise<void> | undefined;
-		let attacker: net.Socket | undefined;
-		try {
-			process.env.OMP_DAEMON_PROJECT_DIR = projectDir;
-			process.env.OMP_DAEMON_RUNTIME_DIR = runtimeDir;
-			process.env.OMP_DAEMON_IDLE_GRACE_MS = "200";
-			brokerPromise = startDaemonBrokerFromEnvironment({ nativeServer: { target } });
-			attacker = await connectNativeEndpoint(target);
-			attacker.resume();
-			const badRequest = `${JSON.stringify({ id: "guess", token: "wrong", operation: { op: "ping" } })}\n`;
-			attacker.write(badRequest.repeat(4));
-			await waitForClose(attacker);
-			attacker = undefined;
-			await brokerPromise;
-			brokerPromise = undefined;
-		} finally {
-			attacker?.destroy();
-			await brokerPromise?.catch(() => undefined);
-			if (savedProject === undefined) delete process.env.OMP_DAEMON_PROJECT_DIR;
-			else process.env.OMP_DAEMON_PROJECT_DIR = savedProject;
-			if (savedRuntime === undefined) delete process.env.OMP_DAEMON_RUNTIME_DIR;
-			else process.env.OMP_DAEMON_RUNTIME_DIR = savedRuntime;
-			if (savedGrace === undefined) delete process.env.OMP_DAEMON_IDLE_GRACE_MS;
-			else process.env.OMP_DAEMON_IDLE_GRACE_MS = savedGrace;
-			await fs.rm(runtimeRoot, { recursive: true, force: true });
-			await fs.rm(projectDir, { recursive: true, force: true });
-		}
-	}, 15_000);
+	brokerFileTest(
+		"bounds unauthenticated native broker guesses",
+		async () => {
+			const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-native-auth-project-"));
+			const runtimeRoot = await privateTempDir("omp-native-auth-runtime-");
+			const runtimeDir = path.join(runtimeRoot, "runtime");
+			await fs.mkdir(runtimeDir, { recursive: true });
+			await fs.writeFile(path.join(runtimeDir, "broker.token"), TOKEN, { mode: 0o600 });
+			const target = { transport: "tcp" as const, host: "127.0.0.1" as const, port: await freePort() };
+			const savedProject = process.env.OMP_DAEMON_PROJECT_DIR;
+			const savedRuntime = process.env.OMP_DAEMON_RUNTIME_DIR;
+			const savedGrace = process.env.OMP_DAEMON_IDLE_GRACE_MS;
+			let brokerPromise: Promise<void> | undefined;
+			let attacker: net.Socket | undefined;
+			try {
+				process.env.OMP_DAEMON_PROJECT_DIR = projectDir;
+				process.env.OMP_DAEMON_RUNTIME_DIR = runtimeDir;
+				process.env.OMP_DAEMON_IDLE_GRACE_MS = "200";
+				brokerPromise = startDaemonBrokerFromEnvironment({ nativeServer: { target } });
+				attacker = await connectNativeEndpoint(target);
+				attacker.resume();
+				const badRequest = `${JSON.stringify({ id: "guess", token: "wrong", operation: { op: "ping" } })}\n`;
+				attacker.write(badRequest.repeat(4));
+				await waitForClose(attacker);
+				attacker = undefined;
+				await brokerPromise;
+				brokerPromise = undefined;
+			} finally {
+				attacker?.destroy();
+				await brokerPromise?.catch(() => undefined);
+				if (savedProject === undefined) delete process.env.OMP_DAEMON_PROJECT_DIR;
+				else process.env.OMP_DAEMON_PROJECT_DIR = savedProject;
+				if (savedRuntime === undefined) delete process.env.OMP_DAEMON_RUNTIME_DIR;
+				else process.env.OMP_DAEMON_RUNTIME_DIR = savedRuntime;
+				if (savedGrace === undefined) delete process.env.OMP_DAEMON_IDLE_GRACE_MS;
+				else process.env.OMP_DAEMON_IDLE_GRACE_MS = savedGrace;
+				await fs.rm(runtimeRoot, { recursive: true, force: true });
+				await fs.rm(projectDir, { recursive: true, force: true });
+			}
+		},
+		15_000,
+	);
 
 	it("does not spawn or fall back to a local broker after a remote error", async () => {
 		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-native-remote-project-"));

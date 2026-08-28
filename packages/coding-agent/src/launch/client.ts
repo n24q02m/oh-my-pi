@@ -29,7 +29,13 @@ const MAX_RESPONSE_BUFFER_BYTES = 32 * 1024 * 1024;
 const MAX_RESPONSE_LINE_BYTES = 26 * 1024 * 1024;
 const TOKEN_FILE = "broker.token";
 const MAX_TOKEN_BYTES = 16 * 1024;
-const NOFOLLOW_FLAG = (nodeFs.constants as Record<string, number>).O_NOFOLLOW ?? 0;
+function requireNoFollowFlag(label: string): number {
+	const noFollowFlag = (nodeFs.constants as { O_NOFOLLOW?: number }).O_NOFOLLOW;
+	if (noFollowFlag === undefined || noFollowFlag === 0) {
+		throw new Error(`Native ${label} cannot be read safely: O_NOFOLLOW is unavailable on ${process.platform}`);
+	}
+	return noFollowFlag;
+}
 const BROKER_SPAWN_OPTIONS = resolveDaemonSpawnOptions({
 	platform: process.platform,
 	hostHasInheritableConsole: hostHasInheritableConsole(),
@@ -111,7 +117,8 @@ async function readExistingToken(runtimeDir: string): Promise<string> {
 	await assertNativePathSafe(tokenPath, { privateFinal: true, privateParent: true });
 	let handle: fs.FileHandle | undefined;
 	try {
-		handle = await fs.open(tokenPath, nodeFs.constants.O_RDONLY | NOFOLLOW_FLAG);
+		const noFollowFlag = requireNoFollowFlag("daemon broker token");
+		handle = await fs.open(tokenPath, nodeFs.constants.O_RDONLY | noFollowFlag);
 		const stat = await handle.stat();
 		if (!stat.isFile()) throw new Error("Native daemon broker token must be a regular file");
 		if (process.platform !== "win32" && (stat.mode & 0o077) !== 0)
@@ -203,6 +210,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	readonly #completionSubscriptionId = crypto.randomUUID();
 	#socket: net.Socket | undefined;
 	#connectPromise: Promise<void> | undefined;
+	#nativeConnectAbortController: AbortController | undefined;
 	#buffer = "";
 	#closed = false;
 	#completionReconnectTimer: NodeJS.Timeout | undefined;
@@ -274,6 +282,9 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		this.#closed = true;
 		clearTimeout(this.#completionReconnectTimer);
 		this.#completionReconnectTimer = undefined;
+		const nativeConnectAbortController = this.#nativeConnectAbortController;
+		this.#nativeConnectAbortController = undefined;
+		nativeConnectAbortController?.abort();
 		this.#socket?.destroy();
 		this.#completionSinks.clear();
 		this.#preservedCompletionOwners.clear();
@@ -342,7 +353,20 @@ class SocketDaemonClient implements DaemonBrokerClient {
 
 	async #connectOnce(): Promise<void> {
 		if (this.#target) {
-			this.#bindSocket(await connectDaemonNativeRemote(this.#target, { timeoutMs: this.#connectTimeoutMs }));
+			const connectAbortController = new AbortController();
+			this.#nativeConnectAbortController = connectAbortController;
+			try {
+				this.#bindSocket(
+					await connectDaemonNativeRemote(this.#target, {
+						timeoutMs: this.#connectTimeoutMs,
+						signal: connectAbortController.signal,
+					}),
+				);
+			} finally {
+				if (this.#nativeConnectAbortController === connectAbortController) {
+					this.#nativeConnectAbortController = undefined;
+				}
+			}
 			return;
 		}
 		try {

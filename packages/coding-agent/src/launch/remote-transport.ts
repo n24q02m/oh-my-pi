@@ -21,7 +21,6 @@ const DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS = 2_000;
 const MAX_TLS_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_SOURCE_BUCKETS = 1_024;
 const SOURCE_BUCKET_SWEEP_MS = 60_000;
-const NOFOLLOW_FLAG = (fs.constants as Record<string, number>).O_NOFOLLOW ?? 0;
 
 const TLS_VALIDATION_ERRORS = new Set([
 	"CERT_HAS_EXPIRED",
@@ -122,9 +121,16 @@ function runWindowsAclProbe(specs: readonly NativePathSafetySpec[]): Promise<voi
 	return promise;
 }
 
+function requireNoFollowFlag(label: string): number {
+	const noFollowFlag = (fs.constants as { O_NOFOLLOW?: number }).O_NOFOLLOW;
+	if (noFollowFlag === undefined || noFollowFlag === 0) {
+		throw new Error(`Native ${label} cannot be read safely: O_NOFOLLOW is unavailable on ${process.platform}`);
+	}
+	return noFollowFlag;
+}
 function assertPosixDirectoryChain(directory: string, label: string, skipFinal = false): void {
 	const directoryFlag = (fs.constants as Record<string, number>).O_DIRECTORY ?? 0;
-	const noFollowFlag = (fs.constants as Record<string, number>).O_NOFOLLOW ?? 0;
+	const noFollowFlag = requireNoFollowFlag(`${label} path`);
 	let current = path.resolve(directory);
 	for (;;) {
 		if (!(skipFinal && current === path.resolve(directory))) {
@@ -218,10 +224,11 @@ function privateFileModeIsSafe(stat: fs.Stats): boolean {
 
 async function readBoundedFile(filePath: string, label: string, privateFile: boolean): Promise<Buffer> {
 	if (!filePath) throw new Error(`Native TLS ${label} path is required`);
-	await assertNativePathSafe(filePath, { privateFinal: privateFile });
+	await assertNativePathSafe(filePath, { privateFinal: privateFile, privateParent: true });
 	let handle: fs.promises.FileHandle | undefined;
 	try {
-		handle = await fsp.open(filePath, fs.constants.O_RDONLY | NOFOLLOW_FLAG);
+		const noFollowFlag = requireNoFollowFlag(`TLS ${label}`);
+		handle = await fsp.open(filePath, fs.constants.O_RDONLY | noFollowFlag);
 		const stat = await handle.stat();
 		if (!stat.isFile()) throw new Error(`Native TLS ${label} must be a regular file`);
 		if (privateFile && !privateFileModeIsSafe(stat)) {
