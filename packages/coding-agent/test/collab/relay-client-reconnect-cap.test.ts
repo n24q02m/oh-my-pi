@@ -56,6 +56,14 @@ function latestWebSocket(): ReconnectWebSocket {
 	return ws;
 }
 
+function advanceToRetry(delay: number): void {
+	const before = ReconnectWebSocket.instances.length;
+	vi.advanceTimersByTime(delay - 1);
+	expect(ReconnectWebSocket.instances).toHaveLength(before);
+	vi.advanceTimersByTime(1);
+	expect(ReconnectWebSocket.instances).toHaveLength(before + 1);
+}
+
 describe("CollabSocket bounded reconnect", () => {
 	afterEach(() => {
 		globalThis.WebSocket = ORIGINAL_WEBSOCKET;
@@ -75,7 +83,7 @@ describe("CollabSocket bounded reconnect", () => {
 		for (const delay of RECONNECT_DELAYS_MS) {
 			latestWebSocket().drop(1006, "temporary outage");
 			expect(closes.at(-1)).toEqual(["temporary outage", true]);
-			vi.runOnlyPendingTimers();
+			advanceToRetry(delay);
 		}
 
 		latestWebSocket().drop(1006, "temporary outage");
@@ -93,18 +101,23 @@ describe("CollabSocket bounded reconnect", () => {
 		socket.onClose = (reason, willReconnect) => closes.push([reason, willReconnect]);
 
 		socket.connect();
-		latestWebSocket().open();
-		latestWebSocket().drop(1006, "temporary outage");
-		vi.runOnlyPendingTimers();
-		latestWebSocket().open();
-		latestWebSocket().drop(1006, "temporary outage");
-		vi.runOnlyPendingTimers();
+		for (const delay of RECONNECT_DELAYS_MS.slice(0, -1)) {
+			latestWebSocket().drop(1006, "temporary outage");
+			expect(closes.at(-1)).toEqual(["temporary outage", true]);
+			advanceToRetry(delay);
+		}
 
-		expect(closes).toEqual([
-			["temporary outage", true],
-			["temporary outage", true],
-		]);
-		expect(ReconnectWebSocket.instances).toHaveLength(3);
+		latestWebSocket().open();
+		for (const delay of RECONNECT_DELAYS_MS) {
+			latestWebSocket().drop(1006, "temporary outage");
+			expect(closes.at(-1)).toEqual(["temporary outage", true]);
+			advanceToRetry(delay);
+		}
+
+		latestWebSocket().drop(1006, "temporary outage");
+		expect(closes.at(-1)).toEqual(["temporary outage", false]);
+		expect(closes).toHaveLength(10);
+		expect(ReconnectWebSocket.instances).toHaveLength(10);
 	});
 
 	it("does not reconnect after an intentional close", () => {
