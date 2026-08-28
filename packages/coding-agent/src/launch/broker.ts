@@ -1,3 +1,4 @@
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -16,6 +17,7 @@ import {
 	DAEMON_PTY_ROWS,
 	DAEMON_RUNTIME_DIR_ENV,
 	type DaemonCompletionNotification,
+	type DaemonNativeServerOptions,
 	type DaemonOperation,
 	type DaemonReadySpec,
 	type DaemonRpcResult,
@@ -27,7 +29,9 @@ import {
 	parseDaemonSpec,
 	parseDaemonWireMessage,
 	parseDaemonWireRequest,
+	validateDaemonBrokerToken,
 } from "./protocol";
+import { assertNativePathSafe, createDaemonNativeServer, type DaemonNativeRemoteServer } from "./remote-transport";
 import { resolveDaemonSpawnOptions } from "./spawn-options";
 import { renderTerminalOutput } from "./terminal-output";
 
@@ -36,6 +40,9 @@ const MAX_REQUEST_BYTES = 1024 * 1024;
 const MAX_LOG_BYTES = 25 * 1024 * 1024;
 const LOG_READ_BYTES = 2 * 1024 * 1024;
 const READINESS_BUFFER_CHARS = 64 * 1024;
+const REMOTE_AUTH_TIMEOUT_MS = 10_000;
+const REMOTE_AUTH_MAX_ATTEMPTS = 3;
+const REMOTE_AUTH_MAX_BYTES = 64 * 1024;
 const RESTART_MAX_DELAY_MS = 30_000;
 const RESTART_BACKOFF_BASE_MS = 1_000;
 /**
@@ -45,6 +52,16 @@ const RESTART_BACKOFF_BASE_MS = 1_000;
  */
 const MAX_TERMINAL_DAEMONS_LISTED = 10;
 const TOKEN_FILE = "broker.token";
+const MAX_NATIVE_TOKEN_BYTES = 16 * 1024;
+function nativeNoFollowFlag(label: string): number | undefined {
+	// Windows fallback is paired with ACL/reparse preflight and post-read handle identity checks.
+	const noFollowFlag = (nodeFs.constants as { O_NOFOLLOW?: number }).O_NOFOLLOW;
+	if (noFollowFlag === undefined || noFollowFlag === 0) {
+		if (process.platform === "win32") return undefined;
+		throw new Error(`Native ${label} cannot be read safely: O_NOFOLLOW is unavailable on ${process.platform}`);
+	}
+	return noFollowFlag;
+}
 const PID_FILE = "broker.pid";
 const META_FILE = "meta.json";
 const LOG_FILE = "output.log";
@@ -104,6 +121,48 @@ interface DaemonLogRead {
 
 function quoteShellArg(value: string): string {
 	return `'${value.replaceAll("'", `'\\''`)}'`;
+}
+
+async function readNativeBrokerToken(runtimeDir: string): Promise<string> {
+	const tokenPath = path.join(runtimeDir, TOKEN_FILE);
+	await assertNativePathSafe(tokenPath, { privateFinal: true, privateParent: true });
+	let handle: fs.FileHandle | undefined;
+	try {
+		const noFollowFlag = nativeNoFollowFlag("daemon broker token");
+		let openFlags = nodeFs.constants.O_RDONLY;
+		if (noFollowFlag !== undefined) openFlags |= noFollowFlag;
+		handle = await fs.open(tokenPath, openFlags);
+		const stat = await handle.stat();
+		if (!stat.isFile()) throw new Error("Native daemon broker token must be a regular file");
+		if (process.platform !== "win32" && (stat.mode & 0o077) !== 0)
+			throw new Error("Native daemon broker token must not be readable by group or other users");
+		if (stat.size > MAX_NATIVE_TOKEN_BYTES)
+			throw new Error("Native daemon broker token file exceeds the 16 KiB limit");
+		const buffer = Buffer.allocUnsafe(MAX_NATIVE_TOKEN_BYTES + 1);
+		let offset = 0;
+		for (;;) {
+			const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+			if (bytesRead === 0) break;
+			offset += bytesRead;
+			if (offset > MAX_NATIVE_TOKEN_BYTES)
+				throw new Error("Native daemon broker token file exceeds the 16 KiB limit");
+		}
+		const token = buffer.subarray(0, offset).toString("utf8").trim();
+		if (!token) throw new Error("Daemon broker token is empty");
+		const currentStat = await fs.stat(tokenPath);
+		if (currentStat.dev !== stat.dev || currentStat.ino !== stat.ino) {
+			throw new Error("Native daemon broker token path changed while reading");
+		}
+		await assertNativePathSafe(tokenPath, { privateFinal: true, privateParent: true });
+		return validateDaemonBrokerToken(token);
+	} catch (error) {
+		if (error instanceof Error && /^Native daemon broker token/u.test(error.message)) throw error;
+		throw new Error(
+			`Native daemon broker token is not safely readable: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
 }
 
 function terminalState(state: DaemonSnapshot["state"]): boolean {
@@ -353,6 +412,7 @@ class DaemonBroker {
 	readonly #token: string;
 	readonly #idleGraceMs: number;
 	readonly #restartBackoffBaseMs: number;
+	readonly #nativeServerOptions: DaemonNativeServerOptions | undefined;
 	readonly #records = new Map<string, ManagedDaemon>();
 	/**
 	 * Names reserved by an in-flight `start` before its record lands in
@@ -370,6 +430,7 @@ class DaemonBroker {
 	readonly #finished = Promise.withResolvers<void>();
 	readonly #sockets = new Set<net.Socket>();
 	#server: net.Server | undefined;
+	#nativeServer: DaemonNativeRemoteServer | undefined;
 	#idleTimer: NodeJS.Timeout | undefined;
 	#shuttingDown = false;
 
@@ -379,6 +440,7 @@ class DaemonBroker {
 		token: string,
 		idleGraceMs: number,
 		restartBackoffBaseMs: number,
+		nativeServerOptions?: DaemonNativeServerOptions,
 	) {
 		this.#projectDir = projectDir;
 		this.#runtimeDir = runtimeDir;
@@ -386,19 +448,40 @@ class DaemonBroker {
 		this.#token = token;
 		this.#idleGraceMs = idleGraceMs;
 		this.#restartBackoffBaseMs = restartBackoffBaseMs;
+		this.#nativeServerOptions = nativeServerOptions;
 	}
 
 	async run(): Promise<void> {
 		await this.#recoverRecords();
-		if (process.platform !== "win32") await fs.rm(this.#endpoint, { force: true });
-		const server = net.createServer(socket => this.#accept(socket));
-		this.#server = server;
-		const { promise: listening, resolve, reject } = Promise.withResolvers<void>();
-		server.once("listening", resolve);
-		server.once("error", reject);
-		server.listen(this.#endpoint);
-		await listening;
-		if (process.platform !== "win32") await fs.chmod(this.#endpoint, 0o600);
+		try {
+			if (process.platform !== "win32") await fs.rm(this.#endpoint, { force: true });
+			const localServer = net.createServer(socket => this.#accept(socket, false));
+			this.#server = localServer;
+			const { promise: listening, resolve, reject } = Promise.withResolvers<void>();
+			localServer.once("listening", resolve);
+			localServer.once("error", reject);
+			localServer.listen(this.#endpoint);
+			await listening;
+			if (process.platform !== "win32") await fs.chmod(this.#endpoint, 0o600);
+			if (this.#nativeServerOptions) {
+				this.#nativeServer = await createDaemonNativeServer(this.#nativeServerOptions, socket =>
+					this.#accept(socket, true),
+				);
+			}
+		} catch (error) {
+			for (const socket of this.#sockets) socket.destroy();
+			this.#sockets.clear();
+			const nativeServer = this.#nativeServer;
+			this.#nativeServer = undefined;
+			await nativeServer?.close().catch(() => undefined);
+			const localServer = this.#server;
+			this.#server = undefined;
+			if (localServer?.listening) {
+				await new Promise<void>(resolve => localServer.close(() => resolve()));
+			}
+			if (process.platform !== "win32") await fs.rm(this.#endpoint, { force: true });
+			throw error;
+		}
 		this.#scheduleIdleShutdown();
 		await this.#finished.promise;
 	}
@@ -419,21 +502,36 @@ class DaemonBroker {
 		for (const socket of this.#sockets) socket.destroy();
 		this.#sockets.clear();
 		this.#clients.clear();
-		if (this.#server) {
-			const { promise, resolve } = Promise.withResolvers<void>();
-			this.#server.close(() => resolve());
-			await promise;
+		const nativeServer = this.#nativeServer;
+		this.#nativeServer = undefined;
+		await nativeServer?.close();
+		const localServer = this.#server;
+		this.#server = undefined;
+		if (localServer?.listening) {
+			await new Promise<void>(resolve => localServer.close(() => resolve()));
 		}
 		if (process.platform !== "win32") await fs.rm(this.#endpoint, { force: true });
 		this.#finished.resolve();
 	}
 
-	#accept(socket: net.Socket): void {
+	#accept(socket: net.Socket, remote = false): void {
 		this.#sockets.add(socket);
+		const isRemote = remote;
 		let authenticated = false;
+		let authenticationAttempts = 0;
+		let unauthenticatedBytes = 0;
 		let buffer = "";
+		const authenticationTimer = isRemote ? setTimeout(() => socket.destroy(), REMOTE_AUTH_TIMEOUT_MS) : undefined;
+		authenticationTimer?.unref();
 		socket.setEncoding("utf8");
 		socket.on("data", chunk => {
+			if (isRemote && !authenticated) {
+				unauthenticatedBytes += Buffer.byteLength(chunk, "utf8");
+				if (unauthenticatedBytes > REMOTE_AUTH_MAX_BYTES) {
+					socket.destroy(new Error("Remote daemon authentication data exceeds size limit"));
+					return;
+				}
+			}
 			buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
 			if (Buffer.byteLength(buffer, "utf8") > MAX_REQUEST_BYTES) {
 				socket.destroy(new Error("Daemon broker request exceeds size limit"));
@@ -445,9 +543,17 @@ class DaemonBroker {
 				const line = buffer.slice(0, newline);
 				buffer = buffer.slice(newline + 1);
 				if (!line) continue;
+				if (isRemote && !authenticated) {
+					authenticationAttempts += 1;
+					if (authenticationAttempts >= REMOTE_AUTH_MAX_ATTEMPTS) {
+						socket.destroy(new Error("Remote daemon authentication attempt limit exceeded"));
+						return;
+					}
+				}
 				void this.#handleLine(socket, line, () => {
 					if (authenticated) return;
 					authenticated = true;
+					clearTimeout(authenticationTimer);
 					this.#clients.add(socket);
 					clearTimeout(this.#idleTimer);
 					this.#idleTimer = undefined;
@@ -458,6 +564,7 @@ class DaemonBroker {
 			// Socket closure performs client accounting.
 		});
 		socket.on("close", () => {
+			clearTimeout(authenticationTimer);
 			this.#sockets.delete(socket);
 			if (!authenticated) return;
 			this.#clients.delete(socket);
@@ -1376,6 +1483,8 @@ class DaemonBroker {
 export interface DaemonBrokerStartOptions {
 	/** Base of the exponential child-restart backoff. */
 	restartBackoffBaseMs?: number;
+	/** Optional native TCP/TLS listener; omitted preserves the local socket endpoint. */
+	nativeServer?: DaemonNativeServerOptions;
 }
 
 /** Start the detached project or global daemon broker selected by the CLI worker host. */
@@ -1412,9 +1521,27 @@ export async function startDaemonBrokerFromEnvironment(options: DaemonBrokerStar
 			error: error instanceof Error ? error.message : String(error),
 		});
 	});
-	const token = (await Bun.file(path.join(runtimeDir, TOKEN_FILE)).text()).trim();
-	if (!token) throw new Error("Daemon broker token is empty");
-	const broker = new DaemonBroker(projectDir, runtimeDir, token, idleGraceMs, restartBackoffBaseMs);
+	let token: string;
+	try {
+		token = options.nativeServer
+			? await readNativeBrokerToken(runtimeDir)
+			: validateDaemonBrokerToken((await Bun.file(path.join(runtimeDir, TOKEN_FILE)).text()).trim());
+	} catch (error) {
+		await releaseBrokerLease(lease);
+		throw error;
+	}
+	if (!token) {
+		await releaseBrokerLease(lease);
+		throw new Error("Daemon broker token is empty");
+	}
+	const broker = new DaemonBroker(
+		projectDir,
+		runtimeDir,
+		token,
+		idleGraceMs,
+		restartBackoffBaseMs,
+		options.nativeServer,
+	);
 	const cancelCleanup = postmortem.register("daemon-broker", () => broker.shutdown());
 	try {
 		await broker.run();
