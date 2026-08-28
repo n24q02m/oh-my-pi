@@ -405,6 +405,76 @@ describe("native remote transport sockets", () => {
 		}
 	}, 15_000);
 
+	it("aborts a stalled native TLS request when its caller signal fires", async () => {
+		const target = { transport: "tls" as const, host: "127.0.0.1", port: await freePort() };
+		const accepted = Promise.withResolvers<void>();
+		let stalledSocket: net.Socket | undefined;
+		const stalledServer = net.createServer(socket => {
+			stalledSocket = socket;
+			accepted.resolve();
+		});
+		const { promise: listening, resolve: resolveListening, reject: rejectListening } = Promise.withResolvers<void>();
+		stalledServer.once("error", rejectListening);
+		stalledServer.listen({ host: target.host, port: target.port }, resolveListening);
+		await listening;
+		const projectDir = await privateTempDir("omp-native-tls-request-abort-project-");
+		let client: DaemonBrokerClient | undefined;
+		try {
+			client = await createDaemonBrokerClient(projectDir, { target, token: TOKEN, connectTimeoutMs: 10_000 });
+			const controller = new AbortController();
+			const connecting = client.request({ op: "ping" }, controller.signal).then(
+				() => ({ status: "resolved" as const }),
+				error => ({
+					status: "rejected" as const,
+					error: error instanceof Error ? error : new Error(String(error)),
+				}),
+			);
+			const unrelated = client.request({ op: "ping" }).then(
+				() => ({ status: "resolved" as const }),
+				error => ({
+					status: "rejected" as const,
+					error: error instanceof Error ? error : new Error(String(error)),
+				}),
+			);
+			const { promise: acceptedOrTimedOut, resolve: resolveAcceptedOrTimedOut } = Promise.withResolvers<boolean>();
+			const acceptTimer = setTimeout(() => resolveAcceptedOrTimedOut(false), 1_000);
+			accepted.promise.then(() => resolveAcceptedOrTimedOut(true));
+			expect(await acceptedOrTimedOut).toBe(true);
+			clearTimeout(acceptTimer);
+			await Bun.sleep(50);
+			const abortedAt = Date.now();
+			controller.abort();
+			const { promise: abortOutcomeTimeout, resolve: resolveAbortOutcomeTimeout } = Promise.withResolvers<{
+				status: "timeout";
+			}>();
+			const abortTimer = setTimeout(() => resolveAbortOutcomeTimeout({ status: "timeout" }), 500);
+			const outcome = await Promise.race([connecting, abortOutcomeTimeout]);
+			clearTimeout(abortTimer);
+			expect(outcome.status).toBe("rejected");
+			if (outcome.status === "rejected") expect(outcome.error.message).toMatch(/abort/i);
+			expect(Date.now() - abortedAt).toBeLessThan(500);
+			const { promise: unrelatedOutcomeTimeout, resolve: resolveUnrelatedOutcomeTimeout } = Promise.withResolvers<{
+				status: "timeout";
+			}>();
+			const unrelatedTimer = setTimeout(() => resolveUnrelatedOutcomeTimeout({ status: "timeout" }), 200);
+			const unrelatedOutcome = await Promise.race([unrelated, unrelatedOutcomeTimeout]);
+			clearTimeout(unrelatedTimer);
+			expect(unrelatedOutcome.status).toBe("timeout");
+			client.close();
+			const unrelatedAfterClose = await unrelated;
+			expect(unrelatedAfterClose.status).toBe("rejected");
+		} finally {
+			client?.close();
+			stalledSocket?.destroy();
+			if (stalledServer.listening) {
+				const { promise: closed, resolve: resolveClosed, reject: rejectClosed } = Promise.withResolvers<void>();
+				stalledServer.close(error => (error ? rejectClosed(error) : resolveClosed()));
+				await closed;
+			}
+			await fs.rm(projectDir, { recursive: true, force: true });
+		}
+	}, 15_000);
+
 	it("enforces the global admission bucket", async () => {
 		const target = { transport: "tcp" as const, host: "127.0.0.1" as const, port: await freePort() };
 		let accepted = 0;

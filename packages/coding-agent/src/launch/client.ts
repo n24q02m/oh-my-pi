@@ -51,6 +51,10 @@ interface PendingRequest {
 	removeAbort?: () => void;
 }
 
+interface ConnectWaiter {
+	removeAbort?: () => void;
+}
+
 /** Broker location and lifecycle overrides used by smoke tests and isolated consumers. */
 export interface DaemonBrokerClientOptions {
 	/** Runtime directory override; defaults to the project-scoped config path. */
@@ -220,6 +224,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	#socket: net.Socket | undefined;
 	#connectPromise: Promise<void> | undefined;
 	#nativeConnectAbortController: AbortController | undefined;
+	#connectWaiters = new Set<ConnectWaiter>();
 	#buffer = "";
 	#closed = false;
 	#completionReconnectTimer: NodeJS.Timeout | undefined;
@@ -237,7 +242,8 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	async request(operation: DaemonOperation, signal?: AbortSignal): Promise<DaemonRpcResult> {
 		if (this.#closed) throw new Error("Daemon broker client is closed");
 		if (signal?.aborted) throw new Error("Daemon broker request aborted");
-		await this.#connect();
+		await this.#connect(signal);
+		if (signal?.aborted) throw new Error("Daemon broker request aborted");
 		const socket = this.#socket;
 		if (!socket || socket.destroyed) throw new Error("Daemon broker socket is unavailable");
 
@@ -349,33 +355,55 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		this.#completionReconnectTimer.unref();
 	}
 
-	async #connect(): Promise<void> {
+	async #connect(signal?: AbortSignal): Promise<void> {
 		if (this.#socket && !this.#socket.destroyed) return;
-		if (this.#connectPromise) return this.#connectPromise;
-		this.#connectPromise = this.#connectOnce();
+		if (signal?.aborted) throw new Error("Daemon broker request aborted");
+		const waiter: ConnectWaiter = {};
+		this.#connectWaiters.add(waiter);
+		const connectPromise = this.#connectPromise ?? this.#startConnect();
 		try {
-			await this.#connectPromise;
+			if (!signal) {
+				await connectPromise;
+				return;
+			}
+			const { promise: aborted, reject } = Promise.withResolvers<void>();
+			const abort = (): void => {
+				if (!this.#connectWaiters.delete(waiter)) return;
+				reject(new Error("Daemon broker request aborted"));
+				if (this.#connectWaiters.size === 0) this.#nativeConnectAbortController?.abort();
+			};
+			waiter.removeAbort = () => signal.removeEventListener("abort", abort);
+			signal.addEventListener("abort", abort, { once: true });
+			if (signal.aborted) abort();
+			await Promise.race([connectPromise, aborted]);
 		} finally {
-			this.#connectPromise = undefined;
+			waiter.removeAbort?.();
+			this.#connectWaiters.delete(waiter);
 		}
 	}
 
-	async #connectOnce(): Promise<void> {
+	#startConnect(): Promise<void> {
+		if (this.#connectPromise) return this.#connectPromise;
+		const connectAbortController = this.#target ? new AbortController() : undefined;
+		this.#nativeConnectAbortController = connectAbortController;
+		let sharedPromise: Promise<void>;
+		sharedPromise = this.#connectOnce(connectAbortController?.signal).finally(() => {
+			if (this.#connectPromise !== sharedPromise) return;
+			this.#connectPromise = undefined;
+			this.#nativeConnectAbortController = undefined;
+		});
+		this.#connectPromise = sharedPromise;
+		return sharedPromise;
+	}
+
+	async #connectOnce(signal?: AbortSignal): Promise<void> {
 		if (this.#target) {
-			const connectAbortController = new AbortController();
-			this.#nativeConnectAbortController = connectAbortController;
-			try {
-				this.#bindSocket(
-					await connectDaemonNativeRemote(this.#target, {
-						timeoutMs: this.#connectTimeoutMs,
-						signal: connectAbortController.signal,
-					}),
-				);
-			} finally {
-				if (this.#nativeConnectAbortController === connectAbortController) {
-					this.#nativeConnectAbortController = undefined;
-				}
-			}
+			this.#bindSocket(
+				await connectDaemonNativeRemote(this.#target, {
+					timeoutMs: this.#connectTimeoutMs,
+					signal,
+				}),
+			);
 			return;
 		}
 		try {
