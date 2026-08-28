@@ -52,9 +52,11 @@ const RESTART_BACKOFF_BASE_MS = 1_000;
 const MAX_TERMINAL_DAEMONS_LISTED = 10;
 const TOKEN_FILE = "broker.token";
 const MAX_NATIVE_TOKEN_BYTES = 16 * 1024;
-function requireNoFollowFlag(label: string): number {
+function nativeNoFollowFlag(label: string): number | undefined {
+	// Windows fallback is paired with ACL/reparse preflight and post-read handle identity checks.
 	const noFollowFlag = (nodeFs.constants as { O_NOFOLLOW?: number }).O_NOFOLLOW;
 	if (noFollowFlag === undefined || noFollowFlag === 0) {
+		if (process.platform === "win32") return undefined;
 		throw new Error(`Native ${label} cannot be read safely: O_NOFOLLOW is unavailable on ${process.platform}`);
 	}
 	return noFollowFlag;
@@ -125,8 +127,10 @@ async function readNativeBrokerToken(runtimeDir: string): Promise<string> {
 	await assertNativePathSafe(tokenPath, { privateFinal: true, privateParent: true });
 	let handle: fs.FileHandle | undefined;
 	try {
-		const noFollowFlag = requireNoFollowFlag("daemon broker token");
-		handle = await fs.open(tokenPath, nodeFs.constants.O_RDONLY | noFollowFlag);
+		const noFollowFlag = nativeNoFollowFlag("daemon broker token");
+		let openFlags = nodeFs.constants.O_RDONLY;
+		if (noFollowFlag !== undefined) openFlags |= noFollowFlag;
+		handle = await fs.open(tokenPath, openFlags);
 		const stat = await handle.stat();
 		if (!stat.isFile()) throw new Error("Native daemon broker token must be a regular file");
 		if (process.platform !== "win32" && (stat.mode & 0o077) !== 0)
@@ -144,6 +148,11 @@ async function readNativeBrokerToken(runtimeDir: string): Promise<string> {
 		}
 		const token = buffer.subarray(0, offset).toString("utf8").trim();
 		if (!token) throw new Error("Daemon broker token is empty");
+		const currentStat = await fs.stat(tokenPath);
+		if (currentStat.dev !== stat.dev || currentStat.ino !== stat.ino) {
+			throw new Error("Native daemon broker token path changed while reading");
+		}
+		await assertNativePathSafe(tokenPath, { privateFinal: true, privateParent: true });
 		return token;
 	} catch (error) {
 		if (error instanceof Error && /^Native daemon broker token/u.test(error.message)) throw error;

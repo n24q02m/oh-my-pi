@@ -42,39 +42,50 @@ $specs = @($env:OMP_NATIVE_ACL_SPECS | ConvertFrom-Json)
 $currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $systemSid = 'S-1-5-18'
 $administratorsSid = 'S-1-5-32-544'
-$writeMask = [System.Security.AccessControl.FileSystemRights]::WriteData -bor [System.Security.AccessControl.FileSystemRights]::AppendData -bor [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor [System.Security.AccessControl.FileSystemRights]::WriteAttributes -bor [System.Security.AccessControl.FileSystemRights]::Delete -bor [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor [System.Security.AccessControl.FileSystemRights]::TakeOwnership -bor [System.Security.AccessControl.FileSystemRights]::FullControl
+$writeMask = [System.Security.AccessControl.FileSystemRights]::WriteData -bor [System.Security.AccessControl.FileSystemRights]::AppendData -bor [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor [System.Security.AccessControl.FileSystemRights]::WriteAttributes -bor [System.Security.AccessControl.FileSystemRights]::Delete -bor [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor [System.Security.AccessControl.FileSystemRights]::TakeOwnership
+$genericWriteMask = [int64]0x40000000
 foreach ($spec in $specs) {
   $target = [string]$spec.path
-  $item = Get-Item -LiteralPath $target -Force -ErrorAction Stop
+  $fullTarget = [System.IO.Path]::GetFullPath($target)
+  $rootPath = [System.IO.Path]::GetPathRoot($fullTarget)
+  $relative = $fullTarget.Substring($rootPath.Length)
+  $parts = @($relative -split '[\\\\/]' | Where-Object { $_ -ne '' })
+  $paths = @()
+  $prefix = $rootPath
+  foreach ($part in $parts) {
+    $prefix = [System.IO.Path]::Combine($prefix, [string]$part)
+    $paths += $prefix
+  }
+  if ($paths.Count -eq 0) { $paths = @($rootPath) }
   $wantDirectory = [bool]$spec.directory
-  if ($wantDirectory -and -not $item.PSIsContainer) { throw "Native path is not a directory: $target" }
-  if (-not $wantDirectory -and $item.PSIsContainer) { throw "Native path is not a file: $target" }
-  $cursor = $item
-  $depth = 0
+  $targetItem = Get-Item -LiteralPath $fullTarget -Force -ErrorAction Stop
+  if ($wantDirectory -and -not $targetItem.PSIsContainer) { throw "Native path is not a directory: $target" }
+  if (-not $wantDirectory -and $targetItem.PSIsContainer) { throw "Native path is not a file: $target" }
   $privateParent = [bool]$spec.privateParent
-  while ($null -ne $cursor) {
-    if (($cursor.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Native path contains a reparse point: $($cursor.FullName)" }
-    $acl = Get-Acl -LiteralPath $cursor.FullName -ErrorAction Stop
+  for ($index = $paths.Count - 1; $index -ge 0; $index--) {
+    $componentPath = [string]$paths[$index]
+    $component = Get-Item -LiteralPath $componentPath -Force -ErrorAction Stop
+    if (($component.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Native path contains a reparse point: $componentPath" }
+    $acl = Get-Acl -LiteralPath $componentPath -ErrorAction Stop
     try { $ownerSid = ([System.Security.Principal.NTAccount]$acl.Owner).Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { $ownerSid = [string]$acl.Owner }
+    $depth = $paths.Count - 1 - $index
     $strict = ($depth -eq 0 -and [bool]$spec.privateFinal) -or ($depth -eq 1 -and $privateParent)
     if ($strict -and $ownerSid -ne $currentSid) {
-      if ($depth -eq 0) { throw "Native private path is not owned by the current user: $($cursor.FullName)" }
-      throw "Native private parent is not owned by the current user: $($cursor.FullName)"
+      if ($depth -eq 0) { throw "Native private path is not owned by the current user: $componentPath" }
+      throw "Native private parent is not owned by the current user: $componentPath"
     }
     foreach ($entry in @($acl.Access)) {
       try { $sid = $entry.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { $sid = [string]$entry.IdentityReference.Value }
-      $rights = [System.Security.AccessControl.FileSystemRights]$entry.FileSystemRights
-      $write = (($rights -band $writeMask) -ne 0)
+      $rights = [int64]$entry.FileSystemRights
+      $write = (($rights -band $writeMask) -ne 0) -or (($rights -band $genericWriteMask) -ne 0)
       $trusted = $sid -eq $currentSid -or $sid -eq $systemSid -or $sid -eq $administratorsSid
       if ($strict) {
-        if ($entry.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { throw "Native private path has a deny ACL: $($cursor.FullName)" }
-        if (-not $trusted) { throw "Native private path has an untrusted ACL entry: $($cursor.FullName)" }
+        if ($entry.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { throw "Native private path has a deny ACL: $componentPath" }
+        if (-not $trusted) { throw "Native private path has an untrusted ACL entry: $componentPath" }
       } elseif ($write -and -not $trusted) {
-        throw "Native path parent is writable by an untrusted principal: $($cursor.FullName)"
+        throw "Native path parent is writable by an untrusted principal: $componentPath"
       }
     }
-    $depth += 1
-    $cursor = $cursor.Parent
   }
 }
 Write-Output 'OMP_NATIVE_ACL_OK'`;
@@ -121,16 +132,26 @@ function runWindowsAclProbe(specs: readonly NativePathSafetySpec[]): Promise<voi
 	return promise;
 }
 
-function requireNoFollowFlag(label: string): number {
+function nativeNoFollowFlag(label: string): number | undefined {
+	// Windows fallback is paired with ACL/reparse preflight and post-read handle identity checks.
 	const noFollowFlag = (fs.constants as { O_NOFOLLOW?: number }).O_NOFOLLOW;
 	if (noFollowFlag === undefined || noFollowFlag === 0) {
+		if (process.platform === "win32") return undefined;
 		throw new Error(`Native ${label} cannot be read safely: O_NOFOLLOW is unavailable on ${process.platform}`);
+	}
+	return noFollowFlag;
+}
+
+function assertPosixNoFollowFlag(label: string): number {
+	const noFollowFlag = nativeNoFollowFlag(label);
+	if (noFollowFlag === undefined) {
+		throw new Error(`Native ${label} cannot use the Windows reparse-safe fallback on POSIX`);
 	}
 	return noFollowFlag;
 }
 function assertPosixDirectoryChain(directory: string, label: string, skipFinal = false): void {
 	const directoryFlag = (fs.constants as Record<string, number>).O_DIRECTORY ?? 0;
-	const noFollowFlag = requireNoFollowFlag(`${label} path`);
+	const noFollowFlag = assertPosixNoFollowFlag(`${label} path`);
 	let current = path.resolve(directory);
 	for (;;) {
 		if (!(skipFinal && current === path.resolve(directory))) {
@@ -227,8 +248,10 @@ async function readBoundedFile(filePath: string, label: string, privateFile: boo
 	await assertNativePathSafe(filePath, { privateFinal: privateFile, privateParent: true });
 	let handle: fs.promises.FileHandle | undefined;
 	try {
-		const noFollowFlag = requireNoFollowFlag(`TLS ${label}`);
-		handle = await fsp.open(filePath, fs.constants.O_RDONLY | noFollowFlag);
+		const noFollowFlag = nativeNoFollowFlag(`TLS ${label}`);
+		let openFlags = fs.constants.O_RDONLY;
+		if (noFollowFlag !== undefined) openFlags |= noFollowFlag;
+		handle = await fsp.open(filePath, openFlags);
 		const stat = await handle.stat();
 		if (!stat.isFile()) throw new Error(`Native TLS ${label} must be a regular file`);
 		if (privateFile && !privateFileModeIsSafe(stat)) {
@@ -243,6 +266,11 @@ async function readBoundedFile(filePath: string, label: string, privateFile: boo
 			offset += bytesRead;
 			if (offset > MAX_TLS_FILE_BYTES) throw new Error(`Native TLS ${label} exceeds the 4 MiB limit`);
 		}
+		const currentStat = await fsp.stat(filePath);
+		if (currentStat.dev !== stat.dev || currentStat.ino !== stat.ino) {
+			throw new Error(`Native TLS ${label} path changed while reading`);
+		}
+		await assertNativePathSafe(filePath, { privateFinal: privateFile, privateParent: true });
 		return buffer.subarray(0, offset);
 	} catch (error) {
 		if (error instanceof Error && /^Native TLS /u.test(error.message)) throw error;
