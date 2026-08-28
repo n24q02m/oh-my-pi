@@ -30,7 +30,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionUiController } from "@oh-my-pi/pi-coding-agent/modes/controllers/extension-ui-controller";
 import type { InteractiveModeContext, InteractiveSelectorDialogOptions } from "@oh-my-pi/pi-coding-agent/modes/types";
-import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
+import { installInMemoryRelay, sendEmptyRecoveryFrames, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 // In-memory transport: shared FakeWebSocket + InMemoryRelay harness (see
 // ./helpers/in-memory-relay), same contract as the other collab tests.
@@ -162,7 +162,10 @@ async function makeHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarnes
 
 	const hostSocket = new CollabSocket({ wsUrl: `ws://localhost:8788/r/${roomId}`, role: "host", key: cryptoKey });
 	const hostOpen = Promise.withResolvers<void>();
+	let welcomeEpoch = 0;
 	const sendWelcome = (): void => {
+		const recoveryEpoch = ++welcomeEpoch;
+		const snapshotId = `ui-snapshot-${recoveryEpoch}`;
 		hostSocket.send({
 			t: "welcome",
 			proto: COLLAB_PROTO,
@@ -170,8 +173,11 @@ async function makeHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarnes
 			state: makeState(),
 			agents: [],
 			entryCount: 0,
+			snapshotId,
+			recoveryEpoch,
 			readOnly: opts?.readOnly ? true : undefined,
 		});
+		sendEmptyRecoveryFrames(hostSocket, snapshotId, recoveryEpoch);
 	};
 	hostSocket.onOpen = () => hostOpen.resolve();
 	hostSocket.onFrame = frame => {

@@ -7,9 +7,8 @@ import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/typ
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
+import { installInMemoryRelay, sendEmptyRecoveryFrames, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
-// The guest mirrors host EventBus traffic onto the local session and
 // observability buses. When an SDK embedder wires the SAME EventBus into both
 // slots, the mirror must emit each frame exactly once.
 
@@ -108,7 +107,10 @@ describe("collab guest bus mirror", () => {
 					state: makeState(),
 					agents: [],
 					entryCount: 0,
+					snapshotId: "bus-snapshot-1",
+					recoveryEpoch: 1,
 				} as CollabFrame);
+				sendEmptyRecoveryFrames(hostSocket, "bus-snapshot-1", 1);
 			}
 		};
 		hostSocket.connect();

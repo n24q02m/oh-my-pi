@@ -3,12 +3,17 @@
  *
  * Connects to a relay room, seals/opens AES-GCM frames, and reconnects with
  * exponential backoff on transient drops. Fatal relay close codes (room gone,
- * host conflict, room full) and decryption failures never reconnect.
+ * host conflict, room full) and unhandled decryption failures never reconnect;
+ * recovery callers can observe an authenticated-frame failure and retransmit.
  */
 import { logger } from "@oh-my-pi/pi-utils";
 import { open, seal } from "./crypto";
 import type { CollabFrame, RelayControlMessage } from "./protocol";
-import { packEnvelope, unpackEnvelope } from "./protocol";
+import { ENVELOPE_HEADER_LENGTH, packEnvelope, unpackEnvelope } from "./protocol";
+
+export const MAX_ENCRYPTED_COLLAB_FRAME_BYTES = 128 * 1024;
+const controlFrameEncoder = new TextEncoder();
+const pendingFrameEncoder = new TextEncoder();
 
 const FATAL_CLOSE_REASONS: Record<number, string> = {
 	4001: "room closed",
@@ -20,7 +25,25 @@ const FATAL_CLOSE_REASONS: Record<number, string> = {
 const BACKOFF_BASE_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
 /** Max enveloped frames buffered while a reconnect is pending; overflow is dropped. */
+const MAX_RECEIVE_QUEUE_FRAMES = 256;
+const MAX_RECEIVE_QUEUE_BYTES = 512 * 1024;
+const MAX_CONTROL_FRAME_BYTES = 64 * 1024;
 const MAX_PENDING_SENDS = 256;
+const MAX_PENDING_SEND_BYTES = 512 * 1024;
+const MAX_PENDING_GUEST_FRAME_BYTES = 512 * 1024;
+
+type PendingGuestFrame = { frame: CollabFrame; targetPeer: number; bytes: number };
+type PendingHandshake = Pick<PendingGuestFrame, "frame" | "targetPeer">;
+
+function serializedFrameBytes(frame: CollabFrame): number {
+	try {
+		const serialized = JSON.stringify(frame);
+		return serialized === undefined ? Number.POSITIVE_INFINITY : pendingFrameEncoder.encode(serialized).byteLength;
+	} catch {
+		return Number.POSITIVE_INFINITY;
+	}
+}
+
 const WS_BACKPRESSURE_THRESHOLD = 64 * 1024;
 const WS_BACKPRESSURE_DRAIN_THRESHOLD = 32 * 1024;
 const WS_BACKPRESSURE_DRAIN_RETRY_MS = 25;
@@ -37,6 +60,8 @@ export class CollabSocket {
 	onOpen?: () => void;
 	onFrame?: (frame: CollabFrame, fromPeer: number) => void;
 	onControl?: (msg: RelayControlMessage) => void;
+	/** Fires after a frame fails authentication; callers may keep the socket and request a retransmission. */
+	onCorruptFrame?: (fromPeer: number) => void;
 	/** Fires once per terminal close (intentional, fatal code, or bad key). willReconnect=true for transient drops that will retry. */
 	onClose?: (reason: string, willReconnect: boolean) => void;
 
@@ -53,9 +78,19 @@ export class CollabSocket {
 	#recvChain: Promise<void> = Promise.resolve();
 	/** Envelopes sealed while disconnected, flushed on the next open. */
 	#pendingSends: Uint8Array[] = [];
+	#pendingSendBytes = 0;
 
+	/** Guest application frames wait behind the authenticated hello on every connection. */
+	#guestHandshakePending = false;
+	#guestHandshakeFlushing = false;
+	#pendingGuestFrames: PendingGuestFrame[] = [];
+	#pendingGuestFrameBytes = 0;
+	#pendingHandshake: PendingHandshake | null = null;
+	#recvQueueCount = 0;
+	#recvQueueBytes = 0;
 	constructor(opts: CollabSocketOptions) {
 		this.#opts = opts;
+		this.#guestHandshakePending = opts.role === "guest";
 	}
 
 	get isOpen(): boolean {
@@ -65,53 +100,131 @@ export class CollabSocket {
 	connect(): void {
 		if (this.#ws || this.#retryTimer) return;
 		this.#closed = false;
+		this.#guestHandshakePending = this.#opts.role === "guest";
+		this.#guestHandshakeFlushing = false;
 		this.#attempt = 0;
 		this.#openSocket();
 	}
 
 	send(frame: CollabFrame, targetPeer = 0): void {
+		if (this.#opts.role === "guest" && (this.#guestHandshakePending || this.#guestHandshakeFlushing)) {
+			if (frame.t === "hello") this.#pendingHandshake = { frame, targetPeer };
+			else this.#enqueuePendingGuestFrame(frame, targetPeer);
+			return;
+		}
+		this.#queueFrame(frame, targetPeer);
+	}
+
+	#queueFrame(frame: CollabFrame, targetPeer: number, prioritize = false): void {
 		this.#sendChain = this.#sendChain
-			.then(async () => {
-				if (this.#closed) {
-					logger.debug("collab: dropping frame, socket closed", { t: frame.t });
-					return;
-				}
-				const openWs = this.#ws;
-				if (openWs && openWs.readyState === WebSocket.OPEN) this.#drainPendingSends(openWs);
-				const sealed = await seal(this.#opts.key, frame);
-				const envelope = packEnvelope(targetPeer, sealed);
-				const ws = this.#ws;
-				if (ws && ws.readyState === WebSocket.OPEN) {
-					if (this.#pendingSends.length > 0) {
-						this.#enqueuePendingSend(envelope, frame.t);
-						if (ws.bufferedAmount < WS_BACKPRESSURE_DRAIN_THRESHOLD) {
-							this.#drainPendingSends(ws);
-						} else {
-							this.#scheduleBackpressureDrain(ws);
-						}
-						return;
-					}
-					if (ws.bufferedAmount >= WS_BACKPRESSURE_THRESHOLD) {
-						this.#enqueuePendingSend(envelope, frame.t);
-						this.#scheduleBackpressureDrain(ws);
-						return;
-					}
-					ws.send(envelope);
-					return;
-				}
-				this.#enqueuePendingSend(envelope, frame.t);
-			})
+			.then(() => this.#sendFrame(frame, targetPeer, prioritize))
 			.catch((err: unknown) => {
 				logger.debug("collab: send failed", { error: String(err) });
 			});
 	}
 
+	async #sendFrame(frame: CollabFrame, targetPeer: number, prioritize = false, expectedWs?: WebSocket): Promise<void> {
+		if (this.#closed) {
+			logger.debug("collab: dropping frame, socket closed", { t: frame.t });
+			return;
+		}
+		const openWs = this.#ws;
+		if (expectedWs !== undefined && openWs !== expectedWs) return;
+		if (!prioritize && openWs && openWs.readyState === WebSocket.OPEN) this.#drainPendingSends(openWs);
+		const sealed = await seal(this.#opts.key, frame);
+		if (expectedWs !== undefined && (this.#ws !== expectedWs || expectedWs.readyState !== WebSocket.OPEN)) return;
+		if (sealed.byteLength + ENVELOPE_HEADER_LENGTH > MAX_ENCRYPTED_COLLAB_FRAME_BYTES) {
+			logger.warn("collab: refusing oversized encrypted frame", {
+				t: frame.t,
+				bytes: sealed.byteLength + ENVELOPE_HEADER_LENGTH,
+			});
+			return;
+		}
+		// Keep a frame tied to the socket that was open when its serialized seal began.
+		// If that socket was replaced meanwhile, queue the envelope for the new
+		// connection so a guest handshake cannot be bypassed by an old send-chain task.
+		const envelope = packEnvelope(targetPeer, sealed);
+		const ws = openWs;
+		if (ws && ws.readyState === WebSocket.OPEN) {
+			if (prioritize) {
+				ws.send(envelope);
+				return;
+			}
+			if (this.#pendingSends.length > 0) {
+				this.#enqueuePendingSend(envelope, frame.t);
+				if (ws.bufferedAmount < WS_BACKPRESSURE_DRAIN_THRESHOLD) this.#drainPendingSends(ws);
+				else this.#scheduleBackpressureDrain(ws);
+				return;
+			}
+			if (ws.bufferedAmount >= WS_BACKPRESSURE_THRESHOLD) {
+				this.#enqueuePendingSend(envelope, frame.t);
+				this.#scheduleBackpressureDrain(ws);
+				return;
+			}
+			ws.send(envelope);
+			return;
+		}
+		this.#enqueuePendingSend(envelope, frame.t);
+	}
+
+	#enqueuePendingGuestFrame(frame: CollabFrame, targetPeer: number): void {
+		const bytes = serializedFrameBytes(frame);
+		if (
+			!Number.isFinite(bytes) ||
+			bytes > MAX_PENDING_GUEST_FRAME_BYTES ||
+			this.#pendingGuestFrameBytes + bytes > MAX_PENDING_GUEST_FRAME_BYTES
+		) {
+			logger.warn("collab: dropping guest command, reconnect buffer byte limit reached", { t: frame.t, bytes });
+			return;
+		}
+		this.#pendingGuestFrames.push({ frame, targetPeer, bytes });
+		this.#pendingGuestFrameBytes += bytes;
+	}
+
+	#flushGuestHandshake(ws: WebSocket): void {
+		this.#guestHandshakeFlushing = true;
+		const handshake = this.#pendingHandshake;
+		this.#pendingHandshake = null;
+		this.#sendChain = this.#sendChain
+			.then(async () => {
+				if (this.#ws !== ws) return;
+				if (handshake) {
+					await this.#sendFrame(handshake.frame, handshake.targetPeer, true, ws);
+					if (this.#ws !== ws) return;
+				}
+				this.#drainPendingSends(ws);
+				while (this.#pendingGuestFrames.length > 0) {
+					if (this.#ws !== ws) return;
+					const pending = this.#pendingGuestFrames[0];
+					if (!pending) return;
+					await this.#sendFrame(pending.frame, pending.targetPeer, false, ws);
+					if (this.#ws !== ws) return;
+					this.#pendingGuestFrames.shift();
+					this.#pendingGuestFrameBytes -= pending.bytes;
+				}
+			})
+			.catch((err: unknown) => logger.debug("collab: guest handshake flush failed", { error: String(err) }))
+			.finally(() => {
+				if (this.#ws === ws) {
+					this.#guestHandshakeFlushing = false;
+					this.#guestHandshakePending = false;
+				}
+			});
+	}
+
 	#enqueuePendingSend(envelope: Uint8Array, frameType: CollabFrame["t"]): void {
-		if (this.#pendingSends.length >= MAX_PENDING_SENDS) {
-			logger.debug("collab: dropping frame, reconnect buffer full", { t: frameType });
+		if (
+			this.#pendingSends.length >= MAX_PENDING_SENDS ||
+			this.#pendingSendBytes + envelope.byteLength > MAX_PENDING_SEND_BYTES
+		) {
+			logger.debug("collab: dropping frame, reconnect buffer limit reached", {
+				t: frameType,
+				bytes: envelope.byteLength,
+			});
 			return;
 		}
 		this.#pendingSends.push(envelope);
+		this.#pendingSendBytes += envelope.byteLength;
 	}
 
 	#drainPendingSends(ws: WebSocket): void {
@@ -122,6 +235,7 @@ export class CollabSocket {
 		) {
 			const envelope = this.#pendingSends.shift();
 			if (!envelope) return;
+			this.#pendingSendBytes -= envelope.byteLength;
 			ws.send(envelope);
 		}
 	}
@@ -149,6 +263,26 @@ export class CollabSocket {
 		}
 	}
 
+	/** Force a transient reconnect, preserving queued guest commands. */
+	reconnect(): void {
+		if (this.#closed) return;
+		this.#clearRetry();
+		this.#clearBackpressureDrain();
+		this.#guestHandshakePending = this.#opts.role === "guest";
+		this.#guestHandshakeFlushing = false;
+		this.#pendingHandshake = null;
+		const ws = this.#ws;
+		this.#ws = null;
+		if (ws) {
+			try {
+				ws.close(1000);
+			} catch {
+				// already closing/closed
+			}
+		}
+		this.onClose?.("connection reset; reconnecting", true);
+		this.#scheduleRetry();
+	}
 	/** Intentional close: clears any retry timer, suppresses reconnect. A later connect() starts fresh. */
 	close(): void {
 		const hadActivity = this.#ws !== null || this.#retryTimer !== undefined;
@@ -156,7 +290,11 @@ export class CollabSocket {
 		this.#clearBackpressureDrain();
 		const wasClosed = this.#closed;
 		this.#closed = true;
+		this.#pendingGuestFrames.length = 0;
+		this.#pendingGuestFrameBytes = 0;
+		this.#pendingHandshake = null;
 		this.#pendingSends.length = 0;
+		this.#pendingSendBytes = 0;
 		const ws = this.#ws;
 		this.#ws = null;
 		if (ws) {
@@ -177,6 +315,11 @@ export class CollabSocket {
 		ws.onopen = () => {
 			if (this.#ws !== ws) return;
 			this.#attempt = 0;
+			if (this.#opts.role === "guest") {
+				this.onOpen?.();
+				this.#flushGuestHandshake(ws);
+				return;
+			}
 			if (this.#pendingSends.length > 0) {
 				this.#drainPendingSends(ws);
 				if (this.#pendingSends.length > 0) this.#scheduleBackpressureDrain(ws);
@@ -200,6 +343,11 @@ export class CollabSocket {
 
 	#handleMessage(ws: WebSocket, data: unknown): void {
 		if (typeof data === "string") {
+			if (controlFrameEncoder.encode(data).byteLength > MAX_CONTROL_FRAME_BYTES) {
+				logger.warn("collab: rejecting oversized control frame");
+				this.reconnect();
+				return;
+			}
 			try {
 				this.onControl?.(JSON.parse(data) as RelayControlMessage);
 			} catch {
@@ -209,8 +357,23 @@ export class CollabSocket {
 		}
 		const bytes = data instanceof ArrayBuffer ? new Uint8Array(data) : data instanceof Uint8Array ? data : null;
 		if (!bytes) return;
+		if (bytes.byteLength > MAX_ENCRYPTED_COLLAB_FRAME_BYTES) {
+			logger.warn("collab: rejecting oversized encrypted frame", { bytes: bytes.byteLength });
+			this.reconnect();
+			return;
+		}
 		const envelope = unpackEnvelope(bytes);
 		if (!envelope) return;
+		if (
+			this.#recvQueueCount >= MAX_RECEIVE_QUEUE_FRAMES ||
+			this.#recvQueueBytes + bytes.byteLength > MAX_RECEIVE_QUEUE_BYTES
+		) {
+			logger.warn("collab: inbound frame queue exceeded bound");
+			this.reconnect();
+			return;
+		}
+		this.#recvQueueCount++;
+		this.#recvQueueBytes += bytes.byteLength;
 		this.#recvChain = this.#recvChain
 			.then(async () => {
 				if (this.#ws !== ws) return;
@@ -218,6 +381,11 @@ export class CollabSocket {
 				try {
 					frame = await open(this.#opts.key, envelope.payload);
 				} catch {
+					if (this.onCorruptFrame) {
+						logger.debug("collab: ignoring corrupted frame", { peerId: envelope.peerId });
+						this.onCorruptFrame(envelope.peerId);
+						return;
+					}
 					this.#failFatal("bad key or corrupted frame");
 					return;
 				}
@@ -226,6 +394,10 @@ export class CollabSocket {
 			})
 			.catch((err: unknown) => {
 				logger.debug("collab: frame handler failed", { error: String(err) });
+			})
+			.finally(() => {
+				this.#recvQueueCount--;
+				this.#recvQueueBytes -= bytes.byteLength;
 			});
 	}
 
@@ -235,10 +407,17 @@ export class CollabSocket {
 		const fatalReason = FATAL_CLOSE_REASONS[code];
 		if (fatalReason !== undefined) {
 			this.#closed = true;
+			this.#pendingGuestFrames.length = 0;
+			this.#pendingGuestFrameBytes = 0;
+			this.#pendingHandshake = null;
 			this.#pendingSends.length = 0;
+			this.#pendingSendBytes = 0;
 			this.onClose?.(fatalReason, false);
 			return;
 		}
+		this.#guestHandshakePending = this.#opts.role === "guest";
+		this.#guestHandshakeFlushing = false;
+		this.#pendingHandshake = null;
 		this.onClose?.(reason || `connection lost (code ${code})`, true);
 		this.#scheduleRetry();
 	}
@@ -248,7 +427,11 @@ export class CollabSocket {
 		if (this.#closed) return;
 		this.#closed = true;
 		this.#clearRetry();
+		this.#pendingGuestFrames.length = 0;
+		this.#pendingGuestFrameBytes = 0;
+		this.#pendingHandshake = null;
 		this.#pendingSends.length = 0;
+		this.#pendingSendBytes = 0;
 		const ws = this.#ws;
 		this.#ws = null;
 		this.#clearBackpressureDrain();
@@ -263,6 +446,7 @@ export class CollabSocket {
 	}
 
 	#scheduleRetry(): void {
+		if (this.#closed || this.#retryTimer !== undefined) return;
 		const base = Math.min(BACKOFF_BASE_MS * 2 ** this.#attempt, BACKOFF_MAX_MS);
 		this.#attempt++;
 		const delay = base * (0.75 + Math.random() * 0.5);

@@ -7,6 +7,7 @@
  * control messages that carry no session data.
  */
 
+import { createHash } from "node:crypto";
 import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import type {
 	BusChannel,
@@ -42,6 +43,447 @@ export type {
 export { COLLAB_PROMPT_MESSAGE_TYPE, COLLAB_PROTO } from "@oh-my-pi/pi-wire";
 export { DEFAULT_RELAY_URL, ENVELOPE_HEADER_LENGTH, ROOM_ID_BYTES };
 
+/** Maximum number of encrypted chunks that may be outstanding at once. */
+export const SNAPSHOT_SEND_WINDOW = 4;
+/** Number of sends (initial send plus bounded retransmissions) before exhaustion. */
+export const SNAPSHOT_MAX_RETRIES = 4;
+/** Highest number of holes carried in one ACK. */
+export const SNAPSHOT_MAX_MISSING = 32;
+export const SNAPSHOT_INITIAL_HISTORY_ENTRIES = 128;
+export const SNAPSHOT_HISTORY_PAGE_ENTRIES = 128;
+export const SNAPSHOT_ACK_TIMEOUT_MS = 250;
+export const SNAPSHOT_MAX_RETAINED_TRANSFERS = 8;
+export const SNAPSHOT_RESUME_RETENTION_MS = 5 * 60 * 1000;
+/** Maximum unencrypted payload bytes carried by one recovery chunk. */
+export const SNAPSHOT_CHUNK_PAYLOAD_BYTES = 64 * 1024;
+/** Maximum number of retained payloads in one transfer. */
+export const SNAPSHOT_MAX_PAYLOAD_COUNT = 4096;
+/** Maximum decoded bytes retained by one snapshot transfer. */
+export const SNAPSHOT_MAX_TRANSFER_BYTES = 64 * 1024 * 1024;
+/** Maximum session entries retained in one snapshot history. */
+export const SNAPSHOT_MAX_ENTRY_COUNT = 16_384;
+export const SNAPSHOT_PAGE_MAX_RETRIES = 4;
+export const SNAPSHOT_PAGE_ACK_TIMEOUT_MS = 250;
+export const SNAPSHOT_MAX_SEEN_CURSORS = 256;
+
+export type SnapshotHello = {
+	t: "hello";
+	proto: number;
+	name: string;
+	writeToken?: string;
+	snapshotRecovery?: boolean;
+	resumeId?: string;
+	snapshotId?: string;
+	contiguousSeq?: number;
+	missing?: number[];
+	recoveryEpoch?: number;
+};
+
+export type SnapshotBeginFrame = {
+	t: "snapshot-begin";
+	snapshotId: string;
+	total: number;
+	entryCount?: number;
+	recoveryEpoch?: number;
+	resumeId?: string;
+	firstHistoryCursor?: string;
+	completionNonce?: string;
+};
+
+export type SnapshotChunkFrame = {
+	t: "snapshot-chunk";
+	snapshotId: string;
+	seq: number;
+	recoveryEpoch?: number;
+	total: number;
+	payload: string;
+	checksum: string;
+	/** Compatibility fields are empty/false for recovery chunks. */
+	entries: SessionEntry[];
+	final: boolean;
+};
+
+export type SnapshotAckFrame = {
+	recoveryEpoch?: number;
+	/** Set only after snapshot activation and carries the computed completion proof. */
+	complete?: boolean;
+	digest?: string;
+	completionProof?: string;
+	t: "snapshot-ack";
+	snapshotId: string;
+	contiguousSeq: number;
+	missing?: number[];
+};
+
+export type SnapshotEndFrame = {
+	t: "snapshot-end";
+	snapshotId: string;
+	nextHistoryCursor?: string;
+	recoveryEpoch?: number;
+	/** Digest of the complete initial payload, authenticated by the frame seal. */
+	checksum?: string;
+	completionNonce?: string;
+};
+
+export type SnapshotPageRequestFrame = {
+	t: "snapshot-page-request";
+	snapshotId: string;
+	cursor: string;
+	recoveryEpoch?: number;
+};
+
+export type SnapshotPageFrame = {
+	t: "snapshot-page";
+	snapshotId: string;
+	cursor: string;
+	nextCursor?: string;
+	payload: string;
+	recoveryEpoch?: number;
+	checksum: string;
+};
+
+export type SnapshotPageAckFrame = {
+	t: "snapshot-page-ack";
+	recoveryEpoch?: number;
+	snapshotId: string;
+	cursor: string;
+};
+export interface SnapshotPageSendResult {
+	frame?: SnapshotPageFrame;
+	complete: boolean;
+	exhausted: boolean;
+}
+
+/** Retry state for one paginated history response. */
+export class SnapshotPageSender {
+	readonly #frame: SnapshotPageFrame;
+	#attempts = 0;
+	#acked = false;
+
+	constructor(frame: SnapshotPageFrame) {
+		this.#frame = frame;
+	}
+
+	acknowledge(ack: SnapshotPageAckFrame): boolean {
+		if (ack.snapshotId !== this.#frame.snapshotId || ack.cursor !== this.#frame.cursor) return false;
+		this.#acked = true;
+		return true;
+	}
+
+	onTimeout(): SnapshotPageSendResult {
+		if (this.#acked) return { complete: true, exhausted: false };
+		if (this.#attempts >= SNAPSHOT_PAGE_MAX_RETRIES) return { complete: false, exhausted: true };
+		this.#attempts++;
+		return { frame: this.#frame, complete: false, exhausted: false };
+	}
+}
+
+export function encodeSnapshotPayload(payload: Uint8Array): string {
+	return Buffer.from(payload).toString("base64url");
+}
+
+export function decodeSnapshotPayload(payload: string): Uint8Array | null {
+	if (!/^[A-Za-z0-9_-]*$/.test(payload)) return null;
+	try {
+		return new Uint8Array(Buffer.from(payload, "base64url"));
+	} catch {
+		return null;
+	}
+}
+
+export function checksumSnapshotPayload(payload: Uint8Array): string {
+	return createHash("sha256").update(payload).digest("hex");
+}
+
+export function computeSnapshotCompletionProof(nonce: string, digest: string): string {
+	return createHash("sha256").update(`${nonce}:${digest}`).digest("hex");
+}
+
+export function serializeSnapshotEntries(entries: readonly SessionEntry[]): Uint8Array {
+	return new TextEncoder().encode(JSON.stringify(entries));
+}
+
+export function splitSnapshotPayload(payload: Uint8Array, maxBytes = SNAPSHOT_CHUNK_PAYLOAD_BYTES): Uint8Array[] {
+	if (!Number.isSafeInteger(maxBytes) || maxBytes <= 0)
+		throw new Error("snapshot payload limit must be a positive integer");
+	if (payload.byteLength === 0) return [new Uint8Array(0)];
+	const chunks: Uint8Array[] = [];
+	for (let offset = 0; offset < payload.byteLength; offset += maxBytes) {
+		chunks.push(payload.slice(offset, Math.min(offset + maxBytes, payload.byteLength)));
+	}
+	return chunks;
+}
+
+export interface SnapshotSendResult {
+	chunks: SnapshotChunkFrame[];
+	complete: boolean;
+	exhausted: boolean;
+}
+
+/**
+ * Pure ACK/window state for a single encrypted snapshot. Payloads stay in the
+ * host's source snapshot; only the bounded in-flight sequence set is mutable
+ * retransmission state.
+ */
+export class SnapshotSender {
+	readonly snapshotId: string;
+	/** Highest sequence number actually exposed by nextWindow(). */
+	#highestSentSeq = -1;
+	readonly total: number;
+	readonly #payloads: readonly Uint8Array[];
+	readonly #attempts = new Map<number, number>();
+	readonly #inFlight = new Set<number>();
+	#nextSeq = 0;
+	#contiguousSeq = -1;
+	/** Last ACK shape observed; identical ACK replays must not burn retries. */
+	#lastAckState: string | null = null;
+
+	constructor(snapshotId: string, payloads: readonly Uint8Array[]) {
+		if (!snapshotId) throw new Error("snapshot id is required");
+		if (payloads.length > SNAPSHOT_MAX_PAYLOAD_COUNT) throw new Error("snapshot payload count exceeds limit");
+		let totalBytes = 0;
+		for (const payload of payloads) {
+			if (payload.byteLength > SNAPSHOT_CHUNK_PAYLOAD_BYTES) throw new Error("snapshot payload chunk exceeds limit");
+			totalBytes += payload.byteLength;
+			if (totalBytes > SNAPSHOT_MAX_TRANSFER_BYTES) throw new Error("snapshot payload bytes exceed limit");
+		}
+		this.snapshotId = snapshotId;
+		this.#payloads = payloads;
+		this.total = payloads.length;
+	}
+
+	get contiguousSeq(): number {
+		return this.#contiguousSeq;
+	}
+
+	get inFlightCount(): number {
+		return this.#inFlight.size;
+	}
+
+	nextWindow(): SnapshotChunkFrame[] {
+		const chunks: SnapshotChunkFrame[] = [];
+		while (this.#inFlight.size < SNAPSHOT_SEND_WINDOW && this.#nextSeq < this.total) {
+			const seq = this.#nextSeq++;
+			this.#inFlight.add(seq);
+			chunks.push(this.#frame(seq));
+			this.#highestSentSeq = seq;
+		}
+		return chunks;
+	}
+
+	acknowledge(ack: SnapshotAckFrame, resendInFlight = false): SnapshotSendResult {
+		if (ack.snapshotId !== this.snapshotId || this.total === 0)
+			return { chunks: [], complete: this.total === 0, exhausted: false };
+		if (Number.isSafeInteger(ack.contiguousSeq) && ack.contiguousSeq >= this.#contiguousSeq) {
+			// ACKs may only advance through chunks that were actually exposed.
+			// A future claim cannot complete (or retire) an incomplete snapshot.
+			if (ack.contiguousSeq <= this.#highestSentSeq) {
+				this.#contiguousSeq = Math.min(ack.contiguousSeq, this.total - 1);
+				for (const seq of this.#inFlight) if (seq <= this.#contiguousSeq) this.#inFlight.delete(seq);
+			}
+		}
+		const missing = this.#boundedMissing(ack.missing);
+		const ackState = `${String(this.#contiguousSeq)}:${missing.join(",")}`;
+		const duplicateAck = !resendInFlight && this.#lastAckState === ackState;
+		this.#lastAckState = ackState;
+		const chunks: SnapshotChunkFrame[] = [];
+		for (const seq of resendInFlight ? [...this.#inFlight] : duplicateAck ? [] : missing) {
+			if (!this.#inFlight.has(seq)) continue;
+			if (!resendInFlight && !missing.includes(seq)) continue;
+			const retry = this.#retry(seq);
+			if (retry.exhausted) return { chunks: [], complete: false, exhausted: true };
+			chunks.push(retry.chunk!);
+		}
+		if (this.#contiguousSeq >= this.total - 1) return { chunks, complete: true, exhausted: false };
+		chunks.push(...this.nextWindow());
+		return { chunks, complete: false, exhausted: false };
+	}
+
+	onTimeout(): SnapshotSendResult {
+		if (this.#contiguousSeq >= this.total - 1) return { chunks: [], complete: true, exhausted: false };
+		if (this.#inFlight.size === 0) return { chunks: this.nextWindow(), complete: false, exhausted: false };
+		const chunks: SnapshotChunkFrame[] = [];
+		for (const seq of this.#inFlight) {
+			const retry = this.#retry(seq);
+			if (retry.exhausted) return { chunks: [], complete: false, exhausted: true };
+			chunks.push(retry.chunk!);
+		}
+		return { chunks, complete: false, exhausted: false };
+	}
+
+	#boundedMissing(missing: number[] | undefined): number[] {
+		if (!missing) return [];
+		const result: number[] = [];
+		for (const seq of missing) {
+			if (result.length >= SNAPSHOT_MAX_MISSING) break;
+			if (
+				Number.isSafeInteger(seq) &&
+				seq > this.#contiguousSeq &&
+				seq <= this.#highestSentSeq &&
+				seq < this.total &&
+				!result.includes(seq)
+			)
+				result.push(seq);
+		}
+		result.sort((a, b) => a - b);
+		return result;
+	}
+
+	#retry(seq: number): { chunk?: SnapshotChunkFrame; exhausted: boolean } {
+		const attempts = this.#attempts.get(seq) ?? 0;
+		if (attempts >= SNAPSHOT_MAX_RETRIES) return { exhausted: true };
+		this.#attempts.set(seq, attempts + 1);
+		return { chunk: this.#frame(seq), exhausted: false };
+	}
+
+	#frame(seq: number): SnapshotChunkFrame {
+		const payload = this.#payloads[seq];
+		if (!payload) throw new Error(`missing snapshot payload ${seq}`);
+		return {
+			t: "snapshot-chunk",
+			snapshotId: this.snapshotId,
+			seq,
+			total: this.total,
+			payload: encodeSnapshotPayload(payload),
+			checksum: checksumSnapshotPayload(payload),
+			entries: [],
+			final: false,
+		};
+	}
+}
+
+export type SnapshotReceiveResult = {
+	ack: SnapshotAckFrame;
+	accepted: boolean;
+	duplicate: boolean;
+	corrupt: boolean;
+};
+
+/** Guest-side deduplicating/reordering state for one snapshot ID. */
+export class SnapshotReceiver {
+	#snapshotId: string | null = null;
+	#total = 0;
+	#contiguousSeq = -1;
+	#bytes = 0;
+	readonly #chunks = new Map<number, Uint8Array>();
+	get snapshotId(): string | null {
+		return this.#snapshotId;
+	}
+
+	get total(): number {
+		return this.#total;
+	}
+
+	get contiguousSeq(): number {
+		return this.#contiguousSeq;
+	}
+
+	get receivedCount(): number {
+		return this.#chunks.size;
+	}
+
+	begin(frame: SnapshotBeginFrame): "new" | "resumed" | "replaced" {
+		if (!this.#snapshotId) {
+			this.#reset(frame);
+			return "new";
+		}
+		if (this.#snapshotId === frame.snapshotId && this.#total === frame.total) return "resumed";
+		this.#reset(frame);
+		return "replaced";
+	}
+
+	ack(extraMissing?: number): SnapshotAckFrame {
+		if (!this.#snapshotId) throw new Error("snapshot has not begun");
+		const missing: number[] = [];
+		if (extraMissing !== undefined && extraMissing > this.#contiguousSeq && extraMissing < this.#total)
+			missing.push(extraMissing);
+		for (
+			let seq = this.#contiguousSeq + 1;
+			seq < this.#highestReceived() && missing.length < SNAPSHOT_MAX_MISSING;
+			seq++
+		) {
+			if (!this.#chunks.has(seq) && !missing.includes(seq)) missing.push(seq);
+		}
+		return {
+			t: "snapshot-ack",
+			snapshotId: this.#snapshotId,
+			contiguousSeq: this.#contiguousSeq,
+			missing: missing.length > 0 ? missing : undefined,
+		};
+	}
+
+	accept(frame: SnapshotChunkFrame): SnapshotReceiveResult {
+		const invalidAck = this.ackFor(frame.snapshotId);
+		if (
+			frame.snapshotId !== this.#snapshotId ||
+			frame.total !== this.#total ||
+			!Number.isSafeInteger(frame.seq) ||
+			frame.seq < 0 ||
+			frame.seq >= this.#total
+		) {
+			return { ack: invalidAck, accepted: false, duplicate: false, corrupt: false };
+		}
+		const payload = decodeSnapshotPayload(frame.payload);
+		if (
+			!payload ||
+			checksumSnapshotPayload(payload) !== frame.checksum ||
+			payload.byteLength > SNAPSHOT_CHUNK_PAYLOAD_BYTES
+		) {
+			return { ack: this.ack(frame.seq), accepted: false, duplicate: false, corrupt: true };
+		}
+		const previous = this.#chunks.get(frame.seq);
+		if (previous) return { ack: this.ack(), accepted: false, duplicate: true, corrupt: false };
+		if (this.#bytes + payload.byteLength > SNAPSHOT_MAX_TRANSFER_BYTES) {
+			return { ack: this.ack(frame.seq), accepted: false, duplicate: false, corrupt: true };
+		}
+		this.#chunks.set(frame.seq, payload);
+		this.#bytes += payload.byteLength;
+		while (this.#chunks.has(this.#contiguousSeq + 1)) this.#contiguousSeq++;
+		return { ack: this.ack(), accepted: true, duplicate: false, corrupt: false };
+	}
+
+	assemble(): Uint8Array {
+		if (!this.#snapshotId || this.#chunks.size !== this.#total || this.#contiguousSeq !== this.#total - 1) {
+			throw new Error("snapshot is incomplete");
+		}
+		const length = [...this.#chunks.values()].reduce((sum, chunk) => sum + chunk.byteLength, 0);
+		const output = new Uint8Array(length);
+		let offset = 0;
+		for (let seq = 0; seq < this.#total; seq++) {
+			const chunk = this.#chunks.get(seq);
+			if (!chunk) throw new Error(`missing snapshot chunk ${seq}`);
+			output.set(chunk, offset);
+			offset += chunk.byteLength;
+		}
+		return output;
+	}
+
+	#reset(frame: SnapshotBeginFrame): void {
+		if (
+			!frame.snapshotId ||
+			!Number.isSafeInteger(frame.total) ||
+			frame.total < 0 ||
+			frame.total > SNAPSHOT_MAX_PAYLOAD_COUNT
+		)
+			throw new Error("invalid snapshot total");
+		this.#snapshotId = frame.snapshotId;
+		this.#total = frame.total;
+		this.#contiguousSeq = -1;
+		this.#bytes = 0;
+		this.#chunks.clear();
+	}
+
+	#highestReceived(): number {
+		let highest = this.#contiguousSeq;
+		for (const seq of this.#chunks.keys()) highest = Math.max(highest, seq);
+		return highest;
+	}
+
+	ackFor(snapshotId: string): SnapshotAckFrame {
+		return { t: "snapshot-ack", snapshotId, contiguousSeq: this.#contiguousSeq };
+	}
+}
+
 export type CollabParticipant = Participant;
 export type AgentSnapshot = WireAgentSnapshot;
 
@@ -61,46 +503,46 @@ export type CollabSessionState = SessionState & {
  * JSON skeleton (`WireFrame`); host-side frames carry the rich session types
  * that serialize into those shapes.
  */
+
 export type CollabFrame =
 	// guest -> host (hello/abort/agent-cmd/fetch-transcript/ui-response are taken verbatim from the wire grammar)
-	| Exclude<GuestFrame, { t: "prompt" }>
+	| Exclude<GuestFrame, { t: "prompt" | "hello" }>
+	| SnapshotHello
 	| { t: "prompt"; text: string; images?: ImageContent[] }
+	| SnapshotPageRequestFrame
+	| SnapshotPageAckFrame
 	// host -> guest
 	| {
 			t: "welcome";
 			proto: number;
 			header: SessionHeader;
 			state: CollabSessionState;
+			snapshotId?: string;
+			recoveryEpoch?: number;
+			resumeId?: string;
 			agents: AgentSnapshot[];
-			/**
-			 * Total number of `SessionEntry` items the host will deliver in the
-			 * `snapshot-chunk` frames that follow. The guest stays in the
-			 * snapshot-loading phase until it has accumulated that many entries
-			 * (or a chunk arrives with `final: true`).
-			 */
+			/** Total number of legacy SessionEntry items following the welcome. */
 			entryCount: number;
 			/** True when this peer joined through a read-only (view) link. */
 			readOnly?: boolean;
 	  }
-	/**
-	 * Targeted snapshot fragment delivered after `welcome`. Splits a large
-	 * transcript across many small frames so the guest's per-chunk progress
-	 * timeout resets each time the relay delivers another batch; without
-	 * chunking, a multi-MB session has to fit one giant frame inside the
-	 * 30 s first-welcome budget. The last chunk carries `final: true` so the
-	 * guest can finalize the replica session.
-	 */
+	/** Legacy chunk frame retained for guests that did not negotiate recovery. */
 	| { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean }
-	| { t: "entry"; entry: SessionEntry }
-	| { t: "event"; event: AgentSessionEvent }
+	| SnapshotBeginFrame
+	| SnapshotChunkFrame
+	| SnapshotAckFrame
+	| SnapshotEndFrame
+	| SnapshotPageFrame
+	| { t: "entry"; entry: SessionEntry; liveSeq?: number }
+	| { t: "event"; event: AgentSessionEvent; liveSeq?: number }
 	| { t: "state"; state: CollabSessionState }
 	/** Mirrored EventBus traffic (task subagent lifecycle/progress channels only). */
-	| { t: "bus"; channel: BusChannel; data: unknown }
+	| { t: "bus"; channel: BusChannel; data: unknown; liveSeq?: number }
 	/** Full agent-registry snapshot (debounced on registry change). */
 	| { t: "agents"; agents: AgentSnapshot[] }
 	| { t: "ui-request"; request: CollabUiRequest }
 	| { t: "ui-request-end"; reqId: number }
-	/** Targeted reply to fetch-transcript; `error` marks a terminal read failure that guests must surface without hot retrying. */
+	/** Targeted reply to fetch-transcript; error marks a terminal read failure that guests must surface without hot retrying. */
 	| { t: "transcript"; reqId: number; text: string; newSize: number; error?: string }
 	| { t: "bye"; reason: string }
 	| { t: "error"; message: string };
@@ -127,6 +569,107 @@ export function unpackEnvelope(data: Uint8Array): { peerId: number; payload: Uin
 /** Rewrite the peerId in place without copying the payload. */
 export function rewriteEnvelopePeer(data: Uint8Array, peerId: number): void {
 	new DataView(data.buffer, data.byteOffset, ENVELOPE_HEADER_LENGTH).setUint32(0, peerId, false);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Frame validation: validates decrypted/authenticated payload schemas
+// ═══════════════════════════════════════════════════════════════════════════
+
+export function validateCollabFrame(value: unknown): CollabFrame | null {
+	if (!value || typeof value !== "object") return null;
+	const frame = value as Record<string, unknown>;
+	if (typeof frame.t !== "string") return null;
+	switch (frame.t) {
+		case "hello":
+			if (
+				!Number.isSafeInteger(frame.proto) ||
+				typeof frame.name !== "string" ||
+				(frame.writeToken !== undefined && typeof frame.writeToken !== "string") ||
+				(frame.snapshotRecovery !== undefined && typeof frame.snapshotRecovery !== "boolean") ||
+				(frame.resumeId !== undefined && typeof frame.resumeId !== "string") ||
+				(frame.snapshotId !== undefined && typeof frame.snapshotId !== "string") ||
+				(frame.contiguousSeq !== undefined && !Number.isSafeInteger(frame.contiguousSeq)) ||
+				(frame.missing !== undefined &&
+					(!Array.isArray(frame.missing) || frame.missing.some(seq => !Number.isSafeInteger(seq)))) ||
+				(frame.recoveryEpoch !== undefined && !Number.isSafeInteger(frame.recoveryEpoch))
+			)
+				return null;
+			return value as CollabFrame;
+		case "prompt":
+			if (typeof frame.text !== "string") return null;
+			if (frame.images !== undefined && !Array.isArray(frame.images)) return null;
+			return value as CollabFrame;
+		case "abort":
+			return value as CollabFrame;
+		case "agent-cmd":
+			if (
+				(frame.cmd !== "chat" && frame.cmd !== "kill" && frame.cmd !== "revive") ||
+				typeof frame.agentId !== "string" ||
+				(frame.text !== undefined && typeof frame.text !== "string")
+			)
+				return null;
+			return value as CollabFrame;
+		case "ui-response":
+			if (!Number.isSafeInteger(frame.reqId) || (frame.value !== undefined && typeof frame.value !== "string"))
+				return null;
+			return value as CollabFrame;
+		case "fetch-transcript":
+			if (
+				!Number.isSafeInteger(frame.reqId) ||
+				typeof frame.agentId !== "string" ||
+				!Number.isSafeInteger(frame.fromByte) ||
+				(frame.fromByte as number) < 0
+			)
+				return null;
+			return value as CollabFrame;
+		case "snapshot-ack":
+			if (
+				typeof frame.snapshotId !== "string" ||
+				!Number.isSafeInteger(frame.contiguousSeq) ||
+				(frame.recoveryEpoch !== undefined && !Number.isSafeInteger(frame.recoveryEpoch)) ||
+				(frame.complete !== undefined && typeof frame.complete !== "boolean") ||
+				(frame.digest !== undefined && typeof frame.digest !== "string") ||
+				(frame.completionProof !== undefined && typeof frame.completionProof !== "string") ||
+				(frame.missing !== undefined &&
+					(!Array.isArray(frame.missing) || frame.missing.some(seq => !Number.isSafeInteger(seq))))
+			)
+				return null;
+			return value as CollabFrame;
+		case "snapshot-page-request":
+			if (
+				typeof frame.snapshotId !== "string" ||
+				typeof frame.cursor !== "string" ||
+				(frame.recoveryEpoch !== undefined && !Number.isSafeInteger(frame.recoveryEpoch))
+			)
+				return null;
+			return value as CollabFrame;
+		case "snapshot-page-ack":
+			if (
+				typeof frame.snapshotId !== "string" ||
+				typeof frame.cursor !== "string" ||
+				(frame.recoveryEpoch !== undefined && !Number.isSafeInteger(frame.recoveryEpoch))
+			)
+				return null;
+			return value as CollabFrame;
+		case "welcome":
+		case "snapshot-begin":
+		case "snapshot-chunk":
+		case "snapshot-end":
+		case "snapshot-page":
+		case "entry":
+		case "event":
+		case "state":
+		case "bus":
+		case "agents":
+		case "ui-request":
+		case "ui-request-end":
+		case "transcript":
+		case "bye":
+		case "error":
+			return value as CollabFrame;
+		default:
+			return null;
+	}
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -288,9 +831,14 @@ export function parseCollabLink(link: string): ParsedCollabLink | { error: strin
 	}
 	const secret = B64URL_RE.test(fragment) ? new Uint8Array(Buffer.from(fragment, "base64url")) : null;
 	if (!secret || (secret.byteLength !== ROOM_KEY_BYTES && secret.byteLength !== ROOM_KEY_BYTES + WRITE_TOKEN_BYTES)) {
-		return { error: "Collab link key must be 32 (view) or 48 (full) base64url bytes" };
+		return { error: "Collab link contains an invalid key length" };
 	}
 	const key = secret.subarray(0, ROOM_KEY_BYTES);
 	const writeToken = secret.byteLength > ROOM_KEY_BYTES ? secret.subarray(ROOM_KEY_BYTES) : undefined;
-	return { wsUrl: `${normalized.origin}/r/${roomId}`, roomId, key, writeToken };
+	return {
+		wsUrl: `${normalized.origin}/r/${roomId}`,
+		roomId,
+		key,
+		writeToken,
+	};
 }

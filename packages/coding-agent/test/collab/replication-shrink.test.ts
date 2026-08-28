@@ -291,6 +291,14 @@ describe("shrinkForReplication (#3740 review)", () => {
 		expect(shrunk.content).toContain("chars elided for collab session");
 	});
 
+	it("clamps UTF-8 payload bytes under the encrypted frame budget", () => {
+		const giant = { content: "漢".repeat(5 * 1024 * 1024) };
+		const shrunk = shrinkForReplication(giant);
+		const bytes = new TextEncoder().encode(JSON.stringify(shrunk)).byteLength;
+		expect(bytes).toBeLessThanOrEqual(MAX_REPLICATED_PAYLOAD_BYTES);
+		expect(shrunk.content).toContain("chars elided for collab session");
+	});
+
 	it("clamps a payload built of many short strings (no individual oversized) under the cap", () => {
 		// Realistic shape: a tool result content array with thousands of small
 		// text blocks. ~3 MB total; no individual string crosses the 64 B
@@ -330,5 +338,29 @@ describe("shrinkForReplication (#3740 review)", () => {
 		expect(shrunk.toolCallId).toBe("call-1");
 		expect(shrunk.toolName).toBe("read");
 		expect(JSON.stringify(shrunk).length).toBeLessThanOrEqual(MAX_REPLICATED_PAYLOAD_BYTES);
+	});
+	it("clamps a pathological object-key payload under the cap (T6-P06, T6-F375-05)", () => {
+		const value: Record<string, string> = {};
+		for (let i = 0; i < 2000; i++) value["k".repeat(100) + i] = "x";
+		const bytesBefore = new TextEncoder().encode(JSON.stringify(value)).byteLength;
+		expect(bytesBefore).toBeGreaterThan(MAX_REPLICATED_PAYLOAD_BYTES);
+		const shrunk = shrinkForReplication(value);
+		const bytesAfter = new TextEncoder().encode(JSON.stringify(shrunk)).byteLength;
+		expect(bytesAfter).toBeLessThanOrEqual(MAX_REPLICATED_PAYLOAD_BYTES);
+	});
+
+	it("guarantees hard UTF-8 limit even on extreme key length explosion", () => {
+		const value: Record<string, unknown> = {
+			t: "bus",
+			channel: "task:subagent:progress",
+		};
+		for (let i = 0; i < 500; i++) {
+			value["extremely_long_key_name_intended_to_defeat_value_only_shrinking_".repeat(10) + i] = {
+				nested: "value",
+			};
+		}
+		const shrunk = shrinkForReplication(value);
+		const bytesAfter = new TextEncoder().encode(JSON.stringify(shrunk)).byteLength;
+		expect(bytesAfter).toBeLessThanOrEqual(MAX_REPLICATED_PAYLOAD_BYTES);
 	});
 });
