@@ -13,9 +13,9 @@
  * `uninstallInMemoryRelay()` in the matching `afterAll`/`afterEach`.
  */
 import {
+	type CollabFrame,
 	checksumSnapshotPayload,
 	encodeSnapshotPayload,
-	type CollabFrame,
 	rewriteEnvelopePeer,
 	serializeSnapshotEntries,
 	unpackEnvelope,

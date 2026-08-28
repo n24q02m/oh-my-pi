@@ -13,6 +13,7 @@ import { ENVELOPE_HEADER_LENGTH, packEnvelope, unpackEnvelope } from "./protocol
 
 export const MAX_ENCRYPTED_COLLAB_FRAME_BYTES = 128 * 1024;
 const controlFrameEncoder = new TextEncoder();
+const pendingFrameEncoder = new TextEncoder();
 
 const FATAL_CLOSE_REASONS: Record<number, string> = {
 	4001: "room closed",
@@ -27,8 +28,22 @@ const BACKOFF_MAX_MS = 30_000;
 const MAX_RECEIVE_QUEUE_FRAMES = 256;
 const MAX_RECEIVE_QUEUE_BYTES = 512 * 1024;
 const MAX_CONTROL_FRAME_BYTES = 64 * 1024;
-type PendingGuestFrame = { frame: CollabFrame; targetPeer: number };
 const MAX_PENDING_SENDS = 256;
+const MAX_PENDING_SEND_BYTES = 512 * 1024;
+const MAX_PENDING_GUEST_FRAME_BYTES = 512 * 1024;
+
+type PendingGuestFrame = { frame: CollabFrame; targetPeer: number; bytes: number };
+type PendingHandshake = Pick<PendingGuestFrame, "frame" | "targetPeer">;
+
+function serializedFrameBytes(frame: CollabFrame): number {
+	try {
+		const serialized = JSON.stringify(frame);
+		return serialized === undefined ? Number.POSITIVE_INFINITY : pendingFrameEncoder.encode(serialized).byteLength;
+	} catch {
+		return Number.POSITIVE_INFINITY;
+	}
+}
+
 const WS_BACKPRESSURE_THRESHOLD = 64 * 1024;
 const WS_BACKPRESSURE_DRAIN_THRESHOLD = 32 * 1024;
 const WS_BACKPRESSURE_DRAIN_RETRY_MS = 25;
@@ -63,12 +78,14 @@ export class CollabSocket {
 	#recvChain: Promise<void> = Promise.resolve();
 	/** Envelopes sealed while disconnected, flushed on the next open. */
 	#pendingSends: Uint8Array[] = [];
+	#pendingSendBytes = 0;
 
 	/** Guest application frames wait behind the authenticated hello on every connection. */
 	#guestHandshakePending = false;
 	#guestHandshakeFlushing = false;
 	#pendingGuestFrames: PendingGuestFrame[] = [];
-	#pendingHandshake: PendingGuestFrame | null = null;
+	#pendingGuestFrameBytes = 0;
+	#pendingHandshake: PendingHandshake | null = null;
 	#recvQueueCount = 0;
 	#recvQueueBytes = 0;
 	constructor(opts: CollabSocketOptions) {
@@ -92,7 +109,7 @@ export class CollabSocket {
 	send(frame: CollabFrame, targetPeer = 0): void {
 		if (this.#opts.role === "guest" && (this.#guestHandshakePending || this.#guestHandshakeFlushing)) {
 			if (frame.t === "hello") this.#pendingHandshake = { frame, targetPeer };
-			else this.#enqueuePendingGuestFrame({ frame, targetPeer });
+			else this.#enqueuePendingGuestFrame(frame, targetPeer);
 			return;
 		}
 		this.#queueFrame(frame, targetPeer);
@@ -106,14 +123,16 @@ export class CollabSocket {
 			});
 	}
 
-	async #sendFrame(frame: CollabFrame, targetPeer: number, prioritize = false): Promise<void> {
+	async #sendFrame(frame: CollabFrame, targetPeer: number, prioritize = false, expectedWs?: WebSocket): Promise<void> {
 		if (this.#closed) {
 			logger.debug("collab: dropping frame, socket closed", { t: frame.t });
 			return;
 		}
 		const openWs = this.#ws;
+		if (expectedWs !== undefined && openWs !== expectedWs) return;
 		if (!prioritize && openWs && openWs.readyState === WebSocket.OPEN) this.#drainPendingSends(openWs);
 		const sealed = await seal(this.#opts.key, frame);
+		if (expectedWs !== undefined && (this.#ws !== expectedWs || expectedWs.readyState !== WebSocket.OPEN)) return;
 		if (sealed.byteLength + ENVELOPE_HEADER_LENGTH > MAX_ENCRYPTED_COLLAB_FRAME_BYTES) {
 			logger.warn("collab: refusing oversized encrypted frame", {
 				t: frame.t,
@@ -148,12 +167,18 @@ export class CollabSocket {
 		this.#enqueuePendingSend(envelope, frame.t);
 	}
 
-	#enqueuePendingGuestFrame(pending: PendingGuestFrame): void {
-		if (this.#pendingGuestFrames.length >= MAX_PENDING_SENDS) {
-			logger.warn("collab: dropping guest command, reconnect buffer full", { t: pending.frame.t });
+	#enqueuePendingGuestFrame(frame: CollabFrame, targetPeer: number): void {
+		const bytes = serializedFrameBytes(frame);
+		if (
+			!Number.isFinite(bytes) ||
+			bytes > MAX_PENDING_GUEST_FRAME_BYTES ||
+			this.#pendingGuestFrameBytes + bytes > MAX_PENDING_GUEST_FRAME_BYTES
+		) {
+			logger.warn("collab: dropping guest command, reconnect buffer byte limit reached", { t: frame.t, bytes });
 			return;
 		}
-		this.#pendingGuestFrames.push(pending);
+		this.#pendingGuestFrames.push({ frame, targetPeer, bytes });
+		this.#pendingGuestFrameBytes += bytes;
 	}
 
 	#flushGuestHandshake(ws: WebSocket): void {
@@ -162,11 +187,20 @@ export class CollabSocket {
 		this.#pendingHandshake = null;
 		this.#sendChain = this.#sendChain
 			.then(async () => {
-				if (handshake) await this.#sendFrame(handshake.frame, handshake.targetPeer, true);
+				if (this.#ws !== ws) return;
+				if (handshake) {
+					await this.#sendFrame(handshake.frame, handshake.targetPeer, true, ws);
+					if (this.#ws !== ws) return;
+				}
 				this.#drainPendingSends(ws);
 				while (this.#pendingGuestFrames.length > 0) {
-					const pending = this.#pendingGuestFrames.shift();
-					if (pending) await this.#sendFrame(pending.frame, pending.targetPeer);
+					if (this.#ws !== ws) return;
+					const pending = this.#pendingGuestFrames[0];
+					if (!pending) return;
+					await this.#sendFrame(pending.frame, pending.targetPeer, false, ws);
+					if (this.#ws !== ws) return;
+					this.#pendingGuestFrames.shift();
+					this.#pendingGuestFrameBytes -= pending.bytes;
 				}
 			})
 			.catch((err: unknown) => logger.debug("collab: guest handshake flush failed", { error: String(err) }))
@@ -179,11 +213,18 @@ export class CollabSocket {
 	}
 
 	#enqueuePendingSend(envelope: Uint8Array, frameType: CollabFrame["t"]): void {
-		if (this.#pendingSends.length >= MAX_PENDING_SENDS) {
-			logger.debug("collab: dropping frame, reconnect buffer full", { t: frameType });
+		if (
+			this.#pendingSends.length >= MAX_PENDING_SENDS ||
+			this.#pendingSendBytes + envelope.byteLength > MAX_PENDING_SEND_BYTES
+		) {
+			logger.debug("collab: dropping frame, reconnect buffer limit reached", {
+				t: frameType,
+				bytes: envelope.byteLength,
+			});
 			return;
 		}
 		this.#pendingSends.push(envelope);
+		this.#pendingSendBytes += envelope.byteLength;
 	}
 
 	#drainPendingSends(ws: WebSocket): void {
@@ -194,6 +235,7 @@ export class CollabSocket {
 		) {
 			const envelope = this.#pendingSends.shift();
 			if (!envelope) return;
+			this.#pendingSendBytes -= envelope.byteLength;
 			ws.send(envelope);
 		}
 	}
@@ -249,8 +291,10 @@ export class CollabSocket {
 		const wasClosed = this.#closed;
 		this.#closed = true;
 		this.#pendingGuestFrames.length = 0;
+		this.#pendingGuestFrameBytes = 0;
 		this.#pendingHandshake = null;
 		this.#pendingSends.length = 0;
+		this.#pendingSendBytes = 0;
 		const ws = this.#ws;
 		this.#ws = null;
 		if (ws) {
@@ -364,8 +408,10 @@ export class CollabSocket {
 		if (fatalReason !== undefined) {
 			this.#closed = true;
 			this.#pendingGuestFrames.length = 0;
+			this.#pendingGuestFrameBytes = 0;
 			this.#pendingHandshake = null;
 			this.#pendingSends.length = 0;
+			this.#pendingSendBytes = 0;
 			this.onClose?.(fatalReason, false);
 			return;
 		}
@@ -382,8 +428,10 @@ export class CollabSocket {
 		this.#closed = true;
 		this.#clearRetry();
 		this.#pendingGuestFrames.length = 0;
+		this.#pendingGuestFrameBytes = 0;
 		this.#pendingHandshake = null;
 		this.#pendingSends.length = 0;
+		this.#pendingSendBytes = 0;
 		const ws = this.#ws;
 		this.#ws = null;
 		this.#clearBackpressureDrain();

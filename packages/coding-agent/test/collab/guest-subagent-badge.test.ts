@@ -127,7 +127,7 @@ describe("collab guest running-subagents badge", () => {
 		let welcomeEpoch = 0;
 		const sendWelcome = (agents: AgentSnapshot[]) => {
 			const recoveryEpoch = ++welcomeEpoch;
-			const snapshotId = "badge-snapshot-" + recoveryEpoch;
+			const snapshotId = `badge-snapshot-${recoveryEpoch}`;
 			hostSocket.send({
 				t: "welcome",
 				proto: COLLAB_PROTO,

@@ -87,6 +87,7 @@ export type SnapshotBeginFrame = {
 	recoveryEpoch?: number;
 	resumeId?: string;
 	firstHistoryCursor?: string;
+	completionNonce?: string;
 };
 
 export type SnapshotChunkFrame = {
@@ -104,9 +105,10 @@ export type SnapshotChunkFrame = {
 
 export type SnapshotAckFrame = {
 	recoveryEpoch?: number;
-	/** Set only after snapshot-end and carries the assembled payload digest. */
+	/** Set only after snapshot activation and carries the computed completion proof. */
 	complete?: boolean;
 	digest?: string;
+	completionProof?: string;
 	t: "snapshot-ack";
 	snapshotId: string;
 	contiguousSeq: number;
@@ -120,6 +122,7 @@ export type SnapshotEndFrame = {
 	recoveryEpoch?: number;
 	/** Digest of the complete initial payload, authenticated by the frame seal. */
 	checksum?: string;
+	completionNonce?: string;
 };
 
 export type SnapshotPageRequestFrame = {
@@ -192,6 +195,10 @@ export function checksumSnapshotPayload(payload: Uint8Array): string {
 	return createHash("sha256").update(payload).digest("hex");
 }
 
+export function computeSnapshotCompletionProof(nonce: string, digest: string): string {
+	return createHash("sha256").update(`${nonce}:${digest}`).digest("hex");
+}
+
 export function serializeSnapshotEntries(entries: readonly SessionEntry[]): Uint8Array {
 	return new TextEncoder().encode(JSON.stringify(entries));
 }
@@ -228,6 +235,8 @@ export class SnapshotSender {
 	readonly #inFlight = new Set<number>();
 	#nextSeq = 0;
 	#contiguousSeq = -1;
+	/** Last ACK shape observed; identical ACK replays must not burn retries. */
+	#lastAckState: string | null = null;
 
 	constructor(snapshotId: string, payloads: readonly Uint8Array[]) {
 		if (!snapshotId) throw new Error("snapshot id is required");
@@ -274,8 +283,11 @@ export class SnapshotSender {
 			}
 		}
 		const missing = this.#boundedMissing(ack.missing);
+		const ackState = `${String(this.#contiguousSeq)}:${missing.join(",")}`;
+		const duplicateAck = !resendInFlight && this.#lastAckState === ackState;
+		this.#lastAckState = ackState;
 		const chunks: SnapshotChunkFrame[] = [];
-		for (const seq of resendInFlight ? [...this.#inFlight] : missing) {
+		for (const seq of resendInFlight ? [...this.#inFlight] : duplicateAck ? [] : missing) {
 			if (!this.#inFlight.has(seq)) continue;
 			if (!resendInFlight && !missing.includes(seq)) continue;
 			const retry = this.#retry(seq);
@@ -313,6 +325,7 @@ export class SnapshotSender {
 			)
 				result.push(seq);
 		}
+		result.sort((a, b) => a - b);
 		return result;
 	}
 
@@ -559,6 +572,107 @@ export function rewriteEnvelopePeer(data: Uint8Array, peerId: number): void {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
+// Frame validation: validates decrypted/authenticated payload schemas
+// ═══════════════════════════════════════════════════════════════════════════
+
+export function validateCollabFrame(value: unknown): CollabFrame | null {
+	if (!value || typeof value !== "object") return null;
+	const frame = value as Record<string, unknown>;
+	if (typeof frame.t !== "string") return null;
+	switch (frame.t) {
+		case "hello":
+			if (
+				!Number.isSafeInteger(frame.proto) ||
+				typeof frame.name !== "string" ||
+				(frame.writeToken !== undefined && typeof frame.writeToken !== "string") ||
+				(frame.snapshotRecovery !== undefined && typeof frame.snapshotRecovery !== "boolean") ||
+				(frame.resumeId !== undefined && typeof frame.resumeId !== "string") ||
+				(frame.snapshotId !== undefined && typeof frame.snapshotId !== "string") ||
+				(frame.contiguousSeq !== undefined && !Number.isSafeInteger(frame.contiguousSeq)) ||
+				(frame.missing !== undefined &&
+					(!Array.isArray(frame.missing) || frame.missing.some(seq => !Number.isSafeInteger(seq)))) ||
+				(frame.recoveryEpoch !== undefined && !Number.isSafeInteger(frame.recoveryEpoch))
+			)
+				return null;
+			return value as CollabFrame;
+		case "prompt":
+			if (typeof frame.text !== "string") return null;
+			if (frame.images !== undefined && !Array.isArray(frame.images)) return null;
+			return value as CollabFrame;
+		case "abort":
+			return value as CollabFrame;
+		case "agent-cmd":
+			if (
+				(frame.cmd !== "chat" && frame.cmd !== "kill" && frame.cmd !== "revive") ||
+				typeof frame.agentId !== "string" ||
+				(frame.text !== undefined && typeof frame.text !== "string")
+			)
+				return null;
+			return value as CollabFrame;
+		case "ui-response":
+			if (!Number.isSafeInteger(frame.reqId) || (frame.value !== undefined && typeof frame.value !== "string"))
+				return null;
+			return value as CollabFrame;
+		case "fetch-transcript":
+			if (
+				!Number.isSafeInteger(frame.reqId) ||
+				typeof frame.agentId !== "string" ||
+				!Number.isSafeInteger(frame.fromByte) ||
+				(frame.fromByte as number) < 0
+			)
+				return null;
+			return value as CollabFrame;
+		case "snapshot-ack":
+			if (
+				typeof frame.snapshotId !== "string" ||
+				!Number.isSafeInteger(frame.contiguousSeq) ||
+				(frame.recoveryEpoch !== undefined && !Number.isSafeInteger(frame.recoveryEpoch)) ||
+				(frame.complete !== undefined && typeof frame.complete !== "boolean") ||
+				(frame.digest !== undefined && typeof frame.digest !== "string") ||
+				(frame.completionProof !== undefined && typeof frame.completionProof !== "string") ||
+				(frame.missing !== undefined &&
+					(!Array.isArray(frame.missing) || frame.missing.some(seq => !Number.isSafeInteger(seq))))
+			)
+				return null;
+			return value as CollabFrame;
+		case "snapshot-page-request":
+			if (
+				typeof frame.snapshotId !== "string" ||
+				typeof frame.cursor !== "string" ||
+				(frame.recoveryEpoch !== undefined && !Number.isSafeInteger(frame.recoveryEpoch))
+			)
+				return null;
+			return value as CollabFrame;
+		case "snapshot-page-ack":
+			if (
+				typeof frame.snapshotId !== "string" ||
+				typeof frame.cursor !== "string" ||
+				(frame.recoveryEpoch !== undefined && !Number.isSafeInteger(frame.recoveryEpoch))
+			)
+				return null;
+			return value as CollabFrame;
+		case "welcome":
+		case "snapshot-begin":
+		case "snapshot-chunk":
+		case "snapshot-end":
+		case "snapshot-page":
+		case "entry":
+		case "event":
+		case "state":
+		case "bus":
+		case "agents":
+		case "ui-request":
+		case "ui-request-end":
+		case "transcript":
+		case "bye":
+		case "error":
+			return value as CollabFrame;
+		default:
+			return null;
+	}
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 // Link format: wss://<host[:port]>/r/<roomId>.<base64url-32-byte-key>
 // ═══════════════════════════════════════════════════════════════════════════
 
@@ -717,9 +831,14 @@ export function parseCollabLink(link: string): ParsedCollabLink | { error: strin
 	}
 	const secret = B64URL_RE.test(fragment) ? new Uint8Array(Buffer.from(fragment, "base64url")) : null;
 	if (!secret || (secret.byteLength !== ROOM_KEY_BYTES && secret.byteLength !== ROOM_KEY_BYTES + WRITE_TOKEN_BYTES)) {
-		return { error: "Collab link key must be 32 (view) or 48 (full) base64url bytes" };
+		return { error: "Collab link contains an invalid key length" };
 	}
 	const key = secret.subarray(0, ROOM_KEY_BYTES);
 	const writeToken = secret.byteLength > ROOM_KEY_BYTES ? secret.subarray(ROOM_KEY_BYTES) : undefined;
-	return { wsUrl: `${normalized.origin}/r/${roomId}`, roomId, key, writeToken };
+	return {
+		wsUrl: `${normalized.origin}/r/${roomId}`,
+		roomId,
+		key,
+		writeToken,
+	};
 }

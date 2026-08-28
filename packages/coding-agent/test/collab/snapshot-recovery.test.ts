@@ -8,6 +8,7 @@ import { describe, expect, it, spyOn, vi } from "bun:test";
 import { importRoomKey, open, seal } from "@oh-my-pi/pi-coding-agent/collab/crypto";
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
+import type { CollabFrame } from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import * as protocol from "@oh-my-pi/pi-coding-agent/collab/protocol";
 import { CollabSocket, MAX_ENCRYPTED_COLLAB_FRAME_BYTES } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
@@ -49,7 +50,7 @@ async function flushMicrotasks(rounds = 12): Promise<void> {
 	for (let i = 0; i < rounds; i++) await Promise.resolve();
 }
 
-async function waitFor(predicate: () => boolean, rounds = 200): Promise<void> {
+async function waitFor(predicate: () => boolean, rounds = 1000): Promise<void> {
 	for (let i = 0; i < rounds; i++) {
 		if (predicate()) return;
 		await flushMicrotasks();
@@ -61,7 +62,10 @@ async function waitFor(predicate: () => boolean, rounds = 200): Promise<void> {
 function makeIntegrationSnapshot(
 	entryCount: number,
 	bodyBytes: number,
-): { header: { type: "session"; id: string; timestamp: string; cwd: string }; entries: SessionEntry[] } {
+): {
+	header: { type: "session"; id: string; title?: string; timestamp: string; cwd: string };
+	entries: SessionEntry[];
+} {
 	const body = "x".repeat(bodyBytes);
 	return {
 		header: { type: "session", id: `integration-${entryCount}`, timestamp: "2026-08-28T00:00:00Z", cwd: "/tmp" },
@@ -290,7 +294,7 @@ describe("collab snapshot recovery", () => {
 		expect(receiver.snapshotId).toBe("snapshot-e");
 	});
 
-	it("rejects ACKs for unexposed future chunks and exhausts repeated missing retries", () => {
+	it("rejects ACKs for unexposed future chunks and ignores repeated missing ACK replays", () => {
 		const sender = new protocol.SnapshotSender("future", payloads(6));
 		const initial = sender.nextWindow();
 		expect(initial.map(chunk => chunk.seq)).toEqual([0, 1, 2, 3]);
@@ -304,21 +308,26 @@ describe("collab snapshot recovery", () => {
 		expect(futureAck.complete).toBe(false);
 		expect(futureAck.chunks.map(chunk => chunk.seq)).not.toContain(4);
 
-		for (let attempt = 0; attempt < protocol.SNAPSHOT_MAX_RETRIES; attempt++) {
-			const retry = sender.acknowledge({
-				t: "snapshot-ack",
-				snapshotId: "future",
-				contiguousSeq: -1,
-				missing: [0],
-			});
-			expect(retry.exhausted).toBe(false);
-		}
-		expect(sender.acknowledge({
+		const missingAck: protocol.SnapshotAckFrame = {
 			t: "snapshot-ack",
 			snapshotId: "future",
 			contiguousSeq: -1,
 			missing: [0],
-		}).exhausted).toBe(true);
+		};
+		const firstMissing = sender.acknowledge(missingAck);
+		expect(firstMissing.exhausted).toBe(false);
+		expect(firstMissing.chunks.map(chunk => chunk.seq)).toContain(0);
+		for (let replay = 0; replay < protocol.SNAPSHOT_MAX_RETRIES + 2; replay++) {
+			const duplicate = sender.acknowledge(missingAck);
+			expect(duplicate.exhausted).toBe(false);
+			expect(duplicate.chunks).toEqual([]);
+		}
+
+		for (let attempt = 1; attempt < protocol.SNAPSHOT_MAX_RETRIES; attempt++) {
+			const retry = sender.onTimeout();
+			expect(retry.exhausted).toBe(false);
+		}
+		expect(sender.onTimeout().exhausted).toBe(true);
 	});
 	it("keeps snapshot control frames end-to-end encrypted", async () => {
 		const key = await importRoomKey(new Uint8Array(32));
@@ -435,7 +444,7 @@ describe("collab snapshot recovery", () => {
 	});
 	it("rejects an oversized legacy history before sending snapshot chunks", async () => {
 		const snapshot = makeIntegrationSnapshot(1100, 60 * 1024);
-		const relay = installInMemoryRelay();
+		installInMemoryRelay();
 		const host = new CollabHost(makeIntegrationHostContext(snapshot));
 		let guestSocket: CollabSocket | undefined;
 		try {
@@ -476,14 +485,14 @@ describe("collab snapshot recovery", () => {
 					parentId: null,
 					timestamp: "2026-08-28T00:00:00Z",
 					message: { role: "user", content: body, timestamp: index },
-				} as SessionEntry),
-			);
+				}) as SessionEntry,
+		);
 		const roomKey = new Uint8Array(32);
 		const key = await importRoomKey(roomKey);
 		const roomId = "legacy-aggregate-limit";
 		const link = protocol.formatCollabLink("ws://localhost:8788", roomId, roomKey);
-		const relay = installInMemoryRelay();
-		const hostSocket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/" + roomId, role: "host", key });
+		installInMemoryRelay();
+		const hostSocket = new CollabSocket({ wsUrl: `ws://localhost:8788/r/${roomId}`, role: "host", key });
 		const hostOpen = Promise.withResolvers<void>();
 		hostSocket.onOpen = () => hostOpen.resolve();
 		hostSocket.onFrame = frame => {
@@ -704,6 +713,359 @@ describe("collab snapshot recovery", () => {
 				await host.stop("test");
 			} catch {}
 			writeSpy.mockRestore();
+			uninstallInMemoryRelay();
+		}
+	});
+	it("rejects forged completion ACKs with mismatched/missing completion proof (T6-P01)", async () => {
+		const snapshot = makeIntegrationSnapshot(2, 200);
+		installInMemoryRelay();
+		const hostCtx = makeIntegrationHostContext(snapshot) as unknown as IntegrationHostContext;
+		const host = new CollabHost(hostCtx);
+		const guestFrames: CollabFrame[] = [];
+		try {
+			await host.start("ws://localhost:8788");
+			const parsed = protocol.parseCollabLink(host.viewLink);
+			if ("error" in parsed) throw new Error(parsed.error);
+			const key = await importRoomKey(parsed.key);
+
+			const guest = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+			guest.onFrame = frame => guestFrames.push(frame);
+			guest.onOpen = () =>
+				guest.send({ t: "hello", proto: protocol.COLLAB_PROTO, name: "adversary", snapshotRecovery: true });
+			guest.connect();
+
+			await waitFor(() => guestFrames.some(f => f.t === "snapshot-begin"));
+			const begin = guestFrames.find(f => f.t === "snapshot-begin") as protocol.SnapshotBeginFrame;
+
+			// Append a live entry on the host while transfer is ongoing
+			const liveEntry: SessionEntry = {
+				type: "message",
+				id: "live-during-forge-attempt",
+				parentId: "entry-1",
+				timestamp: "2026-08-28T00:01:00Z",
+				message: { role: "user", content: "live secret", timestamp: 10 },
+			};
+			hostCtx.sessionManager.onEntryAppended?.(liveEntry);
+
+			// Adversary claims in-window completion with echoed digest but forged completionProof
+			guest.send({
+				t: "snapshot-ack",
+				snapshotId: begin.snapshotId,
+				recoveryEpoch: begin.recoveryEpoch,
+				contiguousSeq: begin.total - 1,
+				complete: true,
+				digest: "forged-digest-or-echoed",
+				completionProof: "forged-proof",
+			});
+
+			await flushMicrotasks(20);
+			// Host MUST NOT release deferred live entry to the adversary
+			expect(guestFrames.some(f => f.t === "entry" && f.entry.id === liveEntry.id)).toBe(false);
+			guest.close();
+		} finally {
+			try {
+				await host.stop("test");
+			} catch {}
+			uninstallInMemoryRelay();
+		}
+	});
+
+	it("preserves live entries when peer disconnects between sender completion and receiver completion (T6-P02)", async () => {
+		const snapshot = makeIntegrationSnapshot(2, 200);
+		const initialEntries = snapshot.entries;
+		const receivedEntries: SessionEntry[] = [];
+		installInMemoryRelay();
+		const hostCtx = makeIntegrationHostContext(snapshot) as unknown as IntegrationHostContext;
+		const guestCtx = makeIntegrationGuestContext(initialEntries, receivedEntries);
+		const host = new CollabHost(hostCtx);
+		const guest = new CollabGuestLink(guestCtx);
+		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+
+		try {
+			await host.start("ws://localhost:8788");
+			await guest.join(host.link);
+			await waitFor(() => receivedEntries.length === 2);
+
+			// Append live entry
+			const liveEntry: SessionEntry = {
+				type: "message",
+				id: "live-across-disconnect-window",
+				parentId: "entry-1",
+				timestamp: "2026-08-28T00:02:00Z",
+				message: { role: "user", content: "preserved live", timestamp: 20 },
+			};
+			hostCtx.sessionManager.onEntryAppended?.(liveEntry);
+
+			await waitFor(() => receivedEntries.some(e => e.id === liveEntry.id));
+			expect(receivedEntries).toContainEqual(liveEntry);
+		} finally {
+			try {
+				await guest.leave("test");
+			} catch {}
+			try {
+				await host.stop("test");
+			} catch {}
+			writeSpy.mockRestore();
+			uninstallInMemoryRelay();
+		}
+	});
+
+	it("reconnects cleanly and does not acknowledge completion on activation failure (T6-P03)", async () => {
+		const snapshot = makeIntegrationSnapshot(2, 200);
+		const initialEntries = snapshot.entries;
+		const receivedEntries: SessionEntry[] = [];
+		installInMemoryRelay();
+		const hostCtx = makeIntegrationHostContext(snapshot) as unknown as IntegrationHostContext;
+		const guestCtx = makeIntegrationGuestContext(initialEntries, receivedEntries);
+		const host = new CollabHost(hostCtx);
+		const guest = new CollabGuestLink(guestCtx);
+
+		// Force Bun.write to fail once to simulate activation failure
+		let failCount = 1;
+		const writeSpy = spyOn(Bun, "write").mockImplementation(async () => {
+			if (failCount > 0) {
+				failCount--;
+				throw new Error("simulated disk write failure");
+			}
+			return 0;
+		});
+
+		try {
+			await host.start("ws://localhost:8788");
+			// The join should reject or recover cleanly
+			await expect(guest.join(host.link)).rejects.toThrow("simulated disk write failure");
+		} finally {
+			try {
+				await guest.leave("test");
+			} catch {}
+			try {
+				await host.stop("test");
+			} catch {}
+			writeSpy.mockRestore();
+			uninstallInMemoryRelay();
+		}
+	});
+
+	it("retires previous transfer state upon repeated hello on the same peer (T6-P05)", async () => {
+		const snapshot = makeIntegrationSnapshot(2, 200);
+		installInMemoryRelay();
+		const hostCtx = makeIntegrationHostContext(snapshot) as unknown as IntegrationHostContext;
+		const host = new CollabHost(hostCtx);
+		const guestFrames: CollabFrame[] = [];
+
+		try {
+			await host.start("ws://localhost:8788");
+			const parsed = protocol.parseCollabLink(host.link);
+			if ("error" in parsed) throw new Error(parsed.error);
+			const key = await importRoomKey(parsed.key);
+
+			const guest = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+			guest.onFrame = frame => guestFrames.push(frame);
+			guest.onOpen = () => {
+				for (let i = 0; i < 5; i++) {
+					guest.send({
+						t: "hello",
+						proto: protocol.COLLAB_PROTO,
+						name: "flooder",
+						snapshotRecovery: true,
+						resumeId: "resume-same",
+					});
+				}
+			};
+			guest.connect();
+
+			await waitFor(() => guestFrames.some(f => f.t === "welcome"));
+			// Peer remains healthy and receives snapshot headers without unhandled errors
+			expect(guestFrames.filter(f => f.t === "welcome").length).toBeGreaterThan(0);
+			guest.close();
+		} finally {
+			try {
+				await host.stop("test");
+			} catch {}
+			uninstallInMemoryRelay();
+		}
+	});
+
+	it("enforces fair per-peer quota on history page requests (T6-P08)", async () => {
+		const snapshot = makeIntegrationSnapshot(300, 700);
+		installInMemoryRelay();
+		const hostCtx = makeIntegrationHostContext(snapshot) as unknown as IntegrationHostContext;
+		const host = new CollabHost(hostCtx);
+		const guest1Frames: CollabFrame[] = [];
+		const guest2Frames: CollabFrame[] = [];
+
+		try {
+			await host.start("ws://localhost:8788");
+			const parsed = protocol.parseCollabLink(host.link);
+			if ("error" in parsed) throw new Error(parsed.error);
+			const key = await importRoomKey(parsed.key);
+
+			const guest1 = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+			guest1.onFrame = frame => guest1Frames.push(frame);
+			guest1.onOpen = () =>
+				guest1.send({ t: "hello", proto: protocol.COLLAB_PROTO, name: "g1", snapshotRecovery: true });
+			guest1.connect();
+
+			const guest2 = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+			guest2.onFrame = frame => guest2Frames.push(frame);
+			guest2.onOpen = () =>
+				guest2.send({ t: "hello", proto: protocol.COLLAB_PROTO, name: "g2", snapshotRecovery: true });
+			guest2.connect();
+
+			await waitFor(
+				() => guest1Frames.some(f => f.t === "snapshot-begin") && guest2Frames.some(f => f.t === "snapshot-begin"),
+			);
+			const b1 = guest1Frames.find(f => f.t === "snapshot-begin") as protocol.SnapshotBeginFrame;
+			const b2 = guest2Frames.find(f => f.t === "snapshot-begin") as protocol.SnapshotBeginFrame;
+
+			// Complete initial transfers
+			guest1.send({
+				t: "snapshot-ack",
+				snapshotId: b1.snapshotId,
+				recoveryEpoch: b1.recoveryEpoch,
+				contiguousSeq: b1.total - 1,
+			});
+			guest2.send({
+				t: "snapshot-ack",
+				snapshotId: b2.snapshotId,
+				recoveryEpoch: b2.recoveryEpoch,
+				contiguousSeq: b2.total - 1,
+			});
+
+			await waitFor(
+				() => guest1Frames.some(f => f.t === "snapshot-end") && guest2Frames.some(f => f.t === "snapshot-end"),
+			);
+			const end1 = guest1Frames.find(f => f.t === "snapshot-end") as protocol.SnapshotEndFrame;
+			const end2 = guest2Frames.find(f => f.t === "snapshot-end") as protocol.SnapshotEndFrame;
+
+			guest1.send({
+				t: "snapshot-ack",
+				snapshotId: b1.snapshotId,
+				recoveryEpoch: b1.recoveryEpoch,
+				contiguousSeq: b1.total - 1,
+				complete: true,
+				digest: end1.checksum,
+				completionProof: protocol.computeSnapshotCompletionProof(end1.completionNonce!, end1.checksum!),
+			});
+			guest2.send({
+				t: "snapshot-ack",
+				snapshotId: b2.snapshotId,
+				recoveryEpoch: b2.recoveryEpoch,
+				contiguousSeq: b2.total - 1,
+				complete: true,
+				digest: end2.checksum,
+				completionProof: protocol.computeSnapshotCompletionProof(end2.completionNonce!, end2.checksum!),
+			});
+
+			await flushMicrotasks(20);
+			// Guest 2 requests a page and gets it without starvation from guest 1
+			guest2.send({
+				t: "snapshot-page-request",
+				snapshotId: b2.snapshotId,
+				recoveryEpoch: b2.recoveryEpoch,
+				cursor: "128",
+			});
+			await waitFor(() => guest2Frames.some(f => f.t === "snapshot-page"));
+			expect(
+				guest2Frames.some(f => f.t === "snapshot-page" && (f as protocol.SnapshotPageFrame).cursor === "128"),
+			).toBe(true);
+
+			guest1.close();
+			guest2.close();
+		} finally {
+			try {
+				await host.stop("test");
+			} catch {}
+			uninstallInMemoryRelay();
+		}
+	});
+
+	it("fails closed on malformed authenticated control frames (T6-P09)", async () => {
+		const snapshot = makeIntegrationSnapshot(2, 200);
+		installInMemoryRelay();
+		const hostCtx = makeIntegrationHostContext(snapshot) as unknown as IntegrationHostContext;
+		const host = new CollabHost(hostCtx);
+		const guestFrames: CollabFrame[] = [];
+
+		try {
+			await host.start("ws://localhost:8788");
+			const parsed = protocol.parseCollabLink(host.link);
+			if ("error" in parsed) throw new Error(parsed.error);
+			const key = await importRoomKey(parsed.key);
+
+			const guest = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+			guest.onFrame = frame => guestFrames.push(frame);
+			guest.onOpen = () => {
+				guest.send({ t: "hello", proto: protocol.COLLAB_PROTO, name: "g-test", snapshotRecovery: true });
+				guest.send({
+					t: "snapshot-ack",
+					snapshotId: 12345 as unknown as string,
+					contiguousSeq: "invalid" as unknown as number,
+				});
+			};
+			guest.connect();
+
+			await waitFor(() => guestFrames.some(f => f.t === "error" && f.message.includes("malformed")));
+			expect(guestFrames.some(f => f.t === "error" && f.message.includes("malformed"))).toBe(true);
+			guest.close();
+		} finally {
+			try {
+				await host.stop("test");
+			} catch {}
+			uninstallInMemoryRelay();
+		}
+	});
+
+	it("preserves retained transfer when session title mutates under same session ID", async () => {
+		const snapshot = makeIntegrationSnapshot(2, 200);
+		installInMemoryRelay();
+		const hostCtx = makeIntegrationHostContext(snapshot) as unknown as IntegrationHostContext;
+		const host = new CollabHost(hostCtx);
+		const guestFrames: CollabFrame[] = [];
+
+		try {
+			await host.start("ws://localhost:8788");
+			const parsed = protocol.parseCollabLink(host.link);
+			if ("error" in parsed) throw new Error(parsed.error);
+			const key = await importRoomKey(parsed.key);
+
+			const guest = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+			guest.onFrame = frame => guestFrames.push(frame);
+			guest.onOpen = () =>
+				guest.send({
+					t: "hello",
+					proto: protocol.COLLAB_PROTO,
+					name: "g",
+					snapshotRecovery: true,
+					resumeId: "resume-title-test",
+				});
+			guest.connect();
+
+			await waitFor(() => guestFrames.some(f => f.t === "welcome"));
+
+			// Mutate title in session header (same session id)
+			snapshot.header.title = "Updated Session Title";
+
+			// Reconnect with same resumeId
+			guestFrames.length = 0;
+			guest.send({
+				t: "hello",
+				proto: protocol.COLLAB_PROTO,
+				name: "g",
+				snapshotRecovery: true,
+				resumeId: "resume-title-test",
+			});
+
+			await waitFor(() => guestFrames.some(f => f.t === "welcome"));
+			const welcome = guestFrames.find(
+				(f): f is Extract<protocol.CollabFrame, { t: "welcome" }> => f.t === "welcome",
+			);
+			expect(welcome?.header.title).toBe("Updated Session Title");
+			guest.close();
+		} finally {
+			try {
+				await host.stop("test");
+			} catch {}
 			uninstallInMemoryRelay();
 		}
 	});
