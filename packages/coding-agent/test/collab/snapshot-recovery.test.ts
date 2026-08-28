@@ -9,7 +9,7 @@ import { importRoomKey, open, seal } from "@oh-my-pi/pi-coding-agent/collab/cryp
 import { CollabGuestLink } from "@oh-my-pi/pi-coding-agent/collab/guest";
 import { CollabHost } from "@oh-my-pi/pi-coding-agent/collab/host";
 import * as protocol from "@oh-my-pi/pi-coding-agent/collab/protocol";
-import { MAX_ENCRYPTED_COLLAB_FRAME_BYTES } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
+import { CollabSocket, MAX_ENCRYPTED_COLLAB_FRAME_BYTES } from "@oh-my-pi/pi-coding-agent/collab/relay-client";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import type { AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
@@ -290,6 +290,36 @@ describe("collab snapshot recovery", () => {
 		expect(receiver.snapshotId).toBe("snapshot-e");
 	});
 
+	it("rejects ACKs for unexposed future chunks and exhausts repeated missing retries", () => {
+		const sender = new protocol.SnapshotSender("future", payloads(6));
+		const initial = sender.nextWindow();
+		expect(initial.map(chunk => chunk.seq)).toEqual([0, 1, 2, 3]);
+
+		const futureAck = sender.acknowledge({
+			t: "snapshot-ack",
+			snapshotId: "future",
+			contiguousSeq: 5,
+		});
+		expect(sender.contiguousSeq).toBe(-1);
+		expect(futureAck.complete).toBe(false);
+		expect(futureAck.chunks.map(chunk => chunk.seq)).not.toContain(4);
+
+		for (let attempt = 0; attempt < protocol.SNAPSHOT_MAX_RETRIES; attempt++) {
+			const retry = sender.acknowledge({
+				t: "snapshot-ack",
+				snapshotId: "future",
+				contiguousSeq: -1,
+				missing: [0],
+			});
+			expect(retry.exhausted).toBe(false);
+		}
+		expect(sender.acknowledge({
+			t: "snapshot-ack",
+			snapshotId: "future",
+			contiguousSeq: -1,
+			missing: [0],
+		}).exhausted).toBe(true);
+	});
 	it("keeps snapshot control frames end-to-end encrypted", async () => {
 		const key = await importRoomKey(new Uint8Array(32));
 		const frame: protocol.SnapshotBeginFrame = {
@@ -403,6 +433,126 @@ describe("collab snapshot recovery", () => {
 			}),
 		).toThrow();
 	});
+	it("rejects an oversized legacy history before sending snapshot chunks", async () => {
+		const snapshot = makeIntegrationSnapshot(1100, 60 * 1024);
+		const relay = installInMemoryRelay();
+		const host = new CollabHost(makeIntegrationHostContext(snapshot));
+		let guestSocket: CollabSocket | undefined;
+		try {
+			await host.start("ws://localhost:8788");
+			const parsed = protocol.parseCollabLink(host.link);
+			if ("error" in parsed) throw new Error(parsed.error);
+			const key = await importRoomKey(parsed.key);
+			const frames: protocol.CollabFrame[] = [];
+			guestSocket = new CollabSocket({ wsUrl: parsed.wsUrl, role: "guest", key });
+			guestSocket.onFrame = frame => frames.push(frame);
+			guestSocket.onOpen = () =>
+				guestSocket?.send({
+					t: "hello",
+					proto: protocol.COLLAB_PROTO,
+					name: "legacy-limit-test",
+				});
+			guestSocket.connect();
+			await waitFor(() => frames.some(frame => frame.t === "error"));
+			const error = frames.find((frame): frame is { t: "error"; message: string } => frame.t === "error");
+			expect(error?.message).toContain("bounded legacy history byte limit");
+		} finally {
+			guestSocket?.close();
+			try {
+				await host.stop("test");
+			} catch {}
+			uninstallInMemoryRelay();
+		}
+	});
+
+	it("rejects a legacy chunk train once aggregate serialized bytes exceed the transfer cap", async () => {
+		const body = "x".repeat(64 * 1024);
+		const entries = Array.from(
+			{ length: 1025 },
+			(_, index) =>
+				({
+					type: "message",
+					id: `legacy-${index}`,
+					parentId: null,
+					timestamp: "2026-08-28T00:00:00Z",
+					message: { role: "user", content: body, timestamp: index },
+				} as SessionEntry),
+			);
+		const roomKey = new Uint8Array(32);
+		const key = await importRoomKey(roomKey);
+		const roomId = "legacy-aggregate-limit";
+		const link = protocol.formatCollabLink("ws://localhost:8788", roomId, roomKey);
+		const relay = installInMemoryRelay();
+		const hostSocket = new CollabSocket({ wsUrl: "ws://localhost:8788/r/" + roomId, role: "host", key });
+		const hostOpen = Promise.withResolvers<void>();
+		hostSocket.onOpen = () => hostOpen.resolve();
+		hostSocket.onFrame = frame => {
+			if (frame.t !== "hello") return;
+			hostSocket.send({
+				t: "welcome",
+				proto: protocol.COLLAB_PROTO,
+				header: { type: "session", id: "legacy", timestamp: "2026-08-28T00:00:00Z", cwd: "/tmp" },
+				state: {} as protocol.CollabSessionState,
+				agents: [],
+				entryCount: entries.length,
+			} as protocol.CollabFrame);
+			for (let index = 0; index < entries.length; index++) {
+				hostSocket.send({ t: "snapshot-chunk", entries: [entries[index]!], final: index === entries.length - 1 });
+			}
+		};
+		hostSocket.connect();
+		await hostOpen.promise;
+		const receivedEntries: SessionEntry[] = [];
+		const guest = new CollabGuestLink(makeIntegrationGuestContext([], receivedEntries));
+		try {
+			await expect(guest.join(link)).rejects.toThrow("legacy snapshot bytes exceed bounded transfer limit");
+		} finally {
+			try {
+				await guest.leave("test");
+			} catch {}
+			hostSocket.close();
+			uninstallInMemoryRelay();
+		}
+	});
+	it("retransmits recovery controls while delivery is stalled", async () => {
+		const snapshot = makeIntegrationSnapshot(4, 20 * 1024);
+		const receivedEntries: SessionEntry[] = [];
+		const relay = installInMemoryRelay();
+		let sentHostFrames = 0;
+		relay.onHostFrame = () => sentHostFrames++;
+		relay.pauseGuestTraffic();
+		const hostCtx = makeIntegrationHostContext(snapshot) as unknown as IntegrationHostContext;
+		const guestCtx = makeIntegrationGuestContext(snapshot.entries, receivedEntries);
+		const host = new CollabHost(hostCtx);
+		const guest = new CollabGuestLink(guestCtx);
+		const writeSpy = spyOn(Bun, "write").mockResolvedValue(0);
+		let joinPromise: Promise<void> | undefined;
+		try {
+			vi.useFakeTimers();
+			await host.start("ws://localhost:8788");
+			joinPromise = guest.join(host.link);
+			void joinPromise.catch(() => {});
+			await waitFor(() => sentHostFrames >= 4);
+			const stalledCount = relay.pendingGuestDeliveryCount;
+			vi.advanceTimersByTime(protocol.SNAPSHOT_ACK_TIMEOUT_MS + 1);
+			await waitFor(() => relay.pendingGuestDeliveryCount > stalledCount);
+			expect(relay.pendingGuestDeliveryCount).toBeGreaterThan(stalledCount);
+			relay.resumeGuestTraffic();
+			await joinPromise;
+			expect(receivedEntries).toEqual(snapshot.entries);
+		} finally {
+			relay.resumeGuestTraffic();
+			try {
+				await guest.leave("test");
+			} catch {}
+			try {
+				await host.stop("test");
+			} catch {}
+			writeSpy.mockRestore();
+			vi.useRealTimers();
+			uninstallInMemoryRelay();
+		}
+	});
 	it("reconnects production host and guest with retained ACK state and live-frame flush", async () => {
 		const snapshot = makeIntegrationSnapshot(4, 20 * 1024);
 		const receivedEntries: SessionEntry[] = [];
@@ -505,7 +655,6 @@ describe("collab snapshot recovery", () => {
 			uninstallInMemoryRelay();
 		}
 	});
-
 	it("replaces a connected recovery after deferred live bounds overflow", async () => {
 		const snapshot = makeIntegrationSnapshot(129, 700);
 		const initialEntries = snapshot.entries.slice(0, 128);

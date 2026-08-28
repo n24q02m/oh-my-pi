@@ -12,7 +12,14 @@
  * Usage: `installInMemoryRelay()` in `beforeAll`/`beforeEach`,
  * `uninstallInMemoryRelay()` in the matching `afterAll`/`afterEach`.
  */
-import { rewriteEnvelopePeer, unpackEnvelope } from "@oh-my-pi/pi-coding-agent/collab/protocol";
+import {
+	checksumSnapshotPayload,
+	encodeSnapshotPayload,
+	type CollabFrame,
+	rewriteEnvelopePeer,
+	serializeSnapshotEntries,
+	unpackEnvelope,
+} from "@oh-my-pi/pi-coding-agent/collab/protocol";
 
 /** Active relay the fake transport routes through; set between install/uninstall. */
 let activeRelay: InMemoryRelay | null = null;
@@ -182,4 +189,35 @@ export function installInMemoryRelay(): InMemoryRelay {
 export function uninstallInMemoryRelay(): void {
 	globalThis.WebSocket = RealWebSocket;
 	activeRelay = null;
+}
+
+/** Send a complete empty recovery snapshot for manual host fixtures. */
+export function sendEmptyRecoveryFrames(
+	socket: { send(frame: CollabFrame, targetPeer?: number): void },
+	snapshotId: string,
+	recoveryEpoch: number,
+	resumeId?: string,
+): void {
+	const payload = serializeSnapshotEntries([]);
+	const checksum = checksumSnapshotPayload(payload);
+	socket.send({
+		t: "snapshot-begin",
+		snapshotId,
+		recoveryEpoch,
+		resumeId,
+		total: 1,
+		entryCount: 0,
+	});
+	socket.send({
+		t: "snapshot-chunk",
+		snapshotId,
+		recoveryEpoch,
+		seq: 0,
+		total: 1,
+		payload: encodeSnapshotPayload(payload),
+		checksum,
+		entries: [],
+		final: false,
+	});
+	socket.send({ t: "snapshot-end", snapshotId, recoveryEpoch, checksum });
 }

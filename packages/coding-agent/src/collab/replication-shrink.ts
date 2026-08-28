@@ -12,7 +12,8 @@
  * and reconnects, the next guest hello triggers the same oversized send, and
  * the loop never breaks (issue #3739).
  *
- * This helper bounds any JSON-serializable payload below
+ * This helper bounds any JSON-serializable payload below the encrypted
+ * WebSocket frame budget represented by
  * {@link MAX_REPLICATED_PAYLOAD_BYTES}. Already-small payloads pass through
  * untouched; oversized ones are returned as a deep-cloned shadow where long
  * strings are head-truncated AND long arrays are head-clipped, with
@@ -28,7 +29,12 @@
  * envelope (+ IV + tag), the 4-byte peer header, and the outer wire wrapper
  * fit comfortably under that on every reasonable relay.
  */
-export const MAX_REPLICATED_PAYLOAD_BYTES = 1 * 1024 * 1024;
+export const MAX_REPLICATED_PAYLOAD_BYTES = 96 * 1024;
+const replicationEncoder = new TextEncoder();
+
+function serializedBytes(value: unknown): number {
+	return replicationEncoder.encode(JSON.stringify(value)).byteLength;
+}
 
 /**
  * Progressive shrink passes. Each pass tightens both the per-string cap and
@@ -101,11 +107,11 @@ function shrinkWalk(value: unknown, stringCap: number, arrayLimit: number): unkn
  * other small metadata pass through untouched.
  */
 export function shrinkForReplication<T>(value: T): T {
-	if (JSON.stringify(value).length <= MAX_REPLICATED_PAYLOAD_BYTES) return value;
+	if (serializedBytes(value) <= MAX_REPLICATED_PAYLOAD_BYTES) return value;
 	let shrunk: unknown = value;
 	for (const pass of SHRINK_PASSES) {
 		shrunk = shrinkWalk(value, pass.stringCap, pass.arrayLimit);
-		if (JSON.stringify(shrunk).length <= MAX_REPLICATED_PAYLOAD_BYTES) return shrunk as T;
+		if (serializedBytes(shrunk) <= MAX_REPLICATED_PAYLOAD_BYTES) return shrunk as T;
 	}
 	return shrunk as T;
 }

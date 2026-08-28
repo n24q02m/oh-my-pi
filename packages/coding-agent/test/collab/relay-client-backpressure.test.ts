@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
-import { CollabSocket } from "../../src/collab/relay-client";
+import { CollabSocket, MAX_ENCRYPTED_COLLAB_FRAME_BYTES } from "../../src/collab/relay-client";
 
 const ORIGINAL_WEBSOCKET = globalThis.WebSocket;
 const HIGH_WATER_MARK = 64 * 1024;
@@ -117,6 +117,116 @@ describe("CollabSocket send backpressure", () => {
 			vi.advanceTimersByTime(DRAIN_RETRY_MS);
 			for (let flush = 0; flush < 5; flush++) await Promise.resolve();
 			expect(ws.sent).toHaveLength(1);
+		} finally {
+			socket.close();
+		}
+	});
+	it("flushes queued guest frames after the authenticated hello", async () => {
+		const plaintexts: string[] = [];
+		vi.spyOn(crypto.subtle, "encrypt").mockImplementation((_algorithm, _key, data) => {
+			const bytes = ArrayBuffer.isView(data)
+				? new Uint8Array(data.buffer, data.byteOffset, data.byteLength)
+				: new Uint8Array(data);
+			plaintexts.push(new TextDecoder().decode(bytes));
+			return Promise.resolve(bytes.slice().buffer);
+		});
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = 0;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const socket = new CollabSocket({
+			wsUrl: "ws://localhost:8788/r/handshake",
+			role: "guest",
+			key: {} as CryptoKey,
+		});
+		socket.onOpen = () => socket.send({ t: "hello", proto: 1, name: "guest" });
+		socket.send({ t: "prompt", text: "queued before open" });
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0];
+			if (!ws) throw new Error("CollabSocket did not construct a WebSocket");
+			ws.open();
+			for (let flush = 0; flush < 10; flush++) await Promise.resolve();
+			expect(plaintexts.map(value => (JSON.parse(value) as { t: string }).t)).toEqual(["hello", "prompt"]);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("counts UTF-8 bytes when rejecting oversized control messages", () => {
+		vi.useFakeTimers();
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = 0;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const socket = new CollabSocket({
+			wsUrl: "ws://localhost:8788/r/control",
+			role: "host",
+			key: {} as CryptoKey,
+		});
+		const closes: { reason: string; willReconnect: boolean }[] = [];
+		socket.onClose = (reason, willReconnect) => closes.push({ reason, willReconnect });
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0];
+			if (!ws) throw new Error("CollabSocket did not construct a WebSocket");
+			ws.open();
+			const control = JSON.stringify({ t: "peer-joined", peer: 1, padding: "漢".repeat(22_000) });
+			expect(control.length).toBeLessThan(64 * 1024);
+			expect(new TextEncoder().encode(control).byteLength).toBeGreaterThan(64 * 1024);
+			ws.onmessage?.({ data: control } as MessageEvent);
+			expect(closes).toEqual([{ reason: "connection reset; reconnecting", willReconnect: true }]);
+			expect(socket.isOpen).toBe(false);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("reconnects instead of dispatching an oversized encrypted frame", () => {
+		vi.useFakeTimers();
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = 0;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const socket = new CollabSocket({
+			wsUrl: "ws://localhost:8788/r/oversized",
+			role: "host",
+			key: {} as CryptoKey,
+		});
+		const closes: { reason: string; willReconnect: boolean }[] = [];
+		socket.onClose = (reason, willReconnect) => closes.push({ reason, willReconnect });
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0];
+			if (!ws) throw new Error("CollabSocket did not construct a WebSocket");
+			ws.open();
+			ws.onmessage?.({ data: new Uint8Array(MAX_ENCRYPTED_COLLAB_FRAME_BYTES + 1) } as MessageEvent);
+			expect(closes).toEqual([{ reason: "connection reset; reconnecting", willReconnect: true }]);
+			expect(socket.isOpen).toBe(false);
+		} finally {
+			socket.close();
+		}
+	});
+
+	it("reconnects when the inbound frame queue reaches its bounded count", () => {
+		vi.useFakeTimers();
+		BackpressuredWebSocket.instances = [];
+		BackpressuredWebSocket.initialBufferedAmount = 0;
+		globalThis.WebSocket = BackpressuredWebSocket as unknown as typeof WebSocket;
+		const socket = new CollabSocket({
+			wsUrl: "ws://localhost:8788/r/flood",
+			role: "host",
+			key: {} as CryptoKey,
+		});
+		const closes: { reason: string; willReconnect: boolean }[] = [];
+		socket.onClose = (reason, willReconnect) => closes.push({ reason, willReconnect });
+		socket.onCorruptFrame = () => {};
+		try {
+			socket.connect();
+			const ws = BackpressuredWebSocket.instances[0];
+			if (!ws) throw new Error("CollabSocket did not construct a WebSocket");
+			ws.open();
+			const frame = new Uint8Array(4 + 32);
+			for (let index = 0; index < 257; index++) ws.onmessage?.({ data: frame.slice() } as MessageEvent);
+			expect(closes).toEqual([{ reason: "connection reset; reconnecting", willReconnect: true }]);
+			expect(socket.isOpen).toBe(false);
 		} finally {
 			socket.close();
 		}
