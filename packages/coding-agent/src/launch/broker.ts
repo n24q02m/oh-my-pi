@@ -8,6 +8,7 @@ import { isEexist, isEnoent, logger, postmortem, procmgr, sanitizeText, setProce
 import { hostHasInheritableConsole } from "../eval/py/spawn-options";
 import { truncateHead, truncateHeadBytes, truncateTail, truncateTailBytes } from "../session/streaming-output";
 import { workerEnvFromParent } from "../subprocess/worker-client";
+import { PairingStore } from "./pairing-store";
 import { daemonBrokerEndpoint, writeDaemonScopeMeta } from "./paths";
 import { hasLiveDaemonProjectPresence, pruneDeadDaemonRuntimeDirs } from "./presence";
 import {
@@ -16,6 +17,7 @@ import {
 	DAEMON_PTY_COLUMNS,
 	DAEMON_PTY_ROWS,
 	DAEMON_RUNTIME_DIR_ENV,
+	type DaemonCapability,
 	type DaemonCompletionNotification,
 	type DaemonNativeServerOptions,
 	type DaemonOperation,
@@ -52,6 +54,7 @@ const RESTART_BACKOFF_BASE_MS = 1_000;
  */
 const MAX_TERMINAL_DAEMONS_LISTED = 10;
 const TOKEN_FILE = "broker.token";
+const PAIRING_FILE = "paired-devices.json";
 const MAX_NATIVE_TOKEN_BYTES = 16 * 1024;
 function nativeNoFollowFlag(label: string): number | undefined {
 	// Windows fallback is paired with ACL/reparse preflight and post-read handle identity checks.
@@ -405,6 +408,32 @@ function connectPort(host: string, port: number): Promise<boolean> {
 	return promise;
 }
 
+function capabilityForOperation(operation: DaemonOperation): DaemonCapability | undefined {
+	switch (operation.op) {
+		case "ping":
+		case "list":
+		case "logs":
+		case "wait":
+		case "describe":
+			return "observe";
+		case "start":
+		case "send":
+		case "stop":
+		case "restart":
+			return "control-session";
+		case "pair-approve":
+			return "approve";
+		case "pair-begin":
+		case "pair-list":
+		case "pair-revoke":
+		case "pair-rotate":
+		case "shutdown":
+			return "manage-devices";
+		case "pair-claim":
+			return undefined;
+	}
+}
+
 class DaemonBroker {
 	readonly #projectDir: string;
 	readonly #runtimeDir: string;
@@ -413,6 +442,7 @@ class DaemonBroker {
 	readonly #idleGraceMs: number;
 	readonly #restartBackoffBaseMs: number;
 	readonly #nativeServerOptions: DaemonNativeServerOptions | undefined;
+	readonly #pairing: PairingStore;
 	readonly #records = new Map<string, ManagedDaemon>();
 	/**
 	 * Names reserved by an in-flight `start` before its record lands in
@@ -449,10 +479,15 @@ class DaemonBroker {
 		this.#idleGraceMs = idleGraceMs;
 		this.#restartBackoffBaseMs = restartBackoffBaseMs;
 		this.#nativeServerOptions = nativeServerOptions;
+		this.#pairing = new PairingStore({
+			filePath: path.join(runtimeDir, PAIRING_FILE),
+			secret: token,
+		});
 	}
 
 	async run(): Promise<void> {
 		await this.#recoverRecords();
+		await this.#pairing.initialize();
 		try {
 			if (process.platform !== "win32") await fs.rm(this.#endpoint, { force: true });
 			const localServer = net.createServer(socket => this.#accept(socket, false));
@@ -498,6 +533,7 @@ class DaemonBroker {
 			await record.log?.close();
 			await record.persistQueue;
 		}
+		await this.#pairing.flush();
 		this.#ownerSockets.clear();
 		for (const socket of this.#sockets) socket.destroy();
 		this.#sockets.clear();
@@ -581,7 +617,7 @@ class DaemonBroker {
 			const decoded: unknown = JSON.parse(line);
 			const request = parseDaemonWireRequest(decoded);
 			id = request.id;
-			if (request.token !== this.#token) throw new Error("Daemon broker authentication failed");
+			await this.#authorize(request);
 			onAuthenticated();
 			for (const owner of request.completionUnsubscribes ?? []) {
 				const subscriptionId = this.#completionSubscriptions.get(owner);
@@ -664,10 +700,40 @@ class DaemonBroker {
 		}
 	}
 
+	async #authorize(request: DaemonWireRequest): Promise<void> {
+		if (request.token === this.#token) return;
+		if (request.operation.op === "pair-claim") {
+			if (request.token === request.operation.code) return;
+			throw new Error("Daemon broker authentication failed");
+		}
+		const device = await this.#pairing.authenticate(request.token);
+		if (!device) throw new Error("Daemon broker authentication failed");
+		const required = capabilityForOperation(request.operation);
+		if (required === undefined || !device.capabilities.includes(required)) {
+			throw new Error(`Daemon capability ${required ?? "none"} is required for ${request.operation.op}`);
+		}
+	}
+
 	async #dispatch(operation: DaemonOperation): Promise<DaemonRpcResult> {
 		switch (operation.op) {
 			case "ping":
 				return { op: "ping", projectDir: this.#projectDir };
+			case "pair-begin":
+				return {
+					op: "pair-begin",
+					...(await this.#pairing.begin(operation.name, operation.capabilities, operation.ttlMs)),
+				};
+			case "pair-approve":
+				return { op: "pair-approve", ...(await this.#pairing.approve(operation.code)) };
+			case "pair-claim":
+				return { op: "pair-claim", ...(await this.#pairing.claim(operation.code)) };
+			case "pair-list":
+				return { op: "pair-list", devices: await this.#pairing.list() };
+			case "pair-revoke":
+				await this.#pairing.revoke(operation.id);
+				return { op: "pair-revoke", id: operation.id };
+			case "pair-rotate":
+				return { op: "pair-rotate", ...(await this.#pairing.rotate(operation.id)) };
 			case "start":
 				return this.#start(operation.spec, operation.owner);
 			case "list": {
