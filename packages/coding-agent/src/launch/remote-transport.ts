@@ -49,6 +49,15 @@ foreach ($spec in $specs) {
   $target = [string]$spec.path
   $fullTarget = [System.IO.Path]::GetFullPath($target)
   $rootPath = [System.IO.Path]::GetPathRoot($fullTarget)
+  if ($rootPath.Length -ne 3 -or $rootPath[1] -ne ":" -or [int][char]$rootPath[2] -ne 92) { throw "Native Windows path must use a local drive root: $target" }
+  $driveInfo = $null
+  try {
+    $driveInfo = New-Object -TypeName System.IO.DriveInfo -ArgumentList $rootPath
+    if (-not $driveInfo.IsReady) { throw "drive is not ready" }
+  } catch {
+    throw "Native Windows path volume could not be verified as a fixed local volume: $rootPath"
+  }
+  if ($driveInfo.DriveType -ne [System.IO.DriveType]::Fixed) { throw "Native Windows path must use a fixed local volume: $rootPath" }
   $relative = $fullTarget.Substring($rootPath.Length)
   $parts = @($relative -split '[\\\\/]' | Where-Object { $_ -ne '' })
   $paths = @()
@@ -134,8 +143,12 @@ function runWindowsAclProbe(specs: readonly NativePathSafetySpec[]): Promise<voi
 }
 function assertWindowsLocalPath(targetPath: string): void {
 	const normalized = path.win32.normalize(targetPath);
-	const isUnc = normalized.startsWith("//") || (normalized.charCodeAt(0) === 92 && normalized.charCodeAt(1) === 92);
-	if (isUnc) throw new Error("Native Windows paths must use a local volume; UNC and remote roots are unsupported");
+	const isRootRelative = normalized.charCodeAt(0) === 92;
+	if (isRootRelative) {
+		throw new Error(
+			"Native Windows paths must use an explicit local drive; UNC, device, and namespace roots are unsupported",
+		);
+	}
 }
 
 function nativeNoFollowFlag(label: string): number | undefined {

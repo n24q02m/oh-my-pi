@@ -258,6 +258,29 @@ describe("native remote transport sockets", () => {
 		15_000,
 	);
 
+	it.skipIf(process.platform !== "win32")(
+		"rejects NT namespace and non-fixed volume roots",
+		async () => {
+			const slash = String.fromCharCode(92);
+			const namespacePaths = [
+				`${slash}Device${slash}Mup${slash}server${slash}share${slash}broker.token`,
+				`${slash}?${slash}UNC${slash}server${slash}share${slash}broker.token`,
+				`${slash}.${slash}pipe${slash}broker`,
+				"/server/share/broker.token",
+			];
+			for (const targetPath of namespacePaths) {
+				await expect(assertNativePathSafe(targetPath, { privateFinal: true, privateParent: true })).rejects.toThrow(
+					/local volume|namespace|UNC|remote root/i,
+				);
+			}
+			const nonFixedVolumePath = `Z:${slash}omp-native-root${slash}broker.token`;
+			await expect(
+				assertNativePathSafe(nonFixedVolumePath, { privateFinal: true, privateParent: true }),
+			).rejects.toThrow(/fixed local volume|local volume|network|remote volume/i);
+		},
+		15_000,
+	);
+
 	it("rejects a native private file under an untrusted writable parent", async () => {
 		const root = await fs.mkdtemp(path.join(os.homedir(), "omp-native-unsafe-"));
 		const parent = path.join(root, "parent");
