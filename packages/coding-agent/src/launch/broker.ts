@@ -30,7 +30,7 @@ import {
 	parseDaemonWireMessage,
 	parseDaemonWireRequest,
 } from "./protocol";
-import { createDaemonNativeServer, type DaemonNativeRemoteServer } from "./remote-transport";
+import { assertNativePathSafe, createDaemonNativeServer, type DaemonNativeRemoteServer } from "./remote-transport";
 import { resolveDaemonSpawnOptions } from "./spawn-options";
 import { renderTerminalOutput } from "./terminal-output";
 
@@ -115,16 +115,14 @@ function quoteShellArg(value: string): string {
 }
 
 async function readNativeBrokerToken(runtimeDir: string): Promise<string> {
-	if (process.platform === "win32") {
-		throw new Error("Native remote broker token permissions cannot be verified safely on Windows");
-	}
 	const tokenPath = path.join(runtimeDir, TOKEN_FILE);
+	await assertNativePathSafe(tokenPath, { privateFinal: true, privateParent: true });
 	let handle: fs.FileHandle | undefined;
 	try {
 		handle = await fs.open(tokenPath, nodeFs.constants.O_RDONLY | NOFOLLOW_FLAG);
 		const stat = await handle.stat();
 		if (!stat.isFile()) throw new Error("Native daemon broker token must be a regular file");
-		if ((stat.mode & 0o077) !== 0)
+		if (process.platform !== "win32" && (stat.mode & 0o077) !== 0)
 			throw new Error("Native daemon broker token must not be readable by group or other users");
 		if (stat.size > MAX_NATIVE_TOKEN_BYTES)
 			throw new Error("Native daemon broker token file exceeds the 16 KiB limit");
@@ -438,19 +436,34 @@ class DaemonBroker {
 
 	async run(): Promise<void> {
 		await this.#recoverRecords();
-		if (this.#nativeServerOptions) {
-			this.#nativeServer = await createDaemonNativeServer(this.#nativeServerOptions, socket => this.#accept(socket));
-			this.#server = this.#nativeServer.server;
-		} else {
+		try {
 			if (process.platform !== "win32") await fs.rm(this.#endpoint, { force: true });
-			const server = net.createServer(socket => this.#accept(socket));
-			this.#server = server;
+			const localServer = net.createServer(socket => this.#accept(socket, false));
+			this.#server = localServer;
 			const { promise: listening, resolve, reject } = Promise.withResolvers<void>();
-			server.once("listening", resolve);
-			server.once("error", reject);
-			server.listen(this.#endpoint);
+			localServer.once("listening", resolve);
+			localServer.once("error", reject);
+			localServer.listen(this.#endpoint);
 			await listening;
 			if (process.platform !== "win32") await fs.chmod(this.#endpoint, 0o600);
+			if (this.#nativeServerOptions) {
+				this.#nativeServer = await createDaemonNativeServer(this.#nativeServerOptions, socket =>
+					this.#accept(socket, true),
+				);
+			}
+		} catch (error) {
+			for (const socket of this.#sockets) socket.destroy();
+			this.#sockets.clear();
+			const nativeServer = this.#nativeServer;
+			this.#nativeServer = undefined;
+			await nativeServer?.close().catch(() => undefined);
+			const localServer = this.#server;
+			this.#server = undefined;
+			if (localServer?.listening) {
+				await new Promise<void>(resolve => localServer.close(() => resolve()));
+			}
+			if (process.platform !== "win32") await fs.rm(this.#endpoint, { force: true });
+			throw error;
 		}
 		this.#scheduleIdleShutdown();
 		await this.#finished.promise;
@@ -472,21 +485,21 @@ class DaemonBroker {
 		for (const socket of this.#sockets) socket.destroy();
 		this.#sockets.clear();
 		this.#clients.clear();
-		if (this.#nativeServer) {
-			await this.#nativeServer.close();
-			this.#nativeServer = undefined;
-		} else if (this.#server) {
-			const { promise, resolve } = Promise.withResolvers<void>();
-			this.#server.close(() => resolve());
-			await promise;
+		const nativeServer = this.#nativeServer;
+		this.#nativeServer = undefined;
+		await nativeServer?.close();
+		const localServer = this.#server;
+		this.#server = undefined;
+		if (localServer?.listening) {
+			await new Promise<void>(resolve => localServer.close(() => resolve()));
 		}
 		if (process.platform !== "win32") await fs.rm(this.#endpoint, { force: true });
 		this.#finished.resolve();
 	}
 
-	#accept(socket: net.Socket): void {
+	#accept(socket: net.Socket, remote = false): void {
 		this.#sockets.add(socket);
-		const isRemote = this.#nativeServerOptions !== undefined;
+		const isRemote = remote;
 		let authenticated = false;
 		let authenticationAttempts = 0;
 		let unauthenticatedBytes = 0;

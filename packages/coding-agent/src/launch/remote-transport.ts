@@ -1,8 +1,11 @@
+import * as childProcess from "node:child_process";
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as net from "node:net";
+import * as path from "node:path";
 import * as tls from "node:tls";
+import { assertOwnerPrivateDir } from "../ssh/connection-manager";
 import {
 	type DaemonNativeRemoteTarget,
 	type DaemonNativeServerOptions,
@@ -14,7 +17,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
 const DEFAULT_GLOBAL_ATTEMPT_LIMIT = 64;
 const DEFAULT_SOURCE_ATTEMPT_LIMIT = 16;
 const DEFAULT_ATTEMPT_WINDOW_MS = 60_000;
-const DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS = 10_000;
+const DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS = 2_000;
 const MAX_TLS_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_SOURCE_BUCKETS = 1_024;
 const SOURCE_BUCKET_SWEEP_MS = 60_000;
@@ -33,6 +36,139 @@ const TLS_VALIDATION_ERRORS = new Set([
 	"UNABLE_TO_VERIFY_LEAF_SIGNATURE",
 ]);
 
+const WINDOWS_ACL_TIMEOUT_MS = 5_000;
+const WINDOWS_ACL_MAX_BUFFER_BYTES = 128 * 1024;
+const WINDOWS_ACL_SCRIPT = `$ErrorActionPreference = 'Stop'
+$specs = @($env:OMP_NATIVE_ACL_SPECS | ConvertFrom-Json)
+$currentSid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+$systemSid = 'S-1-5-18'
+$administratorsSid = 'S-1-5-32-544'
+$writeMask = [System.Security.AccessControl.FileSystemRights]::WriteData -bor [System.Security.AccessControl.FileSystemRights]::AppendData -bor [System.Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor [System.Security.AccessControl.FileSystemRights]::WriteAttributes -bor [System.Security.AccessControl.FileSystemRights]::Delete -bor [System.Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor [System.Security.AccessControl.FileSystemRights]::ChangePermissions -bor [System.Security.AccessControl.FileSystemRights]::TakeOwnership -bor [System.Security.AccessControl.FileSystemRights]::FullControl
+foreach ($spec in $specs) {
+  $target = [string]$spec.path
+  $item = Get-Item -LiteralPath $target -Force -ErrorAction Stop
+  $wantDirectory = [bool]$spec.directory
+  if ($wantDirectory -and -not $item.PSIsContainer) { throw "Native path is not a directory: $target" }
+  if (-not $wantDirectory -and $item.PSIsContainer) { throw "Native path is not a file: $target" }
+  $cursor = $item
+  $depth = 0
+  $privateParent = [bool]$spec.privateParent
+  while ($null -ne $cursor) {
+    if (($cursor.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) { throw "Native path contains a reparse point: $($cursor.FullName)" }
+    $acl = Get-Acl -LiteralPath $cursor.FullName -ErrorAction Stop
+    try { $ownerSid = ([System.Security.Principal.NTAccount]$acl.Owner).Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { $ownerSid = [string]$acl.Owner }
+    $strict = ($depth -eq 0 -and [bool]$spec.privateFinal) -or ($depth -eq 1 -and $privateParent)
+    if ($strict -and $ownerSid -ne $currentSid) {
+      if ($depth -eq 0) { throw "Native private path is not owned by the current user: $($cursor.FullName)" }
+      throw "Native private parent is not owned by the current user: $($cursor.FullName)"
+    }
+    foreach ($entry in @($acl.Access)) {
+      try { $sid = $entry.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]).Value } catch { $sid = [string]$entry.IdentityReference.Value }
+      $rights = [System.Security.AccessControl.FileSystemRights]$entry.FileSystemRights
+      $write = (($rights -band $writeMask) -ne 0)
+      $trusted = $sid -eq $currentSid -or $sid -eq $systemSid -or $sid -eq $administratorsSid
+      if ($strict) {
+        if ($entry.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { throw "Native private path has a deny ACL: $($cursor.FullName)" }
+        if (-not $trusted) { throw "Native private path has an untrusted ACL entry: $($cursor.FullName)" }
+      } elseif ($write -and -not $trusted) {
+        throw "Native path parent is writable by an untrusted principal: $($cursor.FullName)"
+      }
+    }
+    $depth += 1
+    $cursor = $cursor.Parent
+  }
+}
+Write-Output 'OMP_NATIVE_ACL_OK'`;
+
+interface NativePathSafetySpec {
+	path: string;
+	directory: boolean;
+	privateFinal: boolean;
+	privateParent: boolean;
+}
+
+function nativePowerShellPath(): string {
+	return path.join(process.env.SystemRoot ?? "C:\\Windows", "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+}
+
+function runWindowsAclProbe(specs: readonly NativePathSafetySpec[]): Promise<void> {
+	const { promise, resolve, reject } = Promise.withResolvers<void>();
+	try {
+		childProcess.execFile(
+			nativePowerShellPath(),
+			["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", WINDOWS_ACL_SCRIPT],
+			{
+				env: { ...process.env, OMP_NATIVE_ACL_SPECS: JSON.stringify(specs) },
+				windowsHide: true,
+				timeout: WINDOWS_ACL_TIMEOUT_MS,
+				maxBuffer: WINDOWS_ACL_MAX_BUFFER_BYTES,
+			},
+			(error, stdout, stderr) => {
+				if (error) {
+					const detail = stderr.trim().split(/\r?\n/u).filter(Boolean).at(-1) ?? error.message;
+					reject(new Error(`Windows native path ACL verification failed: ${detail}`));
+					return;
+				}
+				if (stdout.trim() !== "OMP_NATIVE_ACL_OK") {
+					reject(new Error("Windows native path ACL verification returned an invalid result"));
+					return;
+				}
+				resolve();
+			},
+		);
+	} catch (error) {
+		reject(error instanceof Error ? error : new Error(String(error)));
+	}
+	return promise;
+}
+
+function assertPosixDirectoryChain(directory: string, label: string, skipFinal = false): void {
+	const directoryFlag = (fs.constants as Record<string, number>).O_DIRECTORY ?? 0;
+	const noFollowFlag = (fs.constants as Record<string, number>).O_NOFOLLOW ?? 0;
+	let current = path.resolve(directory);
+	for (;;) {
+		if (!(skipFinal && current === path.resolve(directory))) {
+			let fd: number | undefined;
+			try {
+				fd = fs.openSync(current, fs.constants.O_RDONLY | directoryFlag | noFollowFlag);
+				const stat = fs.fstatSync(fd);
+				if (!stat.isDirectory()) throw new Error(`Native ${label} parent is not a directory: ${current}`);
+				const mode = stat.mode & 0o7777;
+				if ((mode & 0o022) !== 0 && (mode & 0o1000) === 0) {
+					throw new Error(`Native ${label} parent is writable by group or other users: ${current}`);
+				}
+			} catch (error) {
+				if (error instanceof Error && /^Native /u.test(error.message)) throw error;
+				throw new Error(
+					`Native ${label} parent is not safely accessible: ${error instanceof Error ? error.message : String(error)}`,
+				);
+			} finally {
+				if (fd !== undefined) fs.closeSync(fd);
+			}
+		}
+		const parent = path.dirname(current);
+		if (parent === current) break;
+		current = parent;
+	}
+}
+
+/** Validate the target and every existing parent before reading a native secret or key. */
+export async function assertNativePathSafe(
+	targetPath: string,
+	options: { directory?: boolean; privateFinal?: boolean; privateParent?: boolean } = {},
+): Promise<void> {
+	if (!targetPath) throw new Error("Native path is required");
+	const directory = options.directory === true;
+	const privateFinal = options.privateFinal === true;
+	const privateParent = options.privateParent === true;
+	if (process.platform === "win32") {
+		await runWindowsAclProbe([{ path: path.resolve(targetPath), directory, privateFinal, privateParent }]);
+		return;
+	}
+	const finalDirectory = directory ? path.resolve(targetPath) : path.dirname(path.resolve(targetPath));
+	if ((directory && privateFinal) || (!directory && privateParent)) assertOwnerPrivateDir(finalDirectory);
+	assertPosixDirectoryChain(finalDirectory, "path", (directory && privateFinal) || (!directory && privateParent));
+}
 export interface DaemonNativeAttemptLimits {
 	globalMaxAttempts?: number;
 	sourceMaxAttempts?: number;
@@ -75,16 +211,14 @@ function sourceAddress(socket: net.Socket): string {
 }
 
 function privateFileModeIsSafe(stat: fs.Stats): boolean {
-	if (process.platform === "win32") return false;
 	if (!stat.isFile()) return false;
+	if (process.platform === "win32") return true;
 	return (stat.mode & 0o077) === 0;
 }
 
 async function readBoundedFile(filePath: string, label: string, privateFile: boolean): Promise<Buffer> {
 	if (!filePath) throw new Error(`Native TLS ${label} path is required`);
-	if (process.platform === "win32") {
-		throw new Error("Native TLS certificate/private-key file safety cannot be verified safely on Windows");
-	}
+	await assertNativePathSafe(filePath, { privateFinal: privateFile });
 	let handle: fs.promises.FileHandle | undefined;
 	try {
 		handle = await fsp.open(filePath, fs.constants.O_RDONLY | NOFOLLOW_FLAG);
@@ -297,6 +431,17 @@ export async function createDaemonNativeServer(
 ): Promise<DaemonNativeRemoteServer> {
 	const serverOptions = parseDaemonNativeServerOptions(value);
 	const limiter = new AttemptLimiter(options.limits);
+	const tlsHandshakeTimers = new Map<net.Socket, NodeJS.Timeout>();
+	const clearTlsHandshakeTimer = (socket: net.Socket): void => {
+		const timer = tlsHandshakeTimers.get(socket);
+		if (timer === undefined) return;
+		clearTimeout(timer);
+		tlsHandshakeTimers.delete(socket);
+	};
+	const clearAllTlsHandshakeTimers = (): void => {
+		for (const timer of tlsHandshakeTimers.values()) clearTimeout(timer);
+		tlsHandshakeTimers.clear();
+	};
 	const sockets = new Set<net.Socket>();
 	const admittedTlsSockets = new Set<net.Socket>();
 	const trackSocket = (socket: net.Socket): void => {
@@ -305,7 +450,19 @@ export async function createDaemonNativeServer(
 		socket.once("close", () => {
 			sockets.delete(socket);
 			admittedTlsSockets.delete(socket);
+			clearTlsHandshakeTimer(socket);
 		});
+	};
+	const tlsParentSocket = (socket: net.Socket): net.Socket => {
+		const parent = (socket as tls.TLSSocket & { _parent?: net.Socket })._parent;
+		return parent ?? socket;
+	};
+	const destroyTlsPair = (socket: net.Socket): void => {
+		const parent = tlsParentSocket(socket);
+		clearTlsHandshakeTimer(parent);
+		admittedTlsSockets.delete(parent);
+		socket.destroy();
+		if (parent !== socket) parent.destroy();
 	};
 	const invokeConnection = (socket: net.Socket): void => {
 		try {
@@ -332,11 +489,13 @@ export async function createDaemonNativeServer(
 			const tlsServer = tls.createServer(
 				{ cert, key, minVersion: "TLSv1.2", handshakeTimeout: DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS },
 				socket => {
-					if (!admittedTlsSockets.delete(socket)) {
-						socket.destroy();
+					const parent = tlsParentSocket(socket);
+					clearTlsHandshakeTimer(parent);
+					if (!admittedTlsSockets.delete(parent)) {
+						destroyTlsPair(socket);
 						return;
 					}
-					socket.setTimeout(0);
+					trackSocket(socket);
 					invokeConnection(socket);
 				},
 			);
@@ -348,9 +507,12 @@ export async function createDaemonNativeServer(
 					return;
 				}
 				admittedTlsSockets.add(socket);
-				socket.setTimeout(DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS, () => socket.destroy());
+				const timer = setTimeout(() => {
+					destroyTlsPair(socket);
+				}, DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS);
+				tlsHandshakeTimers.set(socket, timer);
 			});
-			tlsServer.on("tlsClientError", (_error, socket) => socket.destroy());
+			tlsServer.on("tlsClientError", (_error, socket) => destroyTlsPair(socket));
 		} else {
 			server = net.createServer(socket => accept(socket));
 		}
@@ -370,12 +532,14 @@ export async function createDaemonNativeServer(
 		await listening;
 	} catch (error) {
 		limiter.close();
+		clearAllTlsHandshakeTimers();
 		for (const socket of sockets) socket.destroy();
 		if (server) await closeServer(server).catch(() => undefined);
 		throw error;
 	}
 	if (!server) {
 		limiter.close();
+		clearAllTlsHandshakeTimers();
 		throw new Error("Native remote server failed to initialize");
 	}
 	const discoveryTarget = { ...serverOptions.target };
@@ -391,6 +555,7 @@ export async function createDaemonNativeServer(
 			if (closed) return;
 			closed = true;
 			limiter.close();
+			clearAllTlsHandshakeTimers();
 			for (const socket of sockets) socket.destroy();
 			await closeServer(server);
 		},

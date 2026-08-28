@@ -20,7 +20,7 @@ import {
 	parseDaemonRpcResult,
 	parseDaemonWireMessage,
 } from "./protocol";
-import { connectDaemonNativeRemote } from "./remote-transport";
+import { assertNativePathSafe, connectDaemonNativeRemote } from "./remote-transport";
 import { resolveDaemonSpawnOptions } from "./spawn-options";
 
 const CONNECT_TIMEOUT_MS = 10_000;
@@ -107,18 +107,14 @@ async function readOrCreateToken(runtimeDir: string): Promise<string> {
 }
 
 async function readExistingToken(runtimeDir: string): Promise<string> {
-	if (process.platform === "win32") {
-		throw new Error(
-			"Native remote broker token permissions cannot be verified safely on Windows; pass an explicit token",
-		);
-	}
 	const tokenPath = path.join(runtimeDir, TOKEN_FILE);
+	await assertNativePathSafe(tokenPath, { privateFinal: true, privateParent: true });
 	let handle: fs.FileHandle | undefined;
 	try {
 		handle = await fs.open(tokenPath, nodeFs.constants.O_RDONLY | NOFOLLOW_FLAG);
 		const stat = await handle.stat();
 		if (!stat.isFile()) throw new Error("Native daemon broker token must be a regular file");
-		if ((stat.mode & 0o077) !== 0)
+		if (process.platform !== "win32" && (stat.mode & 0o077) !== 0)
 			throw new Error("Native daemon broker token must not be readable by group or other users");
 		if (stat.size > MAX_TOKEN_BYTES) throw new Error("Native daemon broker token file exceeds the 16 KiB limit");
 		const buffer = Buffer.allocUnsafe(MAX_TOKEN_BYTES + 1);
