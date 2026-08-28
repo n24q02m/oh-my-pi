@@ -4,7 +4,9 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { DaemonBrokerClient } from "../../src/launch/client";
+import { startDaemonBrokerFromEnvironment } from "../../src/launch/broker";
+import { createDaemonBrokerClient, type DaemonBrokerClient } from "../../src/launch/client";
+import { daemonBrokerEndpoint } from "../../src/launch/paths";
 import {
 	assertNativePathSafe,
 	connectDaemonNativeRemote,
@@ -382,8 +384,6 @@ describe("native remote transport sockets", () => {
 	});
 
 	it("serves the local endpoint and native endpoint concurrently", async () => {
-		const { daemonBrokerEndpoint } = await import("../../src/launch/paths");
-		const { startDaemonBrokerFromEnvironment } = await import("../../src/launch/broker");
 		const projectDir = await privateTempDir("omp-native-concurrent-project-");
 		const runtimeRoot = await privateTempDir("omp-native-concurrent-runtime-");
 		const runtimeDir = path.join(runtimeRoot, "runtime");
@@ -426,7 +426,6 @@ describe("native remote transport sockets", () => {
 		}
 	}, 15_000);
 	it("bounds client response and line buffering", async () => {
-		const { createDaemonBrokerClient } = await import("../../src/launch/client");
 		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-native-response-project-"));
 		const target = { transport: "tcp" as const, host: "127.0.0.1" as const, port: await freePort() };
 		let server: DaemonNativeRemoteServer | undefined;
@@ -449,7 +448,6 @@ describe("native remote transport sockets", () => {
 	});
 
 	it("bounds unauthenticated native broker guesses", async () => {
-		const { startDaemonBrokerFromEnvironment } = await import("../../src/launch/broker");
 		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-native-auth-project-"));
 		const runtimeRoot = await privateTempDir("omp-native-auth-runtime-");
 		const runtimeDir = path.join(runtimeRoot, "runtime");
@@ -489,7 +487,6 @@ describe("native remote transport sockets", () => {
 	}, 15_000);
 
 	it("does not spawn or fall back to a local broker after a remote error", async () => {
-		const { createDaemonBrokerClient } = await import("../../src/launch/client");
 		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-native-remote-project-"));
 		const runtimeDir = path.join(projectDir, "runtime");
 		await fs.mkdir(runtimeDir, { recursive: true });
