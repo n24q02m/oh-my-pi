@@ -56,6 +56,15 @@ export const SNAPSHOT_MAX_RETAINED_TRANSFERS = 8;
 export const SNAPSHOT_RESUME_RETENTION_MS = 5 * 60 * 1000;
 /** Maximum unencrypted payload bytes carried by one recovery chunk. */
 export const SNAPSHOT_CHUNK_PAYLOAD_BYTES = 64 * 1024;
+/** Maximum number of retained payloads in one transfer. */
+export const SNAPSHOT_MAX_PAYLOAD_COUNT = 4096;
+/** Maximum decoded bytes retained by one snapshot transfer. */
+export const SNAPSHOT_MAX_TRANSFER_BYTES = 64 * 1024 * 1024;
+/** Maximum session entries retained in one snapshot history. */
+export const SNAPSHOT_MAX_ENTRY_COUNT = 16_384;
+export const SNAPSHOT_PAGE_MAX_RETRIES = 4;
+export const SNAPSHOT_PAGE_ACK_TIMEOUT_MS = 250;
+export const SNAPSHOT_MAX_SEEN_CURSORS = 256;
 
 export type SnapshotHello = {
 	t: "hello";
@@ -122,6 +131,35 @@ export type SnapshotPageAckFrame = {
 	snapshotId: string;
 	cursor: string;
 };
+export interface SnapshotPageSendResult {
+	frame?: SnapshotPageFrame;
+	complete: boolean;
+	exhausted: boolean;
+}
+
+/** Retry state for one paginated history response. */
+export class SnapshotPageSender {
+	readonly #frame: SnapshotPageFrame;
+	#attempts = 0;
+	#acked = false;
+
+	constructor(frame: SnapshotPageFrame) {
+		this.#frame = frame;
+	}
+
+	acknowledge(ack: SnapshotPageAckFrame): boolean {
+		if (ack.snapshotId !== this.#frame.snapshotId || ack.cursor !== this.#frame.cursor) return false;
+		this.#acked = true;
+		return true;
+	}
+
+	onTimeout(): SnapshotPageSendResult {
+		if (this.#acked) return { complete: true, exhausted: false };
+		if (this.#attempts >= SNAPSHOT_PAGE_MAX_RETRIES) return { complete: false, exhausted: true };
+		this.#attempts++;
+		return { frame: this.#frame, complete: false, exhausted: false };
+	}
+}
 
 export function encodeSnapshotPayload(payload: Uint8Array): string {
 	return Buffer.from(payload).toString("base64url");
@@ -177,6 +215,13 @@ export class SnapshotSender {
 
 	constructor(snapshotId: string, payloads: readonly Uint8Array[]) {
 		if (!snapshotId) throw new Error("snapshot id is required");
+		if (payloads.length > SNAPSHOT_MAX_PAYLOAD_COUNT) throw new Error("snapshot payload count exceeds limit");
+		let totalBytes = 0;
+		for (const payload of payloads) {
+			if (payload.byteLength > SNAPSHOT_CHUNK_PAYLOAD_BYTES) throw new Error("snapshot payload chunk exceeds limit");
+			totalBytes += payload.byteLength;
+			if (totalBytes > SNAPSHOT_MAX_TRANSFER_BYTES) throw new Error("snapshot payload bytes exceed limit");
+		}
 		this.snapshotId = snapshotId;
 		this.#payloads = payloads;
 		this.total = payloads.length;
@@ -200,7 +245,7 @@ export class SnapshotSender {
 		return chunks;
 	}
 
-	acknowledge(ack: SnapshotAckFrame): SnapshotSendResult {
+	acknowledge(ack: SnapshotAckFrame, resendInFlight = false): SnapshotSendResult {
 		if (ack.snapshotId !== this.snapshotId || this.total === 0)
 			return { chunks: [], complete: this.total === 0, exhausted: false };
 		if (Number.isSafeInteger(ack.contiguousSeq) && ack.contiguousSeq >= this.#contiguousSeq) {
@@ -209,8 +254,9 @@ export class SnapshotSender {
 		}
 		const missing = this.#boundedMissing(ack.missing);
 		const chunks: SnapshotChunkFrame[] = [];
-		for (const seq of missing) {
+		for (const seq of resendInFlight ? [...this.#inFlight] : missing) {
 			if (!this.#inFlight.has(seq)) continue;
+			if (!resendInFlight && !missing.includes(seq)) continue;
 			const retry = this.#retry(seq);
 			if (retry.exhausted) return { chunks: [], complete: false, exhausted: true };
 			chunks.push(retry.chunk!);
@@ -278,8 +324,8 @@ export class SnapshotReceiver {
 	#snapshotId: string | null = null;
 	#total = 0;
 	#contiguousSeq = -1;
+	#bytes = 0;
 	readonly #chunks = new Map<number, Uint8Array>();
-
 	get snapshotId(): string | null {
 		return this.#snapshotId;
 	}
@@ -331,18 +377,27 @@ export class SnapshotReceiver {
 		if (
 			frame.snapshotId !== this.#snapshotId ||
 			frame.total !== this.#total ||
+			!Number.isSafeInteger(frame.seq) ||
 			frame.seq < 0 ||
 			frame.seq >= this.#total
 		) {
 			return { ack: invalidAck, accepted: false, duplicate: false, corrupt: false };
 		}
 		const payload = decodeSnapshotPayload(frame.payload);
-		if (!payload || checksumSnapshotPayload(payload) !== frame.checksum) {
+		if (
+			!payload ||
+			checksumSnapshotPayload(payload) !== frame.checksum ||
+			payload.byteLength > SNAPSHOT_CHUNK_PAYLOAD_BYTES
+		) {
 			return { ack: this.ack(frame.seq), accepted: false, duplicate: false, corrupt: true };
 		}
 		const previous = this.#chunks.get(frame.seq);
 		if (previous) return { ack: this.ack(), accepted: false, duplicate: true, corrupt: false };
+		if (this.#bytes + payload.byteLength > SNAPSHOT_MAX_TRANSFER_BYTES) {
+			return { ack: this.ack(frame.seq), accepted: false, duplicate: false, corrupt: true };
+		}
 		this.#chunks.set(frame.seq, payload);
+		this.#bytes += payload.byteLength;
 		while (this.#chunks.has(this.#contiguousSeq + 1)) this.#contiguousSeq++;
 		return { ack: this.ack(), accepted: true, duplicate: false, corrupt: false };
 	}
@@ -364,10 +419,17 @@ export class SnapshotReceiver {
 	}
 
 	#reset(frame: SnapshotBeginFrame): void {
-		if (!Number.isSafeInteger(frame.total) || frame.total < 0) throw new Error("invalid snapshot total");
+		if (
+			!frame.snapshotId ||
+			!Number.isSafeInteger(frame.total) ||
+			frame.total < 0 ||
+			frame.total > SNAPSHOT_MAX_PAYLOAD_COUNT
+		)
+			throw new Error("invalid snapshot total");
 		this.#snapshotId = frame.snapshotId;
 		this.#total = frame.total;
 		this.#contiguousSeq = -1;
+		this.#bytes = 0;
 		this.#chunks.clear();
 	}
 

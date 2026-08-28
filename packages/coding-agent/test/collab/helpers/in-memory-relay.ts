@@ -83,6 +83,45 @@ export class InMemoryRelay {
 	#host: FakeWebSocket | null = null;
 	readonly #guests = new Map<number, FakeWebSocket>();
 	#nextPeerId = 1;
+	onHostFrame?: (bytes: Uint8Array, targetPeer: number) => void;
+	onGuestFrame?: (bytes: Uint8Array, peerId: number) => void;
+	#paused = false;
+	#pendingGuestDeliveries: (() => void)[] = [];
+	#pauseAfterHostFrames: number | null = null;
+	#hostFrameCount = 0;
+
+	/** Hold host-to-guest frames; guest-to-host ACKs remain live. */
+	pauseGuestTraffic(): void {
+		this.#paused = true;
+	}
+
+	/** Resume held host-to-guest frames in original relay order. */
+	resumeGuestTraffic(): void {
+		this.#paused = false;
+		const pending = this.#pendingGuestDeliveries.splice(0);
+		for (const deliver of pending) deliver();
+	}
+
+	/** Pause immediately after forwarding the given host frame count. */
+	pauseAfterHostFrames(count: number): void {
+		if (!Number.isSafeInteger(count) || count < 1) throw new Error("invalid host frame pause count");
+		this.#paused = false;
+		this.#pauseAfterHostFrames = count;
+		this.#hostFrameCount = 0;
+	}
+
+	dropGuest(peerId: number): void {
+		this.#guests.get(peerId)?.close();
+	}
+
+	get pendingGuestDeliveryCount(): number {
+		return this.#pendingGuestDeliveries.length;
+	}
+
+	#deliverGuest(guest: FakeWebSocket, bytes: Uint8Array): void {
+		if (this.#paused) this.#pendingGuestDeliveries.push(() => guest.deliver(bytes));
+		else guest.deliver(bytes);
+	}
 
 	connect(ws: FakeWebSocket): void {
 		if (ws.role === "host") {
@@ -98,14 +137,20 @@ export class InMemoryRelay {
 		if (from.role === "host") {
 			const envelope = unpackEnvelope(bytes);
 			if (!envelope) return;
+			this.onHostFrame?.(new Uint8Array(bytes), envelope.peerId);
+			const pauseNow = this.#pauseAfterHostFrames !== null && ++this.#hostFrameCount >= this.#pauseAfterHostFrames;
+			if (pauseNow) this.#pauseAfterHostFrames = null;
 			if (envelope.peerId === 0) {
-				for (const guest of this.#guests.values()) guest.deliver(bytes);
+				for (const guest of this.#guests.values()) this.#deliverGuest(guest, bytes);
 			} else {
-				this.#guests.get(envelope.peerId)?.deliver(bytes);
+				const guest = this.#guests.get(envelope.peerId);
+				if (guest) this.#deliverGuest(guest, bytes);
 			}
+			if (pauseNow) this.#paused = true;
 			return;
 		}
 		rewriteEnvelopePeer(bytes, from.peerId);
+		this.onGuestFrame?.(new Uint8Array(bytes), from.peerId);
 		this.#host?.deliver(bytes);
 	}
 

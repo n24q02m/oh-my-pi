@@ -38,6 +38,9 @@ import {
 	checksumSnapshotPayload,
 	decodeSnapshotPayload,
 	parseCollabLink,
+	SNAPSHOT_MAX_ENTRY_COUNT,
+	SNAPSHOT_MAX_SEEN_CURSORS,
+	SNAPSHOT_PAGE_MAX_RETRIES,
 	type SnapshotBeginFrame,
 	type SnapshotChunkFrame,
 	type SnapshotEndFrame,
@@ -212,7 +215,48 @@ export class CollabGuestLink {
 	#activeSnapshotId: string | null = null;
 	#nextHistoryCursor: string | undefined;
 	#seenHistoryCursors = new Set<string>();
-	#pageRetryCounts = new Map<string, number>();
+	#requestHistoryPage(cursor: string): void {
+		const socket = this.#socket;
+		if (!socket || !this.#activeSnapshotId) return;
+		this.#clearHistoryPageTimer();
+		this.#pageRequestCursor = cursor;
+		this.#pageRequestAttempts = 0;
+		socket.send({ t: "snapshot-page-request", snapshotId: this.#activeSnapshotId, cursor });
+		this.#armHistoryPageTimer();
+	}
+
+	#retryHistoryPageRequest(cursor: string): void {
+		const socket = this.#socket;
+		if (!socket || !this.#activeSnapshotId || this.#pageRequestCursor !== cursor) return;
+		if (this.#pageRequestAttempts >= SNAPSHOT_PAGE_MAX_RETRIES) {
+			this.#clearHistoryPageTimer();
+			this.#ctx.showError("Collab host history page retry exhausted");
+			return;
+		}
+		this.#pageRequestAttempts++;
+		socket.send({ t: "snapshot-page-request", snapshotId: this.#activeSnapshotId, cursor });
+		this.#armHistoryPageTimer();
+	}
+
+	#armHistoryPageTimer(): void {
+		this.#clearHistoryPageTimer();
+		if (!this.#pageRequestCursor) return;
+		this.#pageRequestTimer = setTimeout(() => {
+			this.#pageRequestTimer = null;
+			if (this.#pageRequestCursor) this.#retryHistoryPageRequest(this.#pageRequestCursor);
+		}, 250);
+	}
+
+	#clearHistoryPageTimer(): void {
+		if (this.#pageRequestTimer !== null) {
+			clearTimeout(this.#pageRequestTimer);
+			this.#pageRequestTimer = null;
+		}
+	}
+
+	#pageRequestTimer: Timer | null = null;
+	#pageRequestCursor: string | null = null;
+	#pageRequestAttempts = 0;
 	/** base64url write token from a full link; absent when joined via a view link. */
 	#writeToken: string | undefined;
 	/** True when the host marked this peer read-only (view link). */
@@ -333,10 +377,6 @@ export class CollabGuestLink {
 					if (frame.t === "welcome") {
 						this.#clearWelcomeTimer();
 						this.#beginWelcome(frame, joined);
-						if (frame.entryCount === 0) {
-							await this.#finalizeSnapshot();
-							finishJoin();
-						}
 						return;
 					}
 					if (frame.t === "snapshot-begin") {
@@ -400,7 +440,7 @@ export class CollabGuestLink {
 			this.#clearSnapshotProgressTimer();
 			this.#flushPendingTranscripts();
 			if (this.#left) return;
-			if (!joined) {
+			if (!joined && (!willReconnect || !this.#pendingSnapshot?.recovery)) {
 				firstWelcome.reject(new Error(reason));
 				return;
 			}
@@ -459,6 +499,13 @@ export class CollabGuestLink {
 	 * timeout immediately even when the transcript still has to stream in.
 	 */
 	#beginWelcome(frame: WelcomeFrame, isResync: boolean): void {
+		if (
+			!Number.isSafeInteger(frame.entryCount) ||
+			frame.entryCount < 0 ||
+			frame.entryCount > SNAPSHOT_MAX_ENTRY_COUNT
+		) {
+			throw new Error("invalid snapshot entry count");
+		}
 		if (this.#left) return;
 		const retained = this.#pendingSnapshot;
 		if (retained?.recovery) {
@@ -492,12 +539,18 @@ export class CollabGuestLink {
 			logger.debug("collab guest dropping orphan snapshot-begin");
 			return;
 		}
+		const entryCount = frame.entryCount ?? pending.entryCount;
+		if (!Number.isSafeInteger(entryCount) || entryCount < 0 || entryCount > SNAPSHOT_MAX_ENTRY_COUNT) {
+			throw new Error("invalid snapshot entry count");
+		}
 		const receiver = pending.recovery ?? new SnapshotReceiver();
 		const result = receiver.begin(frame);
-		if (result !== "resumed") this.#seenHistoryCursors.clear();
+		if (result !== "resumed") {
+			this.#seenHistoryCursors.clear();
+		}
 		pending.recovery = receiver;
 		pending.snapshotId = frame.snapshotId;
-		pending.entryCount = frame.entryCount ?? pending.entryCount;
+		pending.entryCount = entryCount;
 		pending.firstHistoryCursor = frame.firstHistoryCursor;
 		pending.entries = [];
 		pending.isResync = isResync;
@@ -536,17 +589,15 @@ export class CollabGuestLink {
 		else this.#armSnapshotProgressTimer();
 		return complete;
 	}
-
-	/**
-	 * Append a chunk to the pending legacy snapshot. Returns `true` when the
-	 * accumulator has gathered every entry the welcome promised, or the host
-	 * tagged this chunk as `final`.
-	 */
 	#accumulateSnapshotChunk(frame: LegacySnapshotChunkFrame): boolean {
 		const pending = this.#pendingSnapshot;
 		if (!pending) {
 			logger.debug("collab guest dropping orphan snapshot-chunk");
 			return false;
+		}
+		const nextLength = pending.entries.length + frame.entries.length;
+		if (nextLength > pending.entryCount || nextLength > SNAPSHOT_MAX_ENTRY_COUNT) {
+			throw new Error("snapshot entry count exceeds welcome limit");
 		}
 		pending.entries.push(...frame.entries);
 		const complete = frame.final || pending.entries.length >= pending.entryCount;
@@ -602,13 +653,7 @@ export class CollabGuestLink {
 			this.#ctx.showStatus(
 				pending.isResync ? `Reconnected to collab session${suffix}` : `Joined collab session${suffix}`,
 			);
-			if (this.#activeSnapshotId && this.#nextHistoryCursor) {
-				this.#socket?.send({
-					t: "snapshot-page-request",
-					snapshotId: this.#activeSnapshotId,
-					cursor: this.#nextHistoryCursor,
-				});
-			}
+			if (this.#activeSnapshotId && this.#nextHistoryCursor) this.#requestHistoryPage(this.#nextHistoryCursor);
 		} finally {
 			this.#snapshotFinalizing = false;
 		}
@@ -617,19 +662,22 @@ export class CollabGuestLink {
 		if (this.#activeSnapshotId !== frame.snapshotId) return;
 		const socket = this.#socket;
 		if (!socket) return;
+		const expectedCursor = this.#pageRequestCursor ?? this.#nextHistoryCursor;
+		if (expectedCursor !== frame.cursor) {
+			// ACK delayed duplicates so the host can retire its retry state, but
+			// never clear the timer for the currently requested page.
+			if (this.#seenHistoryCursors.has(frame.cursor)) {
+				socket.send({ t: "snapshot-page-ack", snapshotId: frame.snapshotId, cursor: frame.cursor });
+			}
+			return;
+		}
 		if (this.#seenHistoryCursors.has(frame.cursor)) {
 			socket.send({ t: "snapshot-page-ack", snapshotId: frame.snapshotId, cursor: frame.cursor });
 			return;
 		}
 		const payload = decodeSnapshotPayload(frame.payload);
 		if (!payload || checksumSnapshotPayload(payload) !== frame.checksum) {
-			const retries = this.#pageRetryCounts.get(frame.cursor) ?? 0;
-			if (retries < 4) {
-				this.#pageRetryCounts.set(frame.cursor, retries + 1);
-				socket.send({ t: "snapshot-page-request", snapshotId: frame.snapshotId, cursor: frame.cursor });
-			} else {
-				this.#ctx.showError("Collab host sent a corrupted session history page");
-			}
+			this.#retryHistoryPageRequest(frame.cursor);
 			return;
 		}
 		let entries: SessionEntry[];
@@ -640,22 +688,24 @@ export class CollabGuestLink {
 				error: String(error),
 				cursor: frame.cursor,
 			});
-			const retries = this.#pageRetryCounts.get(frame.cursor) ?? 0;
-			if (retries < 4) {
-				this.#pageRetryCounts.set(frame.cursor, retries + 1);
-				socket.send({ t: "snapshot-page-request", snapshotId: frame.snapshotId, cursor: frame.cursor });
-			} else {
-				this.#ctx.showError("Collab host sent an invalid session history page");
-			}
+			this.#retryHistoryPageRequest(frame.cursor);
 			return;
 		}
-		this.#pageRetryCounts.delete(frame.cursor);
+		this.#clearHistoryPageTimer();
 		this.#seenHistoryCursors.add(frame.cursor);
+		while (this.#seenHistoryCursors.size > SNAPSHOT_MAX_SEEN_CURSORS) {
+			const oldest = this.#seenHistoryCursors.values().next().value as string | undefined;
+			if (oldest === undefined) break;
+			this.#seenHistoryCursors.delete(oldest);
+		}
 		for (const entry of entries) this.#applyFrame({ t: "entry", entry });
 		socket.send({ t: "snapshot-page-ack", snapshotId: frame.snapshotId, cursor: frame.cursor });
 		this.#nextHistoryCursor = frame.nextCursor;
-		if (frame.nextCursor)
-			socket.send({ t: "snapshot-page-request", snapshotId: frame.snapshotId, cursor: frame.nextCursor });
+		if (frame.nextCursor) this.#requestHistoryPage(frame.nextCursor);
+		else {
+			this.#pageRequestCursor = null;
+			this.#pageRequestAttempts = 0;
+		}
 	}
 
 	#armWelcomeTimer(): void {
@@ -931,6 +981,12 @@ export class CollabGuestLink {
 	}
 
 	async #restoreLocalSession(): Promise<void> {
+		this.#clearHistoryPageTimer();
+		this.#seenHistoryCursors.clear();
+		this.#pageRequestCursor = null;
+		this.#pageRequestAttempts = 0;
+		this.#activeSnapshotId = null;
+		this.#nextHistoryCursor = undefined;
 		if (this.#left) return;
 		this.#left = true;
 		this.#socket = null;
