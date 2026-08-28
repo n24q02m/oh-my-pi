@@ -14,6 +14,16 @@ export const DAEMON_PROJECT_DIR_ENV = "OMP_DAEMON_PROJECT_DIR";
 /** Environment key carrying the broker's private runtime directory. */
 export const DAEMON_RUNTIME_DIR_ENV = "OMP_DAEMON_RUNTIME_DIR";
 
+const DAEMON_BROKER_TOKEN_PATTERN = /^[0-9a-f]{64}$/u;
+
+/** Validate the fixed-format token persisted by a daemon broker. */
+export function validateDaemonBrokerToken(value: unknown): string {
+	if (typeof value !== "string" || !DAEMON_BROKER_TOKEN_PATTERN.test(value)) {
+		throw new Error("Daemon broker token must be exactly 64 lowercase hexadecimal characters");
+	}
+	return value;
+}
+
 /** Optional environment key overriding last-client shutdown grace. */
 export const DAEMON_IDLE_GRACE_ENV = "OMP_DAEMON_IDLE_GRACE_MS";
 

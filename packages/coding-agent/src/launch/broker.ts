@@ -29,6 +29,7 @@ import {
 	parseDaemonSpec,
 	parseDaemonWireMessage,
 	parseDaemonWireRequest,
+	validateDaemonBrokerToken,
 } from "./protocol";
 import { assertNativePathSafe, createDaemonNativeServer, type DaemonNativeRemoteServer } from "./remote-transport";
 import { resolveDaemonSpawnOptions } from "./spawn-options";
@@ -153,7 +154,7 @@ async function readNativeBrokerToken(runtimeDir: string): Promise<string> {
 			throw new Error("Native daemon broker token path changed while reading");
 		}
 		await assertNativePathSafe(tokenPath, { privateFinal: true, privateParent: true });
-		return token;
+		return validateDaemonBrokerToken(token);
 	} catch (error) {
 		if (error instanceof Error && /^Native daemon broker token/u.test(error.message)) throw error;
 		throw new Error(
@@ -1524,7 +1525,7 @@ export async function startDaemonBrokerFromEnvironment(options: DaemonBrokerStar
 	try {
 		token = options.nativeServer
 			? await readNativeBrokerToken(runtimeDir)
-			: (await Bun.file(path.join(runtimeDir, TOKEN_FILE)).text()).trim();
+			: validateDaemonBrokerToken((await Bun.file(path.join(runtimeDir, TOKEN_FILE)).text()).trim());
 	} catch (error) {
 		await releaseBrokerLease(lease);
 		throw error;

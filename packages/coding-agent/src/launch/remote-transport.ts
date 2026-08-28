@@ -18,6 +18,7 @@ const DEFAULT_GLOBAL_ATTEMPT_LIMIT = 64;
 const DEFAULT_SOURCE_ATTEMPT_LIMIT = 16;
 const DEFAULT_ATTEMPT_WINDOW_MS = 60_000;
 const DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS = 2_000;
+const DEFAULT_PENDING_HANDSHAKE_LIMIT = 64;
 const MAX_TLS_FILE_BYTES = 4 * 1024 * 1024;
 const MAX_SOURCE_BUCKETS = 1_024;
 const SOURCE_BUCKET_SWEEP_MS = 60_000;
@@ -131,6 +132,11 @@ function runWindowsAclProbe(specs: readonly NativePathSafetySpec[]): Promise<voi
 	}
 	return promise;
 }
+function assertWindowsLocalPath(targetPath: string): void {
+	const normalized = path.win32.normalize(targetPath);
+	const isUnc = normalized.startsWith("//") || (normalized.charCodeAt(0) === 92 && normalized.charCodeAt(1) === 92);
+	if (isUnc) throw new Error("Native Windows paths must use a local volume; UNC and remote roots are unsupported");
+}
 
 function nativeNoFollowFlag(label: string): number | undefined {
 	// Windows fallback is paired with ACL/reparse preflight and post-read handle identity checks.
@@ -189,6 +195,7 @@ export async function assertNativePathSafe(
 	const privateFinal = options.privateFinal === true;
 	const privateParent = options.privateParent === true;
 	if (process.platform === "win32") {
+		assertWindowsLocalPath(targetPath);
 		await runWindowsAclProbe([{ path: path.resolve(targetPath), directory, privateFinal, privateParent }]);
 		return;
 	}
@@ -200,6 +207,7 @@ export interface DaemonNativeAttemptLimits {
 	globalMaxAttempts?: number;
 	sourceMaxAttempts?: number;
 	windowMs?: number;
+	pendingHandshakeMax?: number;
 }
 
 export interface DaemonNativeRemoteServer {
@@ -331,6 +339,32 @@ class AttemptLimiter {
 			while (attempts[0] !== undefined && attempts[0] <= cutoff) attempts.shift();
 			if (attempts.length === 0) this.#sourceAttempts.delete(source);
 		}
+	}
+}
+
+class PendingHandshakeLimiter {
+	readonly #max: number;
+	readonly #sockets = new Set<net.Socket>();
+	#closed = false;
+
+	constructor(options: DaemonNativeAttemptLimits = {}) {
+		this.#max = boundedLimit(options.pendingHandshakeMax, DEFAULT_PENDING_HANDSHAKE_LIMIT);
+	}
+
+	acquire(socket: net.Socket): boolean {
+		if (this.#closed || this.#sockets.size >= this.#max) return false;
+		this.#sockets.add(socket);
+		return true;
+	}
+
+	release(socket: net.Socket): boolean {
+		return this.#sockets.delete(socket);
+	}
+
+	close(): void {
+		if (this.#closed) return;
+		this.#closed = true;
+		this.#sockets.clear();
 	}
 }
 
@@ -466,6 +500,7 @@ export async function createDaemonNativeServer(
 ): Promise<DaemonNativeRemoteServer> {
 	const serverOptions = parseDaemonNativeServerOptions(value);
 	const limiter = new AttemptLimiter(options.limits);
+	const pendingHandshakes = new PendingHandshakeLimiter(options.limits);
 	const tlsHandshakeTimers = new Map<net.Socket, NodeJS.Timeout>();
 	const clearTlsHandshakeTimer = (socket: net.Socket): void => {
 		const timer = tlsHandshakeTimers.get(socket);
@@ -478,24 +513,24 @@ export async function createDaemonNativeServer(
 		tlsHandshakeTimers.clear();
 	};
 	const sockets = new Set<net.Socket>();
-	const admittedTlsSockets = new Set<net.Socket>();
+	const tlsParentSocket = (socket: net.Socket): net.Socket => {
+		const parent = (socket as tls.TLSSocket & { _parent?: net.Socket })._parent;
+		return parent ?? socket;
+	};
 	const trackSocket = (socket: net.Socket): void => {
 		if (sockets.has(socket)) return;
 		sockets.add(socket);
 		socket.once("close", () => {
 			sockets.delete(socket);
-			admittedTlsSockets.delete(socket);
-			clearTlsHandshakeTimer(socket);
+			const parent = tlsParentSocket(socket);
+			pendingHandshakes.release(parent);
+			clearTlsHandshakeTimer(parent);
 		});
-	};
-	const tlsParentSocket = (socket: net.Socket): net.Socket => {
-		const parent = (socket as tls.TLSSocket & { _parent?: net.Socket })._parent;
-		return parent ?? socket;
 	};
 	const destroyTlsPair = (socket: net.Socket): void => {
 		const parent = tlsParentSocket(socket);
 		clearTlsHandshakeTimer(parent);
-		admittedTlsSockets.delete(parent);
+		pendingHandshakes.release(parent);
 		socket.destroy();
 		if (parent !== socket) parent.destroy();
 	};
@@ -526,7 +561,11 @@ export async function createDaemonNativeServer(
 				socket => {
 					const parent = tlsParentSocket(socket);
 					clearTlsHandshakeTimer(parent);
-					if (!admittedTlsSockets.delete(parent)) {
+					if (!pendingHandshakes.release(parent)) {
+						destroyTlsPair(socket);
+						return;
+					}
+					if (!limiter.allow(sourceAddress(parent))) {
 						destroyTlsPair(socket);
 						return;
 					}
@@ -536,12 +575,11 @@ export async function createDaemonNativeServer(
 			);
 			server = tlsServer;
 			tlsServer.on("connection", socket => {
-				trackSocket(socket);
-				if (!limiter.allow(sourceAddress(socket))) {
+				if (!pendingHandshakes.acquire(socket)) {
 					socket.destroy();
 					return;
 				}
-				admittedTlsSockets.add(socket);
+				trackSocket(socket);
 				const timer = setTimeout(() => {
 					destroyTlsPair(socket);
 				}, DEFAULT_TLS_HANDSHAKE_TIMEOUT_MS);
@@ -567,6 +605,7 @@ export async function createDaemonNativeServer(
 		await listening;
 	} catch (error) {
 		limiter.close();
+		pendingHandshakes.close();
 		clearAllTlsHandshakeTimers();
 		for (const socket of sockets) socket.destroy();
 		if (server) await closeServer(server).catch(() => undefined);
@@ -574,6 +613,7 @@ export async function createDaemonNativeServer(
 	}
 	if (!server) {
 		limiter.close();
+		pendingHandshakes.close();
 		clearAllTlsHandshakeTimers();
 		throw new Error("Native remote server failed to initialize");
 	}
@@ -590,6 +630,7 @@ export async function createDaemonNativeServer(
 			if (closed) return;
 			closed = true;
 			limiter.close();
+			pendingHandshakes.close();
 			clearAllTlsHandshakeTimers();
 			for (const socket of sockets) socket.destroy();
 			await closeServer(server);

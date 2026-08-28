@@ -14,7 +14,7 @@ import {
 	type DaemonNativeRemoteServer,
 } from "../../src/launch/remote-transport";
 
-const TOKEN = "test-wire-token";
+const TOKEN = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 async function privateTempDir(prefix: string): Promise<string> {
 	const base = process.platform === "win32" ? os.homedir() : os.tmpdir();
@@ -105,6 +105,40 @@ async function connectNativeEndpoint(target: Parameters<typeof connectDaemonNati
 		}
 	}
 	throw new Error(`native endpoint did not start listening: ${lastError?.message ?? "unknown error"}`);
+}
+
+function openRawNativeEndpoint(target: { host: string; port: number }): Promise<net.Socket> {
+	const { promise, resolve, reject } = Promise.withResolvers<net.Socket>();
+	let socket: net.Socket;
+	try {
+		socket = net.createConnection({ host: target.host, port: target.port });
+	} catch (error) {
+		reject(error instanceof Error ? error : new Error(String(error)));
+		return promise;
+	}
+	let settled = false;
+	const finish = (error?: Error): void => {
+		if (settled) return;
+		settled = true;
+		clearTimeout(timer);
+		socket.off("connect", onConnect);
+		socket.off("error", onError);
+		socket.off("close", onClose);
+		if (error) {
+			socket.destroy();
+			reject(error);
+		} else {
+			resolve(socket);
+		}
+	};
+	const onConnect = (): void => finish();
+	const onError = (error: Error): void => finish(error);
+	const onClose = (): void => finish(new Error("native raw endpoint closed before connection completed"));
+	const timer = setTimeout(() => finish(new Error("timed out connecting to native raw endpoint")), 1_000);
+	socket.once("connect", onConnect);
+	socket.once("error", onError);
+	socket.once("close", onClose);
+	return promise;
 }
 
 async function sendPing(socket: net.Socket, token = TOKEN): Promise<unknown> {
@@ -212,6 +246,17 @@ describe("native remote transport sockets", () => {
 			await fs.rm(root, { recursive: true, force: true });
 		}
 	}, 15_000);
+
+	it.skipIf(process.platform !== "win32")(
+		"rejects Windows UNC native paths",
+		async () => {
+			const uncPath = "//server/share/broker.token";
+			await expect(assertNativePathSafe(uncPath, { privateFinal: true, privateParent: true })).rejects.toThrow(
+				/UNC|local|remote root/i,
+			);
+		},
+		15_000,
+	);
 
 	it("rejects a native private file under an untrusted writable parent", async () => {
 		const root = await fs.mkdtemp(path.join(os.homedir(), "omp-native-unsafe-"));
@@ -348,6 +393,39 @@ describe("native remote transport sockets", () => {
 			expect(client.destroyed).toBe(true);
 		} finally {
 			client?.destroy();
+			await closeNativeServer(server);
+			await fs.rm(fixture.directory, { recursive: true, force: true });
+		}
+	}, 15_000);
+
+	it("bounds pending TLS handshakes separately from admission attempts", async () => {
+		const fixture = await writeTlsFixture();
+		const target = { transport: "tls" as const, host: "127.0.0.1", port: await freePort() };
+		let server: DaemonNativeRemoteServer | undefined;
+		const stalled: net.Socket[] = [];
+		try {
+			server = await createDaemonNativeServer(
+				{ target, certFile: fixture.certFile, keyFile: fixture.keyFile },
+				_socket => undefined,
+				{ limits: { globalMaxAttempts: 3, sourceMaxAttempts: 8, pendingHandshakeMax: 2 } },
+			);
+			stalled.push(await openRawNativeEndpoint(target));
+			stalled.push(await openRawNativeEndpoint(target));
+			stalled.push(await openRawNativeEndpoint(target));
+			await waitForClose(stalled[2]);
+			for (const socket of stalled.slice(0, 2)) {
+				socket.destroy();
+				await waitForClose(socket);
+			}
+			if (!server.fingerprint256) throw new Error("TLS server did not expose a certificate fingerprint");
+			const socket = await connectDaemonNativeRemote(
+				{ ...target, fingerprint256: server.fingerprint256 },
+				{ timeoutMs: 1_000 },
+			);
+			socket.destroy();
+			await waitForClose(socket);
+		} finally {
+			for (const socket of stalled) socket.destroy();
 			await closeNativeServer(server);
 			await fs.rm(fixture.directory, { recursive: true, force: true });
 		}
@@ -647,6 +725,21 @@ describe("native remote transport sockets", () => {
 			await fs.rm(projectDir, { recursive: true, force: true });
 		}
 	}, 15_000);
+
+	it("rejects malformed pre-existing native broker token files", async () => {
+		const projectDir = await privateTempDir("omp-native-token-format-project-");
+		const runtimeDir = path.join(projectDir, "runtime");
+		await fs.mkdir(runtimeDir, { recursive: true, mode: 0o700 });
+		await fs.writeFile(path.join(runtimeDir, "broker.token"), "weak-token", { mode: 0o600 });
+		const target = { transport: "tcp" as const, host: "127.0.0.1" as const, port: await freePort() };
+		try {
+			await expect(
+				createDaemonBrokerClient(projectDir, { runtimeDir, target, connectTimeoutMs: 100 }),
+			).rejects.toThrow(/token|64|hexadecimal/i);
+		} finally {
+			await fs.rm(projectDir, { recursive: true, force: true });
+		}
+	});
 
 	it("does not spawn or fall back to a local broker after a remote error", async () => {
 		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-native-remote-project-"));

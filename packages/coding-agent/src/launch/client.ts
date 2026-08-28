@@ -19,6 +19,7 @@ import {
 	type DaemonWireMessage,
 	parseDaemonRpcResult,
 	parseDaemonWireMessage,
+	validateDaemonBrokerToken,
 } from "./protocol";
 import { assertNativePathSafe, connectDaemonNativeRemote } from "./remote-transport";
 import { resolveDaemonSpawnOptions } from "./spawn-options";
@@ -96,7 +97,7 @@ async function readOrCreateToken(runtimeDir: string): Promise<string> {
 	for (let attempt = 0; attempt < 100; attempt++) {
 		try {
 			const token = (await tokenFile.text()).trim();
-			if (token.length > 0) return token;
+			if (token.length > 0) return validateDaemonBrokerToken(token);
 		} catch (error) {
 			if (!isEnoent(error)) throw error;
 		}
@@ -147,7 +148,7 @@ async function readExistingToken(runtimeDir: string): Promise<string> {
 			throw new Error("Native daemon broker token path changed while reading");
 		}
 		await assertNativePathSafe(tokenPath, { privateFinal: true, privateParent: true });
-		return token;
+		return validateDaemonBrokerToken(token);
 	} catch (error) {
 		if (error instanceof Error && /^Native daemon broker token/u.test(error.message)) throw error;
 		throw new Error(
