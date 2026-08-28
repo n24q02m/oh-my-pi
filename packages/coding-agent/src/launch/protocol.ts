@@ -24,6 +24,51 @@ export function validateDaemonBrokerToken(value: unknown): string {
 	return value;
 }
 
+/** Capabilities assigned to a paired native device. */
+export type DaemonCapability = "observe" | "control-session" | "approve" | "manage-devices" | "git-read";
+
+/** Hash-only paired device record retained by the broker. */
+export interface PairedDeviceRecord {
+	id: string;
+	name: string;
+	tokenHash: string;
+	capabilities: DaemonCapability[];
+	createdAt: number;
+	rotatedAt?: number;
+	lastSeenAt?: number;
+}
+
+/** Public paired-device metadata; credential hashes are deliberately omitted. */
+export interface PairedDeviceMetadata {
+	id: string;
+	name: string;
+	capabilities: DaemonCapability[];
+	createdAt: number;
+	rotatedAt?: number;
+	lastSeenAt?: number;
+}
+
+export interface PairingBeginResult {
+	code: string;
+	name: string;
+	capabilities: DaemonCapability[];
+	createdAt: number;
+	expiresAt: number;
+}
+
+export interface PairingApprovalResult {
+	name: string;
+	capabilities: DaemonCapability[];
+	createdAt: number;
+	expiresAt: number;
+	approvedAt: number;
+}
+
+export interface PairingClaimResult {
+	device: PairedDeviceMetadata;
+	token: string;
+}
+
 /** Optional environment key overriding last-client shutdown grace. */
 export const DAEMON_IDLE_GRACE_ENV = "OMP_DAEMON_IDLE_GRACE_MS";
 
@@ -95,6 +140,12 @@ export type DaemonSignal = "SIGINT" | "SIGTERM" | "SIGHUP" | "SIGQUIT" | "SIGKIL
 /** Typed broker operation sent over the authenticated socket. */
 export type DaemonOperation =
 	| { op: "ping" }
+	| { op: "pair-begin"; name: string; capabilities: DaemonCapability[]; ttlMs?: number }
+	| { op: "pair-approve"; code: string }
+	| { op: "pair-claim"; code: string }
+	| { op: "pair-list" }
+	| { op: "pair-revoke"; id: string }
+	| { op: "pair-rotate"; id: string }
 	| { op: "start"; spec: DaemonSpec; owner?: string }
 	| { op: "list" }
 	| {
@@ -119,6 +170,26 @@ export type DaemonOperation =
 /** Typed broker result decoded before it reaches tool code. */
 export type DaemonRpcResult =
 	| { op: "ping"; projectDir: string }
+	| {
+			op: "pair-begin";
+			code: string;
+			name: string;
+			capabilities: DaemonCapability[];
+			createdAt: number;
+			expiresAt: number;
+	  }
+	| {
+			op: "pair-approve";
+			name: string;
+			capabilities: DaemonCapability[];
+			createdAt: number;
+			expiresAt: number;
+			approvedAt: number;
+	  }
+	| { op: "pair-claim"; device: PairedDeviceMetadata; token: string }
+	| { op: "pair-list"; devices: PairedDeviceMetadata[] }
+	| { op: "pair-revoke"; id: string }
+	| { op: "pair-rotate"; device: PairedDeviceMetadata; token: string }
 	| { op: "start"; daemon: DaemonSnapshot; readyTimedOut: boolean }
 	| { op: "list"; daemons: DaemonSnapshot[] }
 	| {
@@ -222,6 +293,35 @@ function stringRecord(value: unknown, label: string): Record<string, string> {
 	const result: Record<string, string> = {};
 	for (const key in source) result[key] = rawString(source[key], `${label}.${key}`);
 	return result;
+}
+
+function daemonCapability(value: unknown): DaemonCapability {
+	const capability = stringValue(value, "daemon capability");
+	if (capability === "observe" || capability === "control-session" || capability === "approve") return capability;
+	if (capability === "manage-devices" || capability === "git-read") return capability;
+	throw new Error(`Unknown daemon capability: ${capability}`);
+}
+
+function daemonCapabilities(value: unknown, label: string): DaemonCapability[] {
+	if (!Array.isArray(value) || value.length === 0) throw new Error(`${label} must be a non-empty array`);
+	const result: DaemonCapability[] = [];
+	for (const item of value) {
+		const capability = daemonCapability(item);
+		if (!result.includes(capability)) result.push(capability);
+	}
+	return result;
+}
+
+function pairingDeviceMetadata(value: unknown, label: string): PairedDeviceMetadata {
+	const source = record(value, label);
+	return {
+		id: stringValue(source.id, `${label}.id`),
+		name: stringValue(source.name, `${label}.name`),
+		capabilities: daemonCapabilities(source.capabilities, `${label}.capabilities`),
+		createdAt: numberValue(source.createdAt, `${label}.createdAt`),
+		rotatedAt: optionalNumber(source.rotatedAt, `${label}.rotatedAt`),
+		lastSeenAt: optionalNumber(source.lastSeenAt, `${label}.lastSeenAt`),
+	};
 }
 
 function daemonState(value: unknown): DaemonState {
@@ -452,8 +552,22 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 	switch (op) {
 		case "ping":
 		case "list":
+		case "pair-list":
 		case "shutdown":
 			return { op };
+		case "pair-begin":
+			return {
+				op,
+				name: stringValue(source.name, "operation.name"),
+				capabilities: daemonCapabilities(source.capabilities, "operation.capabilities"),
+				ttlMs: optionalNumber(source.ttlMs, "operation.ttlMs"),
+			};
+		case "pair-approve":
+		case "pair-claim":
+			return { op, code: stringValue(source.code, "operation.code") };
+		case "pair-revoke":
+		case "pair-rotate":
+			return { op, id: stringValue(source.id, "operation.id") };
 		case "start":
 			return {
 				op,
@@ -513,6 +627,44 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 	switch (operation.op) {
 		case "ping":
 			return { op: "ping", projectDir: stringValue(source.projectDir, "result.projectDir") };
+		case "pair-begin":
+			return {
+				op: "pair-begin",
+				code: stringValue(source.code, "result.code"),
+				name: stringValue(source.name, "result.name"),
+				capabilities: daemonCapabilities(source.capabilities, "result.capabilities"),
+				createdAt: numberValue(source.createdAt, "result.createdAt"),
+				expiresAt: numberValue(source.expiresAt, "result.expiresAt"),
+			};
+		case "pair-approve":
+			return {
+				op: "pair-approve",
+				name: stringValue(source.name, "result.name"),
+				capabilities: daemonCapabilities(source.capabilities, "result.capabilities"),
+				createdAt: numberValue(source.createdAt, "result.createdAt"),
+				expiresAt: numberValue(source.expiresAt, "result.expiresAt"),
+				approvedAt: numberValue(source.approvedAt, "result.approvedAt"),
+			};
+		case "pair-claim":
+			return {
+				op: "pair-claim",
+				device: pairingDeviceMetadata(source.device, "result.device"),
+				token: stringValue(source.token, "result.token"),
+			};
+		case "pair-list":
+			if (!Array.isArray(source.devices)) throw new Error("result.devices must be an array");
+			return {
+				op: "pair-list",
+				devices: source.devices.map(value => pairingDeviceMetadata(value, "result.device")),
+			};
+		case "pair-revoke":
+			return { op: "pair-revoke", id: stringValue(source.id, "result.id") };
+		case "pair-rotate":
+			return {
+				op: "pair-rotate",
+				device: pairingDeviceMetadata(source.device, "result.device"),
+				token: stringValue(source.token, "result.token"),
+			};
 		case "start":
 			return {
 				op: "start",
