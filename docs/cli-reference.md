@@ -198,7 +198,7 @@ print-mode disposal semantics when the advisor runtime is enabled.
 | `json` | Structured JSON event stream, for headless/machine consumption. |
 | `rpc` | JSON-RPC server over stdio. See [RPC](./rpc.md). |
 | `rpc-ui` | RPC transport with UI extension events enabled. |
-| `acp` | Agent Client Protocol server over stdio. Equivalent to the [`acp`](#subcommands) subcommand; see [ACP agent integration](./acp-agent.md). |
+| `acp` | Agent Client Protocol server over stdio when selected by the ACP subcommand; prefer `omp acp`, the documented command surface. See [ACP agent integration](./acp-agent.md). |
 
 ### ACP server
 

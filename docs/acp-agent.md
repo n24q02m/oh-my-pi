@@ -14,13 +14,15 @@ omp acp
 
 The server speaks JSON-RPC over newline-delimited stdio. Its stdout is reserved for protocol messages, so do not pipe human-readable output into that stream. When started from an interactive terminal, OMP writes a short diagnostic to stderr explaining that the process is waiting for an ACP client.
 
-The command is also available as an output mode:
+The shared parser also accepts `--mode acp`:
 
 ```sh
 omp --mode acp
 ```
 
-`omp acp` is the purpose-built spelling and is equivalent for normal ACP use. Check the installed binary for the exact shared launch flags:
+The installed `omp --help` output does not advertise `acp` among the `--mode` values, so prefer `omp acp`, the documented command surface. Both forms enter the same ACP server path in the checked-in source.
+
+Check the installed binary for the exact shared launch flags:
 
 ```sh
 omp --help
@@ -86,13 +88,13 @@ OMP accepts only an authentication method that it advertised during initializati
 
 ## Tool routing and approvals
 
-When the client advertises the relevant ACP capabilities, OMP routes operations through the client bridge:
+When the client advertises the relevant ACP capabilities, OMP can route operations through the client bridge:
 
 - file reads use the client's filesystem read capability;
 - file writes use the client's filesystem write capability; and
 - shell commands use the client's terminal capability.
 
-Tool permission requests are sent to the ACP client as `session/request_permission`. If the client does not expose a filesystem or terminal capability, OMP keeps the corresponding local tool path instead of assuming that the capability exists.
+The ACP permission gate is narrower than capability routing. When a client bridge is available, `session/request_permission` is used for `bash`, `delete`, and `move` calls, plus `edit` calls whose operation deletes or moves a file. A regular edit that does not have a destructive delete/move intent is not automatically covered by this gate. If the client does not expose a filesystem or terminal capability, OMP keeps the corresponding local tool path instead of assuming that the capability exists.
 
 Approval mode is resolved with the normal OMP settings precedence. A runtime flag overrides `--config` overlays, which override project settings, which override the global configuration. The supported modes are:
 
@@ -118,9 +120,9 @@ tools:
   approvalMode: yolo
 ```
 
-An explicit tool policy can still deny or prompt a call. A tool's critical safety policy can also require a prompt; `yolo` is not a replacement for a client or provider safety check. In the normal interactive ACP setup, write and execution calls therefore reach Zed's permission UI through `session/request_permission`, where the client can select an offered option or cancel the call.
+An explicit tool policy can still deny or prompt a call. For the ACP-gated tools above, explicit `yolo` or auto-approve skips the client permission gate unless the per-tool policy explicitly requires a prompt or deny. A tool's critical safety policy can also require a prompt; `yolo` is not a replacement for a client or provider safety check. When the gate is active, the client can select an offered option or cancel the call.
 
-Plan mode has a separate ACP confirmation step when the client supports elicitation. OMP asks the client to approve or refine the proposed plan; dismissal or refinement keeps plan mode active.
+Plan mode has a separate ACP confirmation step when the client supports `elicitation.form`. OMP asks the client to approve or refine the proposed plan; dismissal or refinement keeps plan mode active. When the client does not support `elicitation.form`, OMP auto-approves the plan proposal so plan mode has a way to exit.
 
 ## Troubleshooting
 
