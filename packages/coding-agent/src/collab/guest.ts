@@ -35,9 +35,18 @@ import {
 	type CollabFrame,
 	type CollabSessionState,
 	type CollabUiRequest,
+	checksumSnapshotPayload,
+	decodeSnapshotPayload,
 	parseCollabLink,
+	type SnapshotBeginFrame,
+	type SnapshotChunkFrame,
+	type SnapshotEndFrame,
+	type SnapshotPageFrame,
+	SnapshotReceiver,
 } from "./protocol";
 import { CollabSocket } from "./relay-client";
+
+type LegacySnapshotChunkFrame = { t: "snapshot-chunk"; entries: SessionEntry[]; final: boolean };
 
 /** Commands a guest may run locally; everything else is host-only. */
 export const COLLAB_GUEST_ALLOWED_COMMANDS: Record<string, true> = {
@@ -66,11 +75,10 @@ const WELCOME_TIMEOUT_MS = 30_000;
  * welcome budget. The default relay sustains ~350 KB/s; a 512 KB chunk lands
  * in under two seconds with comfortable headroom.
  */
-const SNAPSHOT_PROGRESS_TIMEOUT_MS = 30_000;
+const SNAPSHOT_PROGRESS_TIMEOUT_MS = 120_000;
 const TRANSCRIPT_TIMEOUT_MS = 20_000;
 
 type WelcomeFrame = Extract<CollabFrame, { t: "welcome" }>;
-type SnapshotChunkFrame = Extract<CollabFrame, { t: "snapshot-chunk" }>;
 
 /** Accumulator for an in-flight chunked welcome — see {@link CollabGuestLink}. */
 interface PendingSnapshot {
@@ -81,8 +89,24 @@ interface PendingSnapshot {
 	entryCount: number;
 	entries: SessionEntry[];
 	isResync: boolean;
+	recovery?: SnapshotReceiver;
+	snapshotId?: string;
+	firstHistoryCursor?: string;
+	snapshotEndReceived?: boolean;
 }
 
+function decodeSnapshotEntries(payload: Uint8Array): SessionEntry[] {
+	const parsed: unknown = JSON.parse(new TextDecoder().decode(payload));
+	if (
+		!Array.isArray(parsed) ||
+		parsed.some(
+			entry => !entry || typeof entry !== "object" || typeof (entry as { type?: unknown }).type !== "string",
+		)
+	) {
+		throw new Error("invalid session snapshot payload");
+	}
+	return parsed as SessionEntry[];
+}
 /** Minimal context surface the idle-state reconciler mutates. */
 export interface GuestIdleReconcilerCtx {
 	statusLine: { markActivityEnd: () => void };
@@ -174,7 +198,7 @@ export class CollabGuestLink {
 	 */
 	#pendingSnapshot: PendingSnapshot | null = null;
 	/**
-	 * Fires `firstWelcome.reject` from a stalled welcome/snapshot during the
+	 * Fires firstWelcome.reject from a stalled welcome/snapshot during the
 	 * initial join. Set in {@link join}, cleared on resolve/reject; arming a
 	 * timer after that point is a no-op so reconnect-time stalls fall through
 	 * to the normal socket close handling instead of aborting the live session.
@@ -182,6 +206,13 @@ export class CollabGuestLink {
 	#joinReject: ((err: Error) => void) | null = null;
 	#welcomeTimer: Timer | null = null;
 	#snapshotProgressTimer: Timer | null = null;
+	#resumeId = crypto.randomUUID();
+	#snapshotEndReceived = false;
+	#snapshotFinalizing = false;
+	#activeSnapshotId: string | null = null;
+	#nextHistoryCursor: string | undefined;
+	#seenHistoryCursors = new Set<string>();
+	#pageRetryCounts = new Map<string, number>();
 	/** base64url write token from a full link; absent when joined via a view link. */
 	#writeToken: string | undefined;
 	/** True when the host marked this peer read-only (view link). */
@@ -272,23 +303,30 @@ export class CollabGuestLink {
 			joined = true;
 			firstWelcome.resolve();
 		};
+		socket.onCorruptFrame = fromPeer => logger.debug("collab guest ignored corrupted relay frame", { fromPeer });
 
 		socket.onOpen = () => {
-			// (Re)connect: re-introduce ourselves; the host answers with a fresh
-			// welcome which (re)syncs the replica. Discard any partially-streamed
-			// snapshot from a prior connection: the host will resend the full
-			// chunk train.
+			// Keep a partially received recovery snapshot. The next hello carries
+			// its contiguous ACK so the host can resume the retained window.
+			const pendingRecovery = this.#pendingSnapshot?.recovery;
 			this.#welcomed = false;
-			this.#pendingSnapshot = null;
+			if (!pendingRecovery) this.#pendingSnapshot = null;
 			this.#clearSnapshotProgressTimer();
 			this.#armWelcomeTimer();
+			const ack = pendingRecovery?.ack();
 			socket.send({
 				t: "hello",
 				proto: COLLAB_PROTO,
 				name: collabDisplayName(this.#ctx),
 				writeToken: this.#writeToken,
+				snapshotRecovery: true,
+				resumeId: this.#resumeId,
+				snapshotId: pendingRecovery?.snapshotId ?? undefined,
+				contiguousSeq: ack?.contiguousSeq,
+				missing: ack?.missing,
 			});
 		};
+
 		socket.onFrame = frame => {
 			this.#applyChain = this.#applyChain
 				.then(async () => {
@@ -301,19 +339,41 @@ export class CollabGuestLink {
 						}
 						return;
 					}
+					if (frame.t === "snapshot-begin") {
+						this.#beginRecoverySnapshot(frame, joined);
+						return;
+					}
 					if (frame.t === "snapshot-chunk") {
-						const ready = this.#accumulateSnapshotChunk(frame);
+						if ("payload" in frame) {
+							const ready = this.#accumulateRecoveryChunk(frame);
+							if (ready) {
+								await this.#finalizeSnapshot();
+								finishJoin();
+							}
+						} else {
+							const ready = this.#accumulateSnapshotChunk(frame);
+							if (ready) {
+								await this.#finalizeSnapshot();
+								finishJoin();
+							}
+						}
+						return;
+					}
+					if (frame.t === "snapshot-end") {
+						const ready = this.#finishRecoverySnapshot(frame);
 						if (ready) {
 							await this.#finalizeSnapshot();
 							finishJoin();
 						}
 						return;
 					}
+					if (frame.t === "snapshot-page") {
+						if (this.#welcomed && !this.#left) this.#applySnapshotPage(frame);
+						return;
+					}
 					if (frame.t === "error" && !this.#welcomed && !this.#left) {
 						// Pre-welcome errors are the host's targeted reply to our
 						// hello (e.g. protocol mismatch): no welcome will follow.
-						// Fail the join with the host's message instead of hanging
-						// until the welcome timeout.
 						this.#clearWelcomeTimer();
 						if (joined) this.#ctx.showError(`Collab host: ${frame.message}`);
 						else firstWelcome.reject(new Error(frame.message));
@@ -324,7 +384,13 @@ export class CollabGuestLink {
 				})
 				.catch(err => {
 					logger.warn("collab guest frame apply failed", { type: frame.t, error: String(err) });
-					if (!joined && (frame.t === "welcome" || frame.t === "snapshot-chunk")) {
+					if (
+						!joined &&
+						(frame.t === "welcome" ||
+							frame.t === "snapshot-chunk" ||
+							frame.t === "snapshot-begin" ||
+							frame.t === "snapshot-end")
+					) {
 						firstWelcome.reject(err instanceof Error ? err : new Error(String(err)));
 					}
 				});
@@ -394,25 +460,89 @@ export class CollabGuestLink {
 	 */
 	#beginWelcome(frame: WelcomeFrame, isResync: boolean): void {
 		if (this.#left) return;
-		this.#pendingSnapshot = {
-			header: frame.header,
-			state: frame.state,
-			agents: frame.agents,
-			readOnly: frame.readOnly === true,
-			entryCount: frame.entryCount,
-			entries: [],
-			isResync,
-		};
+		const retained = this.#pendingSnapshot;
+		if (retained?.recovery) {
+			retained.header = frame.header;
+			retained.state = frame.state;
+			retained.agents = frame.agents;
+			retained.readOnly = frame.readOnly === true;
+			retained.entryCount = frame.entryCount;
+			retained.entries = [];
+			retained.isResync = isResync;
+			retained.snapshotEndReceived = false;
+		} else {
+			this.#pendingSnapshot = {
+				header: frame.header,
+				state: frame.state,
+				agents: frame.agents,
+				readOnly: frame.readOnly === true,
+				entryCount: frame.entryCount,
+				entries: [],
+				isResync,
+			};
+		}
+		this.#snapshotEndReceived = false;
 		this.#armSnapshotProgressTimer();
 	}
 
+	#beginRecoverySnapshot(frame: SnapshotBeginFrame, isResync: boolean): void {
+		if (this.#left) return;
+		const pending = this.#pendingSnapshot;
+		if (!pending) {
+			logger.debug("collab guest dropping orphan snapshot-begin");
+			return;
+		}
+		const receiver = pending.recovery ?? new SnapshotReceiver();
+		const result = receiver.begin(frame);
+		if (result !== "resumed") this.#seenHistoryCursors.clear();
+		pending.recovery = receiver;
+		pending.snapshotId = frame.snapshotId;
+		pending.entryCount = frame.entryCount ?? pending.entryCount;
+		pending.firstHistoryCursor = frame.firstHistoryCursor;
+		pending.entries = [];
+		pending.isResync = isResync;
+		pending.snapshotEndReceived = false;
+		this.#snapshotEndReceived = false;
+		this.#armSnapshotProgressTimer();
+		this.#socket?.send(receiver.ack());
+	}
+
+	#accumulateRecoveryChunk(frame: SnapshotChunkFrame): boolean {
+		const pending = this.#pendingSnapshot;
+		if (!pending?.recovery || pending.snapshotId !== frame.snapshotId) {
+			logger.debug("collab guest dropping orphan recovery snapshot-chunk");
+			return false;
+		}
+		const result = pending.recovery.accept(frame);
+		this.#socket?.send(result.ack);
+		if (result.corrupt) logger.warn("collab guest rejected corrupted snapshot chunk", { seq: frame.seq });
+		const complete = this.#snapshotEndReceived && pending.recovery.contiguousSeq >= pending.recovery.total - 1;
+		if (complete) this.#clearSnapshotProgressTimer();
+		else this.#armSnapshotProgressTimer();
+		return complete;
+	}
+
+	#finishRecoverySnapshot(frame: SnapshotEndFrame): boolean {
+		const pending = this.#pendingSnapshot;
+		if (!pending?.recovery || pending.snapshotId !== frame.snapshotId) {
+			logger.debug("collab guest dropping orphan snapshot-end");
+			return false;
+		}
+		this.#snapshotEndReceived = true;
+		pending.snapshotEndReceived = true;
+		this.#socket?.send(pending.recovery.ack());
+		const complete = pending.recovery.contiguousSeq >= pending.recovery.total - 1;
+		if (complete) this.#clearSnapshotProgressTimer();
+		else this.#armSnapshotProgressTimer();
+		return complete;
+	}
+
 	/**
-	 * Append a chunk to the pending snapshot. Returns `true` when the
+	 * Append a chunk to the pending legacy snapshot. Returns `true` when the
 	 * accumulator has gathered every entry the welcome promised, or the host
-	 * tagged this chunk as `final`. The caller is responsible for invoking
-	 * {@link #finalizeSnapshot} on the same applyChain microtask.
+	 * tagged this chunk as `final`.
 	 */
-	#accumulateSnapshotChunk(frame: SnapshotChunkFrame): boolean {
+	#accumulateSnapshotChunk(frame: LegacySnapshotChunkFrame): boolean {
 		const pending = this.#pendingSnapshot;
 		if (!pending) {
 			logger.debug("collab guest dropping orphan snapshot-chunk");
@@ -428,41 +558,104 @@ export class CollabGuestLink {
 		return complete;
 	}
 
-	/** Write the accumulated welcome snapshot to the replica file and (re)load it through the resume machinery. */
+	/** Write the accumulated snapshot to the replica file and (re)load it through the resume machinery. */
 	async #finalizeSnapshot(): Promise<void> {
+		if (this.#snapshotFinalizing) return;
 		const pending = this.#pendingSnapshot;
 		this.#pendingSnapshot = null;
 		this.#clearSnapshotProgressTimer();
 		if (!pending || this.#left) return;
-		const replicaPath = path.join(getConfigRootDir(), "collab", `${this.#roomId}.jsonl`);
-		const lines = [pending.header, ...pending.entries].map(entry => JSON.stringify(entry)).join("\n");
-		await Bun.write(replicaPath, `${lines}\n`);
+		this.#snapshotFinalizing = true;
+		try {
+			const entries = pending.recovery ? decodeSnapshotEntries(pending.recovery.assemble()) : pending.entries;
+			if (pending.recovery && entries.length !== pending.entryCount) {
+				throw new Error(`snapshot entry count mismatch: expected ${pending.entryCount}, got ${entries.length}`);
+			}
+			const replicaPath = path.join(getConfigRootDir(), "collab", `${this.#roomId}.jsonl`);
+			const lines = [pending.header, ...entries].map(entry => JSON.stringify(entry)).join("\n");
+			await Bun.write(replicaPath, `${lines}\n`);
 
-		// Resume through AgentSession without adopting the host's cwd.
-		const switched = await this.#ctx.session.switchSession(replicaPath, { preserveLocalCwd: true });
-		if (switched === false) {
-			throw new Error("Collab replica activation was cancelled");
+			// Resume through AgentSession without adopting the host's cwd.
+			const switched = await this.#ctx.session.switchSession(replicaPath, { preserveLocalCwd: true });
+			if (switched === false) {
+				throw new Error("Collab replica activation was cancelled");
+			}
+			this.#clearTransientUi();
+			this.#clearAgentMirror();
+			this.state = pending.state;
+			reconcileGuestSnapshotHostState(this.#ctx, pending.state.isStreaming);
+			this.#applyHostState(pending.state);
+			this.#ctx.resetObserverRegistry();
+			this.#applyAgentSnapshots(pending.agents);
+			this.#ctx.syncRunningSubagentBadge();
+			this.#assistantStreamSynced = false;
+			setSessionTerminalTitle(pending.state.sessionName ?? pending.header.title, pending.state.cwd);
+			this.#ctx.chatContainer.disposeChildren();
+			await this.#ctx.renderInitialMessages({ clearTerminalHistory: true });
+			await this.#ctx.reloadTodos();
+			this.#updateStatusSegment();
+			this.#readOnly = pending.readOnly;
+			this.#welcomed = true;
+			this.#activeSnapshotId = pending.recovery ? (pending.snapshotId ?? null) : null;
+			this.#nextHistoryCursor = pending.recovery ? pending.firstHistoryCursor : undefined;
+			const suffix = this.#readOnly ? " (read-only)" : "";
+			this.#ctx.showStatus(
+				pending.isResync ? `Reconnected to collab session${suffix}` : `Joined collab session${suffix}`,
+			);
+			if (this.#activeSnapshotId && this.#nextHistoryCursor) {
+				this.#socket?.send({
+					t: "snapshot-page-request",
+					snapshotId: this.#activeSnapshotId,
+					cursor: this.#nextHistoryCursor,
+				});
+			}
+		} finally {
+			this.#snapshotFinalizing = false;
 		}
-		this.#clearTransientUi();
-		this.#clearAgentMirror();
-		this.state = pending.state;
-		reconcileGuestSnapshotHostState(this.#ctx, pending.state.isStreaming);
-		this.#applyHostState(pending.state);
-		this.#ctx.resetObserverRegistry();
-		this.#applyAgentSnapshots(pending.agents);
-		this.#ctx.syncRunningSubagentBadge();
-		this.#assistantStreamSynced = false;
-		setSessionTerminalTitle(pending.state.sessionName ?? pending.header.title, pending.state.cwd);
-		this.#ctx.chatContainer.disposeChildren();
-		await this.#ctx.renderInitialMessages({ clearTerminalHistory: true });
-		await this.#ctx.reloadTodos();
-		this.#updateStatusSegment();
-		this.#readOnly = pending.readOnly;
-		this.#welcomed = true;
-		const suffix = this.#readOnly ? " (read-only)" : "";
-		this.#ctx.showStatus(
-			pending.isResync ? `Reconnected to collab session${suffix}` : `Joined collab session${suffix}`,
-		);
+	}
+	#applySnapshotPage(frame: SnapshotPageFrame): void {
+		if (this.#activeSnapshotId !== frame.snapshotId) return;
+		const socket = this.#socket;
+		if (!socket) return;
+		if (this.#seenHistoryCursors.has(frame.cursor)) {
+			socket.send({ t: "snapshot-page-ack", snapshotId: frame.snapshotId, cursor: frame.cursor });
+			return;
+		}
+		const payload = decodeSnapshotPayload(frame.payload);
+		if (!payload || checksumSnapshotPayload(payload) !== frame.checksum) {
+			const retries = this.#pageRetryCounts.get(frame.cursor) ?? 0;
+			if (retries < 4) {
+				this.#pageRetryCounts.set(frame.cursor, retries + 1);
+				socket.send({ t: "snapshot-page-request", snapshotId: frame.snapshotId, cursor: frame.cursor });
+			} else {
+				this.#ctx.showError("Collab host sent a corrupted session history page");
+			}
+			return;
+		}
+		let entries: SessionEntry[];
+		try {
+			entries = decodeSnapshotEntries(payload);
+		} catch (error) {
+			logger.warn("collab guest rejected invalid session history page", {
+				error: String(error),
+				cursor: frame.cursor,
+			});
+			const retries = this.#pageRetryCounts.get(frame.cursor) ?? 0;
+			if (retries < 4) {
+				this.#pageRetryCounts.set(frame.cursor, retries + 1);
+				socket.send({ t: "snapshot-page-request", snapshotId: frame.snapshotId, cursor: frame.cursor });
+			} else {
+				this.#ctx.showError("Collab host sent an invalid session history page");
+			}
+			return;
+		}
+		this.#pageRetryCounts.delete(frame.cursor);
+		this.#seenHistoryCursors.add(frame.cursor);
+		for (const entry of entries) this.#applyFrame({ t: "entry", entry });
+		socket.send({ t: "snapshot-page-ack", snapshotId: frame.snapshotId, cursor: frame.cursor });
+		this.#nextHistoryCursor = frame.nextCursor;
+		if (frame.nextCursor)
+			socket.send({ t: "snapshot-page-request", snapshotId: frame.snapshotId, cursor: frame.nextCursor });
 	}
 
 	#armWelcomeTimer(): void {

@@ -3,12 +3,15 @@
  *
  * Connects to a relay room, seals/opens AES-GCM frames, and reconnects with
  * exponential backoff on transient drops. Fatal relay close codes (room gone,
- * host conflict, room full) and decryption failures never reconnect.
+ * host conflict, room full) and unhandled decryption failures never reconnect;
+ * recovery callers can observe an authenticated-frame failure and retransmit.
  */
 import { logger } from "@oh-my-pi/pi-utils";
 import { open, seal } from "./crypto";
 import type { CollabFrame, RelayControlMessage } from "./protocol";
-import { packEnvelope, unpackEnvelope } from "./protocol";
+import { ENVELOPE_HEADER_LENGTH, packEnvelope, unpackEnvelope } from "./protocol";
+
+export const MAX_ENCRYPTED_COLLAB_FRAME_BYTES = 128 * 1024;
 
 const FATAL_CLOSE_REASONS: Record<number, string> = {
 	4001: "room closed",
@@ -37,6 +40,8 @@ export class CollabSocket {
 	onOpen?: () => void;
 	onFrame?: (frame: CollabFrame, fromPeer: number) => void;
 	onControl?: (msg: RelayControlMessage) => void;
+	/** Fires after a frame fails authentication; callers may keep the socket and request a retransmission. */
+	onCorruptFrame?: (fromPeer: number) => void;
 	/** Fires once per terminal close (intentional, fatal code, or bad key). willReconnect=true for transient drops that will retry. */
 	onClose?: (reason: string, willReconnect: boolean) => void;
 
@@ -79,6 +84,13 @@ export class CollabSocket {
 				const openWs = this.#ws;
 				if (openWs && openWs.readyState === WebSocket.OPEN) this.#drainPendingSends(openWs);
 				const sealed = await seal(this.#opts.key, frame);
+				if (sealed.byteLength + ENVELOPE_HEADER_LENGTH > MAX_ENCRYPTED_COLLAB_FRAME_BYTES) {
+					logger.warn("collab: refusing oversized encrypted frame", {
+						t: frame.t,
+						bytes: sealed.byteLength + ENVELOPE_HEADER_LENGTH,
+					});
+					return;
+				}
 				const envelope = packEnvelope(targetPeer, sealed);
 				const ws = this.#ws;
 				if (ws && ws.readyState === WebSocket.OPEN) {
@@ -218,6 +230,11 @@ export class CollabSocket {
 				try {
 					frame = await open(this.#opts.key, envelope.payload);
 				} catch {
+					if (this.onCorruptFrame) {
+						logger.debug("collab: ignoring corrupted frame", { peerId: envelope.peerId });
+						this.onCorruptFrame(envelope.peerId);
+						return;
+					}
 					this.#failFatal("bad key or corrupted frame");
 					return;
 				}
