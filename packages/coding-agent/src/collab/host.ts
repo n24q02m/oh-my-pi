@@ -26,7 +26,7 @@ import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry } from "../registry/agent-registry";
 import type { AgentSessionEvent } from "../session/agent-session";
 import { stripImagesFromMessage, USER_INTERRUPT_LABEL } from "../session/messages";
-import type { SessionEntry as StoredSessionEntry } from "../session/session-entries";
+import type { SessionHeader, SessionEntry as StoredSessionEntry } from "../session/session-entries";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../task/types";
 import { generateRoomKey, generateWriteToken, importRoomKey } from "./crypto";
 import { collabDisplayName } from "./display-name";
@@ -128,6 +128,31 @@ function snapshotJsonBytes(value: unknown): number {
 	return snapshotEncoder.encode(JSON.stringify(value)).byteLength;
 }
 
+function fitSnapshotMessageContent(
+	base: { id: string; parentId: string | null; timestamp: string },
+	message: Record<string, unknown>,
+	content: string,
+): StoredSessionEntry & WireSessionEntry {
+	const markerEnd = content.lastIndexOf(" chars elided for collab session]");
+	const markerStart = markerEnd >= 0 ? content.lastIndexOf("\n…[", markerEnd) : -1;
+	const marker = markerStart >= 0 ? content.slice(markerStart) : "\n…[content elided for collab snapshot]";
+	const source = markerStart >= 0 ? content.slice(0, markerStart) : content;
+	const makeEntry = (fittedContent: string): StoredSessionEntry & WireSessionEntry =>
+		({
+			...base,
+			type: "message",
+			message: { ...message, content: fittedContent },
+		} as StoredSessionEntry & WireSessionEntry);
+	let low = 0;
+	let high = source.length;
+	while (low < high) {
+		const middle = Math.ceil((low + high) / 2);
+		if (snapshotJsonBytes(makeEntry(source.slice(0, middle) + marker)) <= SNAPSHOT_CHUNK_BYTES) low = middle;
+		else high = middle - 1;
+	}
+	return makeEntry(source.slice(0, low) + marker);
+}
+
 function fitSnapshotEntry(entry: StoredSessionEntry & WireSessionEntry): StoredSessionEntry & WireSessionEntry {
 	const candidate = shrinkForReplication(entry);
 	if (snapshotJsonBytes(candidate) <= SNAPSHOT_CHUNK_BYTES) return candidate;
@@ -140,13 +165,14 @@ function fitSnapshotEntry(entry: StoredSessionEntry & WireSessionEntry): StoredS
 	switch (candidate.type) {
 		case "message": {
 			const {
-				content: _content,
+				content: messageContent,
 				details: _details,
 				providerMetadata: _providerMetadata,
 				providerPayload: _providerPayload,
 				errorMessage: _errorMessage,
 				...message
 			} = candidate.message as unknown as Record<string, unknown>;
+			if (typeof messageContent === "string") return fitSnapshotMessageContent(base, message, messageContent);
 			return {
 				...base,
 				type: "message",
@@ -208,9 +234,16 @@ export type CollabGuestUiResult = { kind: "answered"; value: CollabUiResponseVal
 const MAX_DEFERRED_LIVE_FRAMES = 256;
 
 const MAX_DEFERRED_LIVE_BYTES = 8 * 1024 * 1024;
-const MAX_PENDING_SNAPSHOT_PAGES = 16;
+/** Keep page retry state fair across peers; the global cap remains bounded. */
+const MAX_PENDING_SNAPSHOT_PAGES_PER_PEER = 16;
+const MAX_PENDING_SNAPSHOT_PAGES = 64;
+const MAX_LIVE_SEQUENCE_HISTORY = 4096;
 type SnapshotTransfer = {
 	resumeId: string;
+	sessionId: string;
+	header: SessionHeader;
+	recoveryEpoch: number;
+	checksum: string;
 	snapshotId: string;
 	sender: SnapshotSender;
 	entries: (StoredSessionEntry & WireSessionEntry)[];
@@ -225,10 +258,13 @@ type SnapshotTransfer = {
 	lastUsedAt: number;
 	completed: boolean;
 	historyPending: boolean;
+	completionAcked: boolean;
+	completionAttempts: number;
 };
 
 type SnapshotPageTransfer = {
 	peerId: number;
+	recoveryEpoch: number;
 	sender: SnapshotPageSender;
 	nextCursor?: string;
 	timer: Timer | null;
@@ -244,6 +280,8 @@ export class CollabHost {
 	#sessionId = "";
 	#unsubscribe?: () => void;
 	#peers = new Map<number, { name: string; canWrite: boolean; recovery?: SnapshotTransfer }>();
+	#liveSeq = 0;
+	#recoveryEpoch = 0;
 	#snapshotTransfers = new Map<string, SnapshotTransfer>();
 	#snapshotPages = new Map<string, SnapshotPageTransfer>();
 	#uiReqSeq = 0;
@@ -316,11 +354,25 @@ export class CollabHost {
 		return false;
 	}
 
-	#sendWritablePeers(frame: CollabFrame): void {
+	#sendFrame(frame: CollabFrame, targetPeer = 0): void {
 		const socket = this.#socket;
 		if (!socket) return;
+		// Snapshot payload frames are fitted against the encrypted frame budget
+		// and carry checksums, so shrinking their base64 payload would corrupt
+		// the transfer. Live/control frames still use the replication shrinker.
+		const outbound = frame.t === "snapshot-chunk" || frame.t === "snapshot-page" ? frame : shrinkForReplication(frame);
+		socket.send(outbound, targetPeer);
+	}
+
+	#withLiveSequence(frame: CollabFrame): CollabFrame {
+		if (frame.t !== "entry" && frame.t !== "event" && frame.t !== "bus") return frame;
+		this.#liveSeq = this.#liveSeq >= Number.MAX_SAFE_INTEGER ? 1 : this.#liveSeq + 1;
+		return { ...frame, liveSeq: this.#liveSeq };
+	}
+
+	#sendWritablePeers(frame: CollabFrame): void {
 		for (const [peerId, peer] of this.#peers) {
-			if (peer.canWrite) socket.send(frame, peerId);
+			if (peer.canWrite) this.#sendFrame(frame, peerId);
 		}
 	}
 
@@ -470,7 +522,7 @@ export class CollabHost {
 			this.#snapshotTransfers.delete(transfer.resumeId);
 	}
 
-	#restartSnapshotTransfer(transfer: SnapshotTransfer, peerId: number, frame: CollabFrame): void {
+	#restartSnapshotTransfer(transfer: SnapshotTransfer, peerId: number, frame?: CollabFrame): void {
 		const peer = this.#peers.get(peerId);
 		if (!peer || peer.recovery !== transfer || transfer.peerId !== peerId || !this.#socket) {
 			transfer.needsResync = true;
@@ -485,7 +537,7 @@ export class CollabHost {
 			snapshotRecovery: true,
 			resumeId: transfer.resumeId,
 		});
-		if (!replacement || replacement === transfer) return;
+		if (!replacement || replacement === transfer || !frame) return;
 		if (frame.t === "entry") {
 			if (!replacement.entries.some(entry => entry.id === frame.entry.id))
 				this.#deferSnapshotLive(replacement, frame);
@@ -497,6 +549,22 @@ export class CollabHost {
 	#deferSnapshotLive(transfer: SnapshotTransfer, frame: CollabFrame, peerId?: number): void {
 		if ((transfer.completed && !transfer.historyPending) || transfer.needsResync) return;
 		const bytes = snapshotJsonBytes(frame);
+		if (bytes > MAX_DEFERRED_LIVE_BYTES) {
+			// A single pathological frame must not recursively trigger replacement.
+			// The replacement snapshot contains the authoritative entry when possible;
+			// event/bus data is intentionally dropped rather than overflowing the stack.
+			logger.warn("collab: dropping oversized live frame and forcing snapshot resync", {
+				type: frame.t,
+				bytes,
+			});
+			if (peerId !== undefined) this.#restartSnapshotTransfer(transfer, peerId);
+			else {
+				transfer.needsResync = true;
+				transfer.pendingLive.length = 0;
+				transfer.pendingLiveBytes = 0;
+			}
+			return;
+		}
 		if (
 			transfer.pendingLive.length >= MAX_DEFERRED_LIVE_FRAMES ||
 			transfer.pendingLiveBytes + bytes > MAX_DEFERRED_LIVE_BYTES
@@ -521,18 +589,19 @@ export class CollabHost {
 			this.#ctx.session.emitNotice("warning", "Collab ended: session switched", "collab");
 			return;
 		}
+		const broadcastFrame = this.#withLiveSequence(frame);
 		const deferred = new Set<SnapshotTransfer>();
 		for (const [peerId, peer] of this.#peers) {
 			if (peer.recovery && (!peer.recovery.completed || peer.recovery.historyPending)) {
-				this.#deferSnapshotLive(peer.recovery, frame, peerId);
+				this.#deferSnapshotLive(peer.recovery, broadcastFrame, peerId);
 				deferred.add(peer.recovery);
 				continue;
 			}
-			this.#socket.send(frame, peerId);
+			this.#sendFrame(broadcastFrame, peerId);
 		}
 		for (const transfer of this.#snapshotTransfers.values()) {
 			if (transfer.peerId === null && (!transfer.completed || transfer.historyPending) && !deferred.has(transfer))
-				this.#deferSnapshotLive(transfer, frame);
+				this.#deferSnapshotLive(transfer, broadcastFrame);
 		}
 	}
 
@@ -588,7 +657,7 @@ export class CollabHost {
 		hello?: SnapshotHello,
 	): void {
 		if (proto !== COLLAB_PROTO) {
-			this.#socket?.send(
+			this.#sendFrame(
 				{ t: "error", message: `protocol mismatch: host speaks v${COLLAB_PROTO}, guest sent v${proto}` },
 				fromPeer,
 			);
@@ -614,14 +683,19 @@ export class CollabHost {
 			}
 			logger.info("collab welcome exceeded size threshold; stripped images", { stripped });
 		}
-		const entries = snapshot.entries.filter(isWireSessionEntry);
+		const entries = snapshot.entries.filter(isWireSessionEntry).map(entry => fitSnapshotEntry(entry));
 		const socket = this.#socket;
 		if (!socket) return;
 		if (entries.length > SNAPSHOT_MAX_ENTRY_COUNT) {
-			socket.send({ t: "error", message: "collab snapshot exceeds the bounded history entry limit" }, fromPeer);
+			this.#sendFrame({ t: "error", message: "collab snapshot exceeds the bounded history entry limit" }, fromPeer);
 			return;
 		}
-		socket.send(
+		const historyBytes = snapshotJsonBytes(entries);
+		if (historyBytes > SNAPSHOT_MAX_TRANSFER_BYTES) {
+			this.#sendFrame({ t: "error", message: "collab snapshot exceeds the bounded legacy history byte limit" }, fromPeer);
+			return;
+		}
+		this.#sendFrame(
 			{
 				t: "welcome",
 				proto: COLLAB_PROTO,
@@ -636,7 +710,7 @@ export class CollabHost {
 		this.#sendSnapshotChunks(entries, fromPeer);
 		if (canWrite) {
 			for (const pending of this.#pendingUi.values()) {
-				socket.send({ t: "ui-request", request: pending.request }, fromPeer);
+				this.#sendFrame({ t: "ui-request", request: pending.request }, fromPeer);
 			}
 		}
 		this.#ctx.session.emitNotice(
@@ -656,7 +730,7 @@ export class CollabHost {
 		const socket = this.#socket;
 		if (!socket) return;
 		if (entries.length === 0) {
-			socket.send({ t: "snapshot-chunk", entries: [], final: true }, fromPeer);
+			this.#sendFrame({ t: "snapshot-chunk", entries: [], final: true }, fromPeer);
 			return;
 		}
 		let i = 0;
@@ -673,18 +747,49 @@ export class CollabHost {
 				batch.push(shrunk);
 				i++;
 			}
-			socket.send({ t: "snapshot-chunk", entries: batch, final: i >= entries.length }, fromPeer);
+			this.#sendFrame({ t: "snapshot-chunk", entries: batch, final: i >= entries.length }, fromPeer);
 		}
 	}
 
+	#sendRecoveryHeader(transfer: SnapshotTransfer, peerId: number, canWrite: boolean): void {
+		this.#sendFrame(
+			{
+				t: "welcome",
+				proto: COLLAB_PROTO,
+				header: transfer.header,
+				state: this.#buildState(),
+				agents: this.#snapshotAgents(),
+				entryCount: transfer.initialEntryCount,
+				snapshotId: transfer.snapshotId,
+				recoveryEpoch: transfer.recoveryEpoch,
+				resumeId: transfer.resumeId,
+				readOnly: canWrite ? undefined : true,
+			},
+			peerId,
+		);
+		this.#sendFrame(
+			{
+				t: "snapshot-begin",
+				snapshotId: transfer.snapshotId,
+				recoveryEpoch: transfer.recoveryEpoch,
+				resumeId: transfer.resumeId,
+				total: transfer.sender.total,
+				entryCount: transfer.initialEntryCount,
+				firstHistoryCursor: transfer.nextHistoryCursor,
+			},
+			peerId,
+		);
+	}
 	#sendRecoverySnapshot(peerId: number, resumeId: string, hello: SnapshotHello): SnapshotTransfer | undefined {
-		const socket = this.#socket;
-		if (!socket) return;
+		if (!this.#socket) return;
+		const currentSnapshot = this.#ctx.sessionManager.snapshotForReplication();
 		const current = this.#snapshotTransfers.get(resumeId);
 		const canResume =
 			current !== undefined &&
 			current.peerId === null &&
 			hello.snapshotId === current.snapshotId &&
+			hello.recoveryEpoch === current.recoveryEpoch &&
+			current.sessionId === currentSnapshot.header.id &&
 			!current.completed &&
 			!current.needsResync;
 		if (current && !canResume && current.peerId === null) {
@@ -692,25 +797,31 @@ export class CollabHost {
 			if (current.retentionTimer !== null) clearTimeout(current.retentionTimer);
 			this.#snapshotTransfers.delete(current.resumeId);
 		}
-		let transfer = current;
+		let transfer: SnapshotTransfer | undefined = current;
 		if (!canResume) {
-			const snapshot = this.#ctx.sessionManager.snapshotForReplication();
+			const snapshot = currentSnapshot;
 			if (JSON.stringify(snapshot).length > WELCOME_IMAGE_STRIP_THRESHOLD) {
 				for (const entry of snapshot.entries) {
 					if (entry.type === "message") stripImagesFromMessage(entry.message);
 				}
 			}
 			const entries = snapshot.entries.filter(isWireSessionEntry).map(entry => fitSnapshotEntry(entry));
-			const historyBytes = entries.reduce((sum, entry) => sum + snapshotJsonBytes(entry), 0);
+			const historyBytes = snapshotJsonBytes(entries);
 			if (entries.length > SNAPSHOT_MAX_ENTRY_COUNT || historyBytes > SNAPSHOT_MAX_TRANSFER_BYTES) {
-				socket.send({ t: "error", message: "collab snapshot exceeds the bounded recovery history limit" }, peerId);
+				this.#sendFrame({ t: "error", message: "collab snapshot exceeds the bounded recovery history limit" }, peerId);
 				return;
 			}
 			const initialEntries = entries.slice(0, SNAPSHOT_INITIAL_HISTORY_ENTRIES);
-			const payloads = splitSnapshotPayload(serializeSnapshotEntries(initialEntries));
+			const initialPayload = serializeSnapshotEntries(initialEntries);
+			const payloads = splitSnapshotPayload(initialPayload);
+			this.#recoveryEpoch = this.#recoveryEpoch >= Number.MAX_SAFE_INTEGER ? 1 : this.#recoveryEpoch + 1;
 			const snapshotId = crypto.randomUUID();
 			transfer = {
 				resumeId,
+				sessionId: snapshot.header.id,
+				header: snapshot.header,
+				recoveryEpoch: this.#recoveryEpoch,
+				checksum: checksumSnapshotPayload(initialPayload),
 				snapshotId,
 				sender: new SnapshotSender(snapshotId, payloads),
 				entries,
@@ -725,8 +836,10 @@ export class CollabHost {
 				lastUsedAt: Date.now(),
 				completed: false,
 				historyPending: entries.length > initialEntries.length,
+				completionAcked: false,
+				completionAttempts: 0,
 			};
-			this.#snapshotTransfers.set(resumeId, transfer as SnapshotTransfer);
+			this.#snapshotTransfers.set(resumeId, transfer);
 			this.#trimSnapshotTransfers();
 		} else if (transfer) {
 			transfer.peerId = peerId;
@@ -738,36 +851,17 @@ export class CollabHost {
 		}
 		if (!transfer) return;
 		const peer = this.#peers.get(peerId);
-		if (!peer || !transfer) return;
+		if (!peer) return;
 		peer.recovery = transfer;
+		const sameTransfer = hello.snapshotId === transfer.snapshotId && hello.recoveryEpoch === transfer.recoveryEpoch;
 		const initialAck: SnapshotAckFrame = {
 			t: "snapshot-ack",
 			snapshotId: transfer.snapshotId,
-			contiguousSeq: hello.snapshotId === transfer.snapshotId ? (hello.contiguousSeq ?? -1) : -1,
-			missing: hello.snapshotId === transfer.snapshotId ? hello.missing : undefined,
+			recoveryEpoch: transfer.recoveryEpoch,
+			contiguousSeq: sameTransfer ? (hello.contiguousSeq ?? -1) : -1,
+			missing: sameTransfer ? hello.missing : undefined,
 		};
-		socket.send(
-			{
-				t: "welcome",
-				proto: COLLAB_PROTO,
-				header: this.#ctx.sessionManager.snapshotForReplication().header,
-				state: this.#buildState(),
-				agents: this.#snapshotAgents(),
-				entryCount: transfer.initialEntryCount,
-				readOnly: peer.canWrite ? undefined : true,
-			},
-			peerId,
-		);
-		socket.send(
-			{
-				t: "snapshot-begin",
-				snapshotId: transfer.snapshotId,
-				total: transfer.sender.total,
-				entryCount: transfer.initialEntryCount,
-				firstHistoryCursor: transfer.nextHistoryCursor,
-			},
-			peerId,
-		);
+		this.#sendRecoveryHeader(transfer, peerId, peer.canWrite);
 		const result = transfer.sender.acknowledge(initialAck, canResume);
 		if (result.exhausted) {
 			this.#failSnapshotTransfer(transfer, "snapshot transfer retry exhausted", peerId);
@@ -777,8 +871,7 @@ export class CollabHost {
 		if (result.complete) this.#finishSnapshotTransfer(transfer, peerId);
 		else this.#armSnapshotAckTimer(transfer);
 		if (peer.canWrite) {
-			for (const pending of this.#pendingUi.values())
-				socket.send({ t: "ui-request", request: pending.request }, peerId);
+			for (const pending of this.#pendingUi.values()) this.#sendFrame({ t: "ui-request", request: pending.request }, peerId);
 		}
 		this.#ctx.session.emitNotice(
 			"info",
@@ -792,23 +885,61 @@ export class CollabHost {
 
 	#sendRecoveryChunks(transfer: SnapshotTransfer, chunks: readonly SnapshotChunkFrame[]): void {
 		if (!this.#socket || transfer.peerId === null) return;
-		for (const chunk of chunks) this.#socket.send(chunk, transfer.peerId);
+		for (const chunk of chunks)
+			this.#sendFrame({ ...chunk, recoveryEpoch: transfer.recoveryEpoch }, transfer.peerId);
+	}
+	#sendRecoveryEnd(transfer: SnapshotTransfer, peerId: number): void {
+		this.#sendFrame(
+			{
+				t: "snapshot-end",
+				snapshotId: transfer.snapshotId,
+				recoveryEpoch: transfer.recoveryEpoch,
+				checksum: transfer.checksum,
+			},
+			peerId,
+		);
 	}
 
 	#armSnapshotAckTimer(transfer: SnapshotTransfer): void {
 		if (transfer.ackTimer !== null) clearTimeout(transfer.ackTimer);
-		if (transfer.peerId === null || transfer.completed) {
+		if (transfer.peerId === null) {
+			transfer.ackTimer = null;
+			return;
+		}
+		if (transfer.completed) {
+			if (transfer.completionAcked) {
+				transfer.ackTimer = null;
+				return;
+			}
+			transfer.ackTimer = setTimeout(() => {
+				transfer.ackTimer = null;
+				if (this.#stopped || transfer.peerId === null || !transfer.completed || transfer.completionAcked) return;
+				if (transfer.completionAttempts >= SNAPSHOT_MAX_RETRIES) {
+					this.#failSnapshotTransfer(transfer, "snapshot completion retry exhausted", transfer.peerId);
+					return;
+				}
+				transfer.completionAttempts++;
+				this.#sendRecoveryEnd(transfer, transfer.peerId);
+				this.#armSnapshotAckTimer(transfer);
+			}, SNAPSHOT_ACK_TIMEOUT_MS);
+			return;
+		}
+		const peer = this.#peers.get(transfer.peerId);
+		if (!peer) {
 			transfer.ackTimer = null;
 			return;
 		}
 		transfer.ackTimer = setTimeout(() => {
 			transfer.ackTimer = null;
 			if (this.#stopped || transfer.peerId === null || transfer.completed) return;
+			const currentPeer = this.#peers.get(transfer.peerId);
+			if (!currentPeer || currentPeer.recovery !== transfer) return;
 			const result = transfer.sender.onTimeout();
 			if (result.exhausted) {
 				this.#failSnapshotTransfer(transfer, "snapshot transfer retry exhausted", transfer.peerId);
 				return;
 			}
+			this.#sendRecoveryHeader(transfer, transfer.peerId, currentPeer.canWrite);
 			this.#sendRecoveryChunks(transfer, result.chunks);
 			if (result.complete) this.#finishSnapshotTransfer(transfer, transfer.peerId);
 			else this.#armSnapshotAckTimer(transfer);
@@ -818,29 +949,46 @@ export class CollabHost {
 	#finishSnapshotTransfer(transfer: SnapshotTransfer, peerId: number): void {
 		if (transfer.completed) return;
 		transfer.completed = true;
+		transfer.completionAttempts = 0;
 		if (transfer.ackTimer !== null) {
 			clearTimeout(transfer.ackTimer);
 			transfer.ackTimer = null;
 		}
-		if (this.#socket) this.#socket.send({ t: "snapshot-end", snapshotId: transfer.snapshotId }, peerId);
-		if (transfer.nextHistoryCursor) {
-			// Keep the peer in recovery mode until every older history page is
-			// ACKed; otherwise live entries would overtake paginated history.
-			transfer.historyPending = true;
+		this.#sendRecoveryEnd(transfer, peerId);
+		transfer.historyPending = transfer.nextHistoryCursor !== undefined;
+		this.#maybeReleaseSnapshotLive(transfer, peerId);
+		if (!transfer.completionAcked && transfer.peerId !== null) this.#armSnapshotAckTimer(transfer);
+	}
+
+	#acceptSnapshotCompletion(transfer: SnapshotTransfer, frame: SnapshotAckFrame, peerId: number): void {
+		if (
+			!transfer.completed ||
+			frame.recoveryEpoch !== transfer.recoveryEpoch ||
+			frame.complete !== true ||
+			frame.digest !== transfer.checksum
+		)
 			return;
+		transfer.completionAcked = true;
+		if (transfer.ackTimer !== null) {
+			clearTimeout(transfer.ackTimer);
+			transfer.ackTimer = null;
 		}
+		this.#maybeReleaseSnapshotLive(transfer, peerId);
+	}
+
+	#maybeReleaseSnapshotLive(transfer: SnapshotTransfer, peerId: number): void {
+		if (!transfer.completionAcked || transfer.historyPending) return;
 		this.#releaseSnapshotLive(transfer, peerId);
 	}
 
 	#releaseSnapshotLive(transfer: SnapshotTransfer, peerId: number): void {
+		if (!transfer.completionAcked) return;
 		transfer.historyPending = false;
 		const peer = this.#peers.get(peerId);
 		if (peer?.recovery === transfer) peer.recovery = undefined;
 		const pendingLive = transfer.pendingLive.splice(0);
 		transfer.pendingLiveBytes = 0;
-		if (this.#socket) {
-			for (const frame of pendingLive) this.#socket.send(frame, peerId);
-		}
+		for (const frame of pendingLive) this.#sendFrame(frame, peerId);
 		transfer.peerId = null;
 		this.#retainSnapshotTransfer(transfer);
 	}
@@ -852,7 +1000,7 @@ export class CollabHost {
 		transfer.retentionTimer = null;
 		const peer = this.#peers.get(peerId);
 		if (peer?.recovery === transfer) peer.recovery = undefined;
-		if (this.#socket) this.#socket.send({ t: "error", message: reason }, peerId);
+		this.#sendFrame({ t: "error", message: reason }, peerId);
 		if (this.#snapshotTransfers.get(transfer.resumeId) === transfer)
 			this.#snapshotTransfers.delete(transfer.resumeId);
 		transfer.pendingLive.length = 0;
@@ -883,7 +1031,7 @@ export class CollabHost {
 
 	#handleSnapshotAck(frame: SnapshotAckFrame, fromPeer: number): void {
 		const transfer = this.#peers.get(fromPeer)?.recovery;
-		if (!transfer || transfer.snapshotId !== frame.snapshotId) return;
+		if (!transfer || transfer.snapshotId !== frame.snapshotId || frame.recoveryEpoch !== transfer.recoveryEpoch) return;
 		const result = transfer.sender.acknowledge(frame);
 		if (result.exhausted) {
 			this.#failSnapshotTransfer(transfer, "snapshot transfer retry exhausted", fromPeer);
@@ -892,6 +1040,7 @@ export class CollabHost {
 		this.#sendRecoveryChunks(transfer, result.chunks);
 		if (result.complete) this.#finishSnapshotTransfer(transfer, fromPeer);
 		else this.#armSnapshotAckTimer(transfer);
+		if (frame.complete === true) this.#acceptSnapshotCompletion(transfer, frame, fromPeer);
 	}
 
 	#pageKey(peerId: number, snapshotId: string, cursor: string): string {
@@ -906,10 +1055,10 @@ export class CollabHost {
 			const result = transfer.sender.onTimeout();
 			if (result.exhausted) {
 				this.#snapshotPages.delete(key);
-				this.#socket.send({ t: "error", message: "snapshot history page retry exhausted" }, transfer.peerId);
+				this.#sendFrame({ t: "error", message: "snapshot history page retry exhausted" }, transfer.peerId);
 				return;
 			}
-			if (result.frame) this.#socket.send(result.frame, transfer.peerId);
+			if (result.frame) this.#sendFrame(result.frame, transfer.peerId);
 			this.#armSnapshotPageRetry(key, transfer);
 		}, SNAPSHOT_PAGE_ACK_TIMEOUT_MS);
 	}
@@ -917,7 +1066,7 @@ export class CollabHost {
 	#handleSnapshotPageAck(frame: SnapshotPageAckFrame, fromPeer: number): void {
 		const key = this.#pageKey(fromPeer, frame.snapshotId, frame.cursor);
 		const pageTransfer = this.#snapshotPages.get(key);
-		if (!pageTransfer?.sender.acknowledge(frame)) return;
+		if (!pageTransfer || pageTransfer.recoveryEpoch !== frame.recoveryEpoch || !pageTransfer.sender.acknowledge(frame)) return;
 		if (pageTransfer.timer !== null) clearTimeout(pageTransfer.timer);
 		pageTransfer.timer = null;
 		this.#snapshotPages.delete(key);
@@ -944,6 +1093,7 @@ export class CollabHost {
 			!transfer ||
 			transfer.snapshotId !== frame.snapshotId ||
 			transfer.peerId !== fromPeer ||
+			frame.recoveryEpoch !== transfer.recoveryEpoch ||
 			!transfer.completed ||
 			!transfer.historyPending ||
 			!this.#socket
@@ -954,40 +1104,42 @@ export class CollabHost {
 		let end = Math.min(start + SNAPSHOT_HISTORY_PAGE_ENTRIES, transfer.entries.length);
 		while (end > start && snapshotJsonBytes(transfer.entries.slice(start, end)) > SNAPSHOT_CHUNK_BYTES) end--;
 		if (end === start) {
-			this.#socket.send({ t: "error", message: "snapshot history entry exceeds the page size limit" }, fromPeer);
+			this.#sendFrame({ t: "error", message: "snapshot history entry exceeds the page size limit" }, fromPeer);
 			return;
 		}
 		const payload = serializeSnapshotEntries(transfer.entries.slice(start, end));
 		const page: SnapshotPageFrame = {
 			t: "snapshot-page",
 			snapshotId: transfer.snapshotId,
+			recoveryEpoch: transfer.recoveryEpoch,
 			cursor: frame.cursor,
 			nextCursor: end < transfer.entries.length ? String(end) : undefined,
 			payload: encodeSnapshotPayload(payload),
 			checksum: checksumSnapshotPayload(payload),
 		};
 		if (snapshotJsonBytes(page) + 32 + 4 > MAX_ENCRYPTED_COLLAB_FRAME_BYTES) {
-			this.#socket.send({ t: "error", message: "snapshot history page exceeds encrypted frame limit" }, fromPeer);
+			this.#sendFrame({ t: "error", message: "snapshot history page exceeds encrypted frame limit" }, fromPeer);
 			return;
 		}
 		const key = this.#pageKey(fromPeer, frame.snapshotId, frame.cursor);
 		const old = this.#snapshotPages.get(key);
-		if (old?.timer !== null && old) clearTimeout(old.timer);
+		if (old && old.timer !== null) clearTimeout(old.timer);
+		if (!old) {
+			const peerPageCount = [...this.#snapshotPages.values()].filter(candidate => candidate.peerId === fromPeer).length;
+			if (peerPageCount >= MAX_PENDING_SNAPSHOT_PAGES_PER_PEER || this.#snapshotPages.size >= MAX_PENDING_SNAPSHOT_PAGES) {
+				this.#sendFrame({ t: "error", message: "snapshot history page queue is full; retry shortly" }, fromPeer);
+				return;
+			}
+		}
 		const pending: SnapshotPageTransfer = {
 			peerId: fromPeer,
+			recoveryEpoch: transfer.recoveryEpoch,
 			sender: new SnapshotPageSender(page),
 			nextCursor: page.nextCursor,
 			timer: null,
 		};
 		this.#snapshotPages.set(key, pending);
-		while (this.#snapshotPages.size > MAX_PENDING_SNAPSHOT_PAGES) {
-			const oldestKey = this.#snapshotPages.keys().next().value as string | undefined;
-			if (!oldestKey) break;
-			const oldest = this.#snapshotPages.get(oldestKey);
-			if (oldest?.timer !== null && oldest) clearTimeout(oldest.timer);
-			this.#snapshotPages.delete(oldestKey);
-		}
-		this.#socket.send(page, fromPeer);
+		this.#sendFrame(page, fromPeer);
 		this.#armSnapshotPageRetry(key, pending);
 	}
 

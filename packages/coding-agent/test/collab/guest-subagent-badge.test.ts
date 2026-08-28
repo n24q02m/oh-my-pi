@@ -14,7 +14,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/modes/running-subagent-badge";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
-import { installInMemoryRelay, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
+import { installInMemoryRelay, sendEmptyRecoveryFrames, uninstallInMemoryRelay } from "./helpers/in-memory-relay";
 
 // In-memory transport: shared FakeWebSocket + InMemoryRelay harness (see
 // ./helpers/in-memory-relay), mirroring the relay's forwarding contract.
@@ -124,7 +124,10 @@ describe("collab guest running-subagents badge", () => {
 		const hostSocket = new CollabSocket({ wsUrl: `ws://localhost:8788/r/${roomId}`, role: "host", key: cryptoKey });
 		const hostOpen = Promise.withResolvers<void>();
 		let nextWelcomeAgents = makeAgents(["remote-one"]);
+		let welcomeEpoch = 0;
 		const sendWelcome = (agents: AgentSnapshot[]) => {
+			const recoveryEpoch = ++welcomeEpoch;
+			const snapshotId = "badge-snapshot-" + recoveryEpoch;
 			hostSocket.send({
 				t: "welcome",
 				proto: COLLAB_PROTO,
@@ -132,7 +135,10 @@ describe("collab guest running-subagents badge", () => {
 				state: makeState(),
 				agents,
 				entryCount: 0,
+				snapshotId,
+				recoveryEpoch,
 			});
+			sendEmptyRecoveryFrames(hostSocket, snapshotId, recoveryEpoch);
 		};
 		hostSocket.onOpen = () => hostOpen.resolve();
 		hostSocket.onFrame = frame => {

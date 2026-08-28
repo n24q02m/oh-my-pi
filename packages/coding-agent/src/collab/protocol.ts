@@ -76,6 +76,7 @@ export type SnapshotHello = {
 	snapshotId?: string;
 	contiguousSeq?: number;
 	missing?: number[];
+	recoveryEpoch?: number;
 };
 
 export type SnapshotBeginFrame = {
@@ -83,6 +84,8 @@ export type SnapshotBeginFrame = {
 	snapshotId: string;
 	total: number;
 	entryCount?: number;
+	recoveryEpoch?: number;
+	resumeId?: string;
 	firstHistoryCursor?: string;
 };
 
@@ -90,6 +93,7 @@ export type SnapshotChunkFrame = {
 	t: "snapshot-chunk";
 	snapshotId: string;
 	seq: number;
+	recoveryEpoch?: number;
 	total: number;
 	payload: string;
 	checksum: string;
@@ -99,6 +103,10 @@ export type SnapshotChunkFrame = {
 };
 
 export type SnapshotAckFrame = {
+	recoveryEpoch?: number;
+	/** Set only after snapshot-end and carries the assembled payload digest. */
+	complete?: boolean;
+	digest?: string;
 	t: "snapshot-ack";
 	snapshotId: string;
 	contiguousSeq: number;
@@ -109,12 +117,16 @@ export type SnapshotEndFrame = {
 	t: "snapshot-end";
 	snapshotId: string;
 	nextHistoryCursor?: string;
+	recoveryEpoch?: number;
+	/** Digest of the complete initial payload, authenticated by the frame seal. */
+	checksum?: string;
 };
 
 export type SnapshotPageRequestFrame = {
 	t: "snapshot-page-request";
 	snapshotId: string;
 	cursor: string;
+	recoveryEpoch?: number;
 };
 
 export type SnapshotPageFrame = {
@@ -123,11 +135,13 @@ export type SnapshotPageFrame = {
 	cursor: string;
 	nextCursor?: string;
 	payload: string;
+	recoveryEpoch?: number;
 	checksum: string;
 };
 
 export type SnapshotPageAckFrame = {
 	t: "snapshot-page-ack";
+	recoveryEpoch?: number;
 	snapshotId: string;
 	cursor: string;
 };
@@ -206,6 +220,8 @@ export interface SnapshotSendResult {
  */
 export class SnapshotSender {
 	readonly snapshotId: string;
+	/** Highest sequence number actually exposed by nextWindow(). */
+	#highestSentSeq = -1;
 	readonly total: number;
 	readonly #payloads: readonly Uint8Array[];
 	readonly #attempts = new Map<number, number>();
@@ -241,6 +257,7 @@ export class SnapshotSender {
 			const seq = this.#nextSeq++;
 			this.#inFlight.add(seq);
 			chunks.push(this.#frame(seq));
+			this.#highestSentSeq = seq;
 		}
 		return chunks;
 	}
@@ -249,8 +266,12 @@ export class SnapshotSender {
 		if (ack.snapshotId !== this.snapshotId || this.total === 0)
 			return { chunks: [], complete: this.total === 0, exhausted: false };
 		if (Number.isSafeInteger(ack.contiguousSeq) && ack.contiguousSeq >= this.#contiguousSeq) {
-			this.#contiguousSeq = Math.min(ack.contiguousSeq, this.total - 1);
-			for (const seq of this.#inFlight) if (seq <= this.#contiguousSeq) this.#inFlight.delete(seq);
+			// ACKs may only advance through chunks that were actually exposed.
+			// A future claim cannot complete (or retire) an incomplete snapshot.
+			if (ack.contiguousSeq <= this.#highestSentSeq) {
+				this.#contiguousSeq = Math.min(ack.contiguousSeq, this.total - 1);
+				for (const seq of this.#inFlight) if (seq <= this.#contiguousSeq) this.#inFlight.delete(seq);
+			}
 		}
 		const missing = this.#boundedMissing(ack.missing);
 		const chunks: SnapshotChunkFrame[] = [];
@@ -283,7 +304,13 @@ export class SnapshotSender {
 		const result: number[] = [];
 		for (const seq of missing) {
 			if (result.length >= SNAPSHOT_MAX_MISSING) break;
-			if (Number.isSafeInteger(seq) && seq > this.#contiguousSeq && seq < this.total && !result.includes(seq))
+			if (
+				Number.isSafeInteger(seq) &&
+				seq > this.#contiguousSeq &&
+				seq <= this.#highestSentSeq &&
+				seq < this.total &&
+				!result.includes(seq)
+			)
 				result.push(seq);
 		}
 		return result;
@@ -477,6 +504,9 @@ export type CollabFrame =
 			proto: number;
 			header: SessionHeader;
 			state: CollabSessionState;
+			snapshotId?: string;
+			recoveryEpoch?: number;
+			resumeId?: string;
 			agents: AgentSnapshot[];
 			/** Total number of legacy SessionEntry items following the welcome. */
 			entryCount: number;
@@ -490,11 +520,11 @@ export type CollabFrame =
 	| SnapshotAckFrame
 	| SnapshotEndFrame
 	| SnapshotPageFrame
-	| { t: "entry"; entry: SessionEntry }
-	| { t: "event"; event: AgentSessionEvent }
+	| { t: "entry"; entry: SessionEntry; liveSeq?: number }
+	| { t: "event"; event: AgentSessionEvent; liveSeq?: number }
 	| { t: "state"; state: CollabSessionState }
 	/** Mirrored EventBus traffic (task subagent lifecycle/progress channels only). */
-	| { t: "bus"; channel: BusChannel; data: unknown }
+	| { t: "bus"; channel: BusChannel; data: unknown; liveSeq?: number }
 	/** Full agent-registry snapshot (debounced on registry change). */
 	| { t: "agents"; agents: AgentSnapshot[] }
 	| { t: "ui-request"; request: CollabUiRequest }

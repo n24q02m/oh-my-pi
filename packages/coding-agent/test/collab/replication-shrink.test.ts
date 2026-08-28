@@ -291,6 +291,14 @@ describe("shrinkForReplication (#3740 review)", () => {
 		expect(shrunk.content).toContain("chars elided for collab session");
 	});
 
+	it("clamps UTF-8 payload bytes under the encrypted frame budget", () => {
+		const giant = { content: "漢".repeat(5 * 1024 * 1024) };
+		const shrunk = shrinkForReplication(giant);
+		const bytes = new TextEncoder().encode(JSON.stringify(shrunk)).byteLength;
+		expect(bytes).toBeLessThanOrEqual(MAX_REPLICATED_PAYLOAD_BYTES);
+		expect(shrunk.content).toContain("chars elided for collab session");
+	});
+
 	it("clamps a payload built of many short strings (no individual oversized) under the cap", () => {
 		// Realistic shape: a tool result content array with thousands of small
 		// text blocks. ~3 MB total; no individual string crosses the 64 B
