@@ -209,6 +209,27 @@ function grantUntrustedWriteAcl(directory: string): void {
 	});
 }
 
+function nonFixedWindowsDriveRoot(): string {
+	if (process.platform !== "win32") throw new Error("Windows volume helper called on a non-Windows test host");
+	const powershell = path.join(
+		process.env.SystemRoot ?? "C:\\Windows",
+		"System32",
+		"WindowsPowerShell",
+		"v1.0",
+		"powershell.exe",
+	);
+	const command =
+		"$ErrorActionPreference = 'Stop'; foreach ($code in 65..90) { $root = ([char]$code).ToString() + ':' + [char]92; $drive = New-Object -TypeName System.IO.DriveInfo -ArgumentList $root; if ($drive.DriveType -ne [System.IO.DriveType]::Fixed) { Write-Output $root; break } }";
+	const output = childProcess.execFileSync(
+		powershell,
+		["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command],
+		{ encoding: "utf8", windowsHide: true },
+	);
+	const root = output.trim().split(/\r?\n/u).find(Boolean);
+	if (!root) throw new Error("Windows test host has no non-fixed drive root");
+	return root;
+}
+
 describe("native remote transport sockets", () => {
 	it("accepts and cleans up loopback TCP sockets", async () => {
 		const target = { transport: "tcp" as const, host: "127.0.0.1" as const, port: await freePort() };
@@ -273,10 +294,10 @@ describe("native remote transport sockets", () => {
 					/local volume|namespace|UNC|remote root/i,
 				);
 			}
-			const nonFixedVolumePath = `Z:${slash}omp-native-root${slash}broker.token`;
+			const nonFixedVolumePath = `${nonFixedWindowsDriveRoot()}omp-native-root${slash}broker.token`;
 			await expect(
 				assertNativePathSafe(nonFixedVolumePath, { privateFinal: true, privateParent: true }),
-			).rejects.toThrow(/fixed local volume|local volume|network|remote volume/i);
+			).rejects.toThrow(/must use a fixed local volume/i);
 		},
 		15_000,
 	);

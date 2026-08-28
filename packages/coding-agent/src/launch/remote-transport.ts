@@ -51,13 +51,19 @@ foreach ($spec in $specs) {
   $rootPath = [System.IO.Path]::GetPathRoot($fullTarget)
   if ($rootPath.Length -ne 3 -or $rootPath[1] -ne ":" -or [int][char]$rootPath[2] -ne 92) { throw "Native Windows path must use a local drive root: $target" }
   $driveInfo = $null
+  $driveType = $null
   try {
     $driveInfo = New-Object -TypeName System.IO.DriveInfo -ArgumentList $rootPath
+    $driveType = $driveInfo.DriveType
+  } catch {
+    throw "Native Windows path volume type could not be verified: $rootPath"
+  }
+  if ($driveType -ne [System.IO.DriveType]::Fixed) { throw "Native Windows path must use a fixed local volume: $rootPath" }
+  try {
     if (-not $driveInfo.IsReady) { throw "drive is not ready" }
   } catch {
     throw "Native Windows path volume could not be verified as a fixed local volume: $rootPath"
   }
-  if ($driveInfo.DriveType -ne [System.IO.DriveType]::Fixed) { throw "Native Windows path must use a fixed local volume: $rootPath" }
   $relative = $fullTarget.Substring($rootPath.Length)
   $parts = @($relative -split '[\\\\/]' | Where-Object { $_ -ne '' })
   $paths = @()
