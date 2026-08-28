@@ -198,7 +198,11 @@ print-mode disposal semantics when the advisor runtime is enabled.
 | `json` | Structured JSON event stream, for headless/machine consumption. |
 | `rpc` | JSON-RPC server over stdio. See [RPC](./rpc.md). |
 | `rpc-ui` | RPC transport with UI extension events enabled. |
-| `acp` | Agent Client Protocol server over stdio. Equivalent to the [`acp`](#subcommands) subcommand; see [approval mode → ACP sessions](./approval-mode.md#acp-sessions). |
+| `acp` | Agent Client Protocol server over stdio. Equivalent to the [`acp`](#subcommands) subcommand; see [ACP agent integration](./acp-agent.md). |
+
+### ACP server
+
+`omp acp` runs the Agent Client Protocol server over stdio for editors and other ACP clients. It is intended to be spawned by the client; stdout is reserved for JSON-RPC messages. See [ACP agent integration](./acp-agent.md) for Zed registration, session lifecycle, authentication, and approval behavior.
 
 ## Subcommands
 
@@ -207,7 +211,7 @@ Run `omp <command> --help` for each command's own flags and examples.
 | Command | Purpose | See also |
 | --- | --- | --- |
 | `launch` | Start a coding session (the default command). | [Launch flags](#launch-flags) |
-| `acp` | Run Oh My Pi as an ACP (Agent Client Protocol) server over stdio. | [approval mode](./approval-mode.md#acp-sessions) |
+| `acp` | Run Oh My Pi as an ACP (Agent Client Protocol) server over stdio. | [ACP agent integration](./acp-agent.md) |
 | `auth-broker` | Manage the omp auth-broker (credential vault). | [auth broker / gateway](./auth-broker-gateway.md) |
 | `auth-gateway` | Run an auth-gateway forward proxy backed by the configured broker. | [auth broker / gateway](./auth-broker-gateway.md) |
 | `agents` | Manage bundled task agents. | [task agent discovery](./task-agent-discovery.md) |
