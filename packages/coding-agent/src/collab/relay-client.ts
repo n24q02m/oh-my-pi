@@ -19,6 +19,7 @@ const FATAL_CLOSE_REASONS: Record<number, string> = {
 
 const BACKOFF_BASE_MS = 1_000;
 const BACKOFF_MAX_MS = 30_000;
+const MAX_RECONNECT_ATTEMPTS = 5;
 /** Max enveloped frames buffered while a reconnect is pending; overflow is dropped. */
 const MAX_PENDING_SENDS = 256;
 const WS_BACKPRESSURE_THRESHOLD = 64 * 1024;
@@ -239,7 +240,15 @@ export class CollabSocket {
 			this.onClose?.(fatalReason, false);
 			return;
 		}
-		this.onClose?.(reason || `connection lost (code ${code})`, true);
+		const closeReason = reason || `connection lost (code ${code})`;
+		if (this.#attempt >= MAX_RECONNECT_ATTEMPTS) {
+			this.#closed = true;
+			this.#clearRetry();
+			this.#pendingSends.length = 0;
+			this.onClose?.(closeReason, false);
+			return;
+		}
+		this.onClose?.(closeReason, true);
 		this.#scheduleRetry();
 	}
 
