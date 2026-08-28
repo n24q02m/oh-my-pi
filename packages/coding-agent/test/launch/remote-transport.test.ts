@@ -591,7 +591,7 @@ describe("native remote transport sockets", () => {
 		}
 	});
 
-	it("bounds unauthenticated native broker guesses", async () => {
+	it("closes a native client at the authentication cap before idle shutdown", async () => {
 		const projectDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-native-auth-project-"));
 		const runtimeRoot = await privateTempDir("omp-native-auth-runtime-");
 		const runtimeDir = path.join(runtimeRoot, "runtime");
@@ -603,20 +603,38 @@ describe("native remote transport sockets", () => {
 		const savedGrace = process.env.OMP_DAEMON_IDLE_GRACE_MS;
 		let brokerPromise: Promise<void> | undefined;
 		let attacker: net.Socket | undefined;
+		let shutdownClient: DaemonBrokerClient | undefined;
 		try {
 			process.env.OMP_DAEMON_PROJECT_DIR = projectDir;
 			process.env.OMP_DAEMON_RUNTIME_DIR = runtimeDir;
-			process.env.OMP_DAEMON_IDLE_GRACE_MS = "200";
+			process.env.OMP_DAEMON_IDLE_GRACE_MS = "30000";
 			brokerPromise = startDaemonBrokerFromEnvironment({ nativeServer: { target } });
 			attacker = await connectNativeEndpoint(target);
 			attacker.resume();
+			attacker.on("error", () => undefined);
 			const badRequest = `${JSON.stringify({ id: "guess", token: "wrong", operation: { op: "ping" } })}\n`;
-			attacker.write(badRequest.repeat(4));
-			await waitForClose(attacker);
+			const { promise: closeOutcome, resolve: resolveCloseOutcome } = Promise.withResolvers<"closed" | "timeout">();
+			const closeTimer = setTimeout(() => resolveCloseOutcome("timeout"), 1_000);
+			attacker.once("close", () => resolveCloseOutcome("closed"));
+			// The third invalid attempt reaches the cap and must close before the 30s idle grace.
+			attacker.write(badRequest.repeat(3));
+			const outcome = await closeOutcome;
+			clearTimeout(closeTimer);
+			expect(outcome).toBe("closed");
 			attacker = undefined;
+			shutdownClient = await createDaemonBrokerClient(projectDir, {
+				runtimeDir,
+				target,
+				token: TOKEN,
+				connectTimeoutMs: 1_000,
+			});
+			await shutdownClient.request({ op: "shutdown" });
+			shutdownClient.close();
+			shutdownClient = undefined;
 			await brokerPromise;
 			brokerPromise = undefined;
 		} finally {
+			shutdownClient?.close();
 			attacker?.destroy();
 			await brokerPromise?.catch(() => undefined);
 			if (savedProject === undefined) delete process.env.OMP_DAEMON_PROJECT_DIR;

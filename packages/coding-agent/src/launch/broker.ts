@@ -543,11 +543,11 @@ class DaemonBroker {
 				buffer = buffer.slice(newline + 1);
 				if (!line) continue;
 				if (isRemote && !authenticated) {
+					authenticationAttempts += 1;
 					if (authenticationAttempts >= REMOTE_AUTH_MAX_ATTEMPTS) {
 						socket.destroy(new Error("Remote daemon authentication attempt limit exceeded"));
 						return;
 					}
-					authenticationAttempts += 1;
 				}
 				void this.#handleLine(socket, line, () => {
 					if (authenticated) return;
