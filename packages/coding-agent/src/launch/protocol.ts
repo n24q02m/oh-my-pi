@@ -23,6 +23,18 @@ export type DaemonState = "starting" | "running" | "ready" | "restarting" | "sto
 /** Restart behavior applied after an unexpected daemon exit. */
 export type DaemonRestartPolicy = "no" | "on-failure" | "always";
 
+/** Native daemon broker endpoint. Raw TCP is intentionally limited to loopback. */
+export type DaemonNativeRemoteTarget =
+	| { transport: "tcp"; host: "127.0.0.1" | "::1"; port: number }
+	| { transport: "tls"; host: string; port: number; fingerprint256?: string };
+
+/** Native broker listener configuration. TLS listeners require an explicit key pair. */
+export interface DaemonNativeServerOptions {
+	target: DaemonNativeRemoteTarget;
+	certFile?: string;
+	keyFile?: string;
+}
+
 /** Readiness conditions; every configured condition must pass. */
 export interface DaemonReadySpec {
 	log?: string;
@@ -240,6 +252,92 @@ function readySpec(value: unknown): DaemonReadySpec {
 	const timeoutMs = numberValue(source.timeoutMs, "ready.timeoutMs");
 	if (!log && port === undefined) throw new Error("ready requires log or port");
 	return { log, port, host, timeoutMs };
+}
+
+const NATIVE_REMOTE_SCHEME_TCP = "tcp:";
+const NATIVE_REMOTE_SCHEME_TLS = "tls:";
+const NATIVE_REMOTE_MAX_PORT = 65_535;
+
+function validateNativePort(value: unknown, label: string): number {
+	if (typeof value !== "number" || !Number.isInteger(value) || value < 1 || value > NATIVE_REMOTE_MAX_PORT) {
+		throw new Error(`${label} must be an integer port from 1 to ${NATIVE_REMOTE_MAX_PORT}`);
+	}
+	return value;
+}
+
+function validateNativeFingerprint(value: unknown, label: string): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string" || !/^(?:[0-9a-f]{64}|(?:[0-9a-f]{2}:){31}[0-9a-f]{2})$/iu.test(value)) {
+		throw new Error(`${label} must be a SHA-256 fingerprint`);
+	}
+	return value;
+}
+
+function nativeTargetFromParts(
+	transport: unknown,
+	host: unknown,
+	port: unknown,
+	fingerprint256: unknown,
+): DaemonNativeRemoteTarget {
+	if (transport !== "tcp" && transport !== "tls") throw new Error("native remote transport must be tcp or tls");
+	if (typeof host !== "string" || host.length === 0 || /[\u0000-\u0020]/u.test(host)) {
+		throw new Error("native remote host must be a non-empty hostname");
+	}
+	const checkedPort = validateNativePort(port, "native remote port");
+	if (transport === "tcp") {
+		if (host !== "127.0.0.1" && host !== "::1") {
+			throw new Error("raw TCP native remote targets must use exact loopback host 127.0.0.1 or ::1");
+		}
+		if (fingerprint256 !== undefined) throw new Error("raw TCP native remote targets cannot pin a fingerprint");
+		return { transport, host, port: checkedPort };
+	}
+	const checkedFingerprint = validateNativeFingerprint(fingerprint256, "native remote fingerprint256");
+	return checkedFingerprint === undefined
+		? { transport, host, port: checkedPort }
+		: { transport, host, port: checkedPort, fingerprint256: checkedFingerprint };
+}
+
+function parseNativeRemoteUrl(value: string): DaemonNativeRemoteTarget {
+	let parsed: URL;
+	try {
+		parsed = new URL(value);
+	} catch {
+		throw new Error("native remote target must be a tcp:// or tls:// URL");
+	}
+	if (parsed.protocol !== NATIVE_REMOTE_SCHEME_TCP && parsed.protocol !== NATIVE_REMOTE_SCHEME_TLS) {
+		throw new Error("native remote target must use tcp:// or tls://");
+	}
+	if (
+		parsed.username ||
+		parsed.password ||
+		parsed.search ||
+		parsed.hash ||
+		(parsed.pathname !== "" && parsed.pathname !== "/")
+	) {
+		throw new Error("native remote target URL must contain only scheme, host, and port");
+	}
+	const hostname = parsed.hostname.replace(/^\[|\]$/gu, "");
+	if (!parsed.port || !/^[0-9]+$/u.test(parsed.port)) throw new Error("native remote target port is malformed");
+	return nativeTargetFromParts(parsed.protocol.slice(0, -1), hostname, Number(parsed.port), undefined);
+}
+
+/** Decode a native remote endpoint from a strict URL or target object. */
+export function parseDaemonNativeRemoteTarget(value: unknown): DaemonNativeRemoteTarget {
+	if (typeof value === "string") return parseNativeRemoteUrl(value);
+	const source = record(value, "native remote target");
+	return nativeTargetFromParts(source.transport, source.host, source.port, source.fingerprint256);
+}
+
+/** Decode native listener options and require a complete TLS certificate/key pair. */
+export function parseDaemonNativeServerOptions(value: unknown): DaemonNativeServerOptions {
+	const source = record(value, "native server options");
+	const target = parseDaemonNativeRemoteTarget(source.target);
+	const certFile = source.certFile === undefined ? undefined : stringValue(source.certFile, "native server certFile");
+	const keyFile = source.keyFile === undefined ? undefined : stringValue(source.keyFile, "native server keyFile");
+	if (target.transport === "tls" && (!certFile || !keyFile)) {
+		throw new Error("TLS native server requires explicit certFile and keyFile");
+	}
+	return { target, certFile, keyFile };
 }
 
 /** Decode and validate a daemon launch specification. */

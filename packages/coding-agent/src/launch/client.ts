@@ -1,3 +1,4 @@
+import * as nodeFs from "node:fs";
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import * as os from "node:os";
@@ -12,17 +13,23 @@ import {
 	DAEMON_PROJECT_DIR_ENV,
 	DAEMON_RUNTIME_DIR_ENV,
 	type DaemonCompletionNotification,
+	type DaemonNativeRemoteTarget,
 	type DaemonOperation,
 	type DaemonRpcResult,
 	type DaemonWireMessage,
 	parseDaemonRpcResult,
 	parseDaemonWireMessage,
 } from "./protocol";
+import { connectDaemonNativeRemote } from "./remote-transport";
 import { resolveDaemonSpawnOptions } from "./spawn-options";
 
 const CONNECT_TIMEOUT_MS = 10_000;
 const CONNECT_RETRY_MS = 50;
+const MAX_RESPONSE_BUFFER_BYTES = 32 * 1024 * 1024;
+const MAX_RESPONSE_LINE_BYTES = 26 * 1024 * 1024;
 const TOKEN_FILE = "broker.token";
+const MAX_TOKEN_BYTES = 16 * 1024;
+const NOFOLLOW_FLAG = (nodeFs.constants as Record<string, number>).O_NOFOLLOW ?? 0;
 const BROKER_SPAWN_OPTIONS = resolveDaemonSpawnOptions({
 	platform: process.platform,
 	hostHasInheritableConsole: hostHasInheritableConsole(),
@@ -42,6 +49,12 @@ export interface DaemonBrokerClientOptions {
 	runtimeDir?: string;
 	/** Last-client shutdown grace override in milliseconds. */
 	idleGraceMs?: number;
+	/** Native endpoint override; remote errors never spawn a local broker. */
+	target?: DaemonNativeRemoteTarget;
+	/** Existing broker wire token for a native endpoint; it is never placed in the endpoint URL. */
+	token?: string;
+	/** Native endpoint connection deadline in milliseconds. */
+	connectTimeoutMs?: number;
 }
 
 export interface DaemonCompletionUnregisterOptions {
@@ -93,6 +106,42 @@ async function readOrCreateToken(runtimeDir: string): Promise<string> {
 	throw new Error(`Timed out initializing daemon broker token in ${runtimeDir}`);
 }
 
+async function readExistingToken(runtimeDir: string): Promise<string> {
+	if (process.platform === "win32") {
+		throw new Error(
+			"Native remote broker token permissions cannot be verified safely on Windows; pass an explicit token",
+		);
+	}
+	const tokenPath = path.join(runtimeDir, TOKEN_FILE);
+	let handle: fs.FileHandle | undefined;
+	try {
+		handle = await fs.open(tokenPath, nodeFs.constants.O_RDONLY | NOFOLLOW_FLAG);
+		const stat = await handle.stat();
+		if (!stat.isFile()) throw new Error("Native daemon broker token must be a regular file");
+		if ((stat.mode & 0o077) !== 0)
+			throw new Error("Native daemon broker token must not be readable by group or other users");
+		if (stat.size > MAX_TOKEN_BYTES) throw new Error("Native daemon broker token file exceeds the 16 KiB limit");
+		const buffer = Buffer.allocUnsafe(MAX_TOKEN_BYTES + 1);
+		let offset = 0;
+		for (;;) {
+			const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset);
+			if (bytesRead === 0) break;
+			offset += bytesRead;
+			if (offset > MAX_TOKEN_BYTES) throw new Error("Native daemon broker token file exceeds the 16 KiB limit");
+		}
+		const token = buffer.subarray(0, offset).toString("utf8").trim();
+		if (token.length === 0) throw new Error("Native daemon broker token is empty");
+		return token;
+	} catch (error) {
+		if (error instanceof Error && /^Native daemon broker token/u.test(error.message)) throw error;
+		throw new Error(
+			`Native daemon broker token is not safely readable: ${error instanceof Error ? error.message : String(error)}`,
+		);
+	} finally {
+		await handle?.close().catch(() => undefined);
+	}
+}
+
 function requestTimeoutMs(operation: DaemonOperation): number {
 	switch (operation.op) {
 		case "start":
@@ -108,27 +157,35 @@ function requestTimeoutMs(operation: DaemonOperation): number {
 
 function openSocket(endpoint: string, timeoutMs: number): Promise<net.Socket> {
 	const { promise, resolve, reject } = Promise.withResolvers<net.Socket>();
-	const socket = net.createConnection({ path: endpoint });
-	const timer = setTimeout(() => {
-		socket.destroy();
-		reject(new Error(`Timed out connecting to daemon broker at ${endpoint}`));
-	}, timeoutMs);
-	const cleanup = (): void => {
+	let socket: net.Socket;
+	try {
+		socket = net.createConnection({ path: endpoint });
+	} catch (error) {
+		reject(error instanceof Error ? error : new Error(String(error)));
+		return promise;
+	}
+	let settled = false;
+	const finish = (error?: Error): void => {
+		if (settled) return;
+		settled = true;
 		clearTimeout(timer);
 		socket.off("connect", onConnect);
 		socket.off("error", onError);
+		socket.off("close", onClose);
+		if (error) {
+			socket.destroy();
+			reject(error);
+		} else {
+			resolve(socket);
+		}
 	};
-	const onConnect = (): void => {
-		cleanup();
-		resolve(socket);
-	};
-	const onError = (error: Error): void => {
-		cleanup();
-		socket.destroy();
-		reject(error);
-	};
+	const onConnect = (): void => finish();
+	const onError = (error: Error): void => finish(error);
+	const onClose = (): void => finish(new Error("Daemon broker socket closed before connection completed"));
+	const timer = setTimeout(() => finish(new Error(`Timed out connecting to daemon broker at ${endpoint}`)), timeoutMs);
 	socket.once("connect", onConnect);
 	socket.once("error", onError);
+	socket.once("close", onClose);
 	return promise;
 }
 
@@ -136,9 +193,11 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	readonly projectDir: string;
 	readonly #runtimeDir: string;
 	readonly #endpoint: string;
+	readonly #target: DaemonNativeRemoteTarget | undefined;
 	readonly #token: string;
 	readonly #seenCompletionIds = new Set<string>();
 	readonly #idleGraceMs: number | undefined;
+	readonly #connectTimeoutMs: number | undefined;
 	readonly #pending = new Map<string, PendingRequest>();
 	readonly #completionSinks = new Map<string, (notification: DaemonCompletionNotification) => Promise<void> | void>();
 	readonly #completionUnsubscribes = new Set<string>();
@@ -156,8 +215,10 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		this.projectDir = projectDir;
 		this.#runtimeDir = runtimeDir;
 		this.#endpoint = daemonBrokerEndpoint(projectDir, runtimeDir);
+		this.#target = options.target;
 		this.#token = token;
 		this.#idleGraceMs = options.idleGraceMs;
+		this.#connectTimeoutMs = options.connectTimeoutMs;
 	}
 
 	async request(operation: DaemonOperation, signal?: AbortSignal): Promise<DaemonRpcResult> {
@@ -257,6 +318,7 @@ class SocketDaemonClient implements DaemonBrokerClient {
 
 	#scheduleCompletionReconnect(): void {
 		if (
+			this.#target !== undefined ||
 			this.#closed ||
 			this.#completionSinks.size === 0 ||
 			this.#completionReconnectTimer !== undefined ||
@@ -283,6 +345,10 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	}
 
 	async #connectOnce(): Promise<void> {
+		if (this.#target) {
+			this.#bindSocket(await connectDaemonNativeRemote(this.#target, { timeoutMs: this.#connectTimeoutMs }));
+			return;
+		}
 		try {
 			this.#bindSocket(await openSocket(this.#endpoint, 250));
 			return;
@@ -324,10 +390,14 @@ class SocketDaemonClient implements DaemonBrokerClient {
 	}
 
 	#bindSocket(socket: net.Socket): void {
+		if (this.#closed) {
+			socket.destroy();
+			throw new Error("Daemon broker client is closed");
+		}
 		this.#socket = socket;
 		this.#buffer = "";
 		socket.setEncoding("utf8");
-		socket.on("data", chunk => this.#onData(chunk));
+		socket.on("data", chunk => this.#onData(socket, chunk));
 		socket.on("error", () => {
 			// The close handler rejects pending requests with one stable error.
 		});
@@ -338,13 +408,24 @@ class SocketDaemonClient implements DaemonBrokerClient {
 		});
 	}
 
-	#onData(chunk: string | Buffer): void {
-		this.#buffer += typeof chunk === "string" ? chunk : chunk.toString("utf8");
+	#onData(socket: net.Socket, chunk: string | Buffer): void {
+		const nextBuffer = this.#buffer + (typeof chunk === "string" ? chunk : chunk.toString("utf8"));
+		if (Buffer.byteLength(nextBuffer, "utf8") > MAX_RESPONSE_BUFFER_BYTES) {
+			this.#rejectPending(new Error("Daemon broker response exceeds size limit"));
+			socket.destroy();
+			return;
+		}
+		this.#buffer = nextBuffer;
 		for (;;) {
 			const newline = this.#buffer.indexOf("\n");
 			if (newline < 0) return;
 			const line = this.#buffer.slice(0, newline);
 			this.#buffer = this.#buffer.slice(newline + 1);
+			if (Buffer.byteLength(line, "utf8") > MAX_RESPONSE_LINE_BYTES) {
+				this.#rejectPending(new Error("Daemon broker response line exceeds size limit"));
+				socket.destroy();
+				return;
+			}
 			if (line.length === 0) continue;
 			let decoded: unknown;
 			try {
@@ -391,7 +472,6 @@ class SocketDaemonClient implements DaemonBrokerClient {
 			}
 		}
 	}
-
 	async #deliverCompletion(message: DaemonCompletionNotification): Promise<void> {
 		if (this.#seenCompletionIds.has(message.completionId)) {
 			this.#ackCompletion(message.completionId);
@@ -471,7 +551,8 @@ export async function createDaemonBrokerClient(
 ): Promise<DaemonBrokerClient> {
 	const canonical = await canonicalProjectDir(projectDir);
 	const runtimeDir = options.runtimeDir ?? daemonRuntimeDir(canonical);
-	const token = await readOrCreateToken(runtimeDir);
+	const token =
+		options.token ?? (options.target ? await readExistingToken(runtimeDir) : await readOrCreateToken(runtimeDir));
 	return new SocketDaemonClient(canonical, runtimeDir, token, options);
 }
 
