@@ -165,7 +165,7 @@ async function makeHarness(opts?: { readOnly?: boolean }): Promise<GuestUiHarnes
 	let welcomeEpoch = 0;
 	const sendWelcome = (): void => {
 		const recoveryEpoch = ++welcomeEpoch;
-		const snapshotId = "ui-snapshot-" + recoveryEpoch;
+		const snapshotId = `ui-snapshot-${recoveryEpoch}`;
 		hostSocket.send({
 			t: "welcome",
 			proto: COLLAB_PROTO,
