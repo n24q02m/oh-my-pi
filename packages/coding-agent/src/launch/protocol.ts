@@ -63,6 +63,28 @@ export interface PairingApprovalResult {
 	expiresAt: number;
 	approvedAt: number;
 }
+/** Redacted metadata for a pending enrollment; codes and credentials never cross this boundary. */
+export interface PairingPendingMetadata {
+	name: string;
+	capabilities: DaemonCapability[];
+	createdAt: number;
+	expiresAt: number;
+}
+
+/** Validate a non-empty, duplicate-free capability list for CLI and wire consumers. */
+export function parseDaemonCapabilities(value: unknown, label: string): DaemonCapability[] {
+	return daemonCapabilities(value, label);
+}
+
+function pairingPendingMetadata(value: unknown, label: string): PairingPendingMetadata {
+	const source = record(value, label);
+	return {
+		name: stringValue(source.name, `${label}.name`),
+		capabilities: daemonCapabilities(source.capabilities, `${label}.capabilities`),
+		createdAt: numberValue(source.createdAt, `${label}.createdAt`),
+		expiresAt: numberValue(source.expiresAt, `${label}.expiresAt`),
+	};
+}
 
 export interface PairingClaimResult {
 	device: PairedDeviceMetadata;
@@ -141,6 +163,8 @@ export type DaemonSignal = "SIGINT" | "SIGTERM" | "SIGHUP" | "SIGQUIT" | "SIGKIL
 export type DaemonOperation =
 	| { op: "ping" }
 	| { op: "pair-begin"; name: string; capabilities: DaemonCapability[]; ttlMs?: number }
+	| { op: "pair-preview"; code: string }
+	| { op: "pair-deny"; code: string }
 	| { op: "pair-approve"; code: string }
 	| { op: "pair-claim"; code: string }
 	| { op: "pair-list" }
@@ -178,6 +202,8 @@ export type DaemonRpcResult =
 			createdAt: number;
 			expiresAt: number;
 	  }
+	| (PairingPendingMetadata & { op: "pair-preview" })
+	| (PairingPendingMetadata & { op: "pair-deny" })
 	| {
 			op: "pair-approve";
 			name: string;
@@ -562,6 +588,8 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 				capabilities: daemonCapabilities(source.capabilities, "operation.capabilities"),
 				ttlMs: optionalNumber(source.ttlMs, "operation.ttlMs"),
 			};
+		case "pair-preview":
+		case "pair-deny":
 		case "pair-approve":
 		case "pair-claim":
 			return { op, code: stringValue(source.code, "operation.code") };
@@ -636,6 +664,9 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 				createdAt: numberValue(source.createdAt, "result.createdAt"),
 				expiresAt: numberValue(source.expiresAt, "result.expiresAt"),
 			};
+		case "pair-preview":
+		case "pair-deny":
+			return { op: operation.op, ...pairingPendingMetadata(value, "result") };
 		case "pair-approve":
 			return {
 				op: "pair-approve",

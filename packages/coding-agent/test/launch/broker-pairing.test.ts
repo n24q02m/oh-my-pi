@@ -164,4 +164,38 @@ describe("daemon broker capability-scoped pairing", () => {
 			await secondBroker.catch(() => undefined);
 		}
 	});
+	it("requires approve capability to preview and deny only a pending enrollment", async () => {
+		using tempDir = TestTempDir.createSync("@omp-broker-pairing-preview-deny-");
+		const projectDir = path.join(tempDir.path(), "project");
+		const runtimeDir = path.join(tempDir.path(), "runtime");
+		await fsPromises.mkdir(projectDir, { recursive: true });
+		const admin = await createDaemonBrokerClient(projectDir, { runtimeDir });
+		const broker = startBroker(projectDir, runtimeDir);
+		let approver: DaemonBrokerClient | undefined;
+		try {
+			const approverClaim = await beginAndClaim(admin, "approver", ["approve"]);
+			approver = await createDaemonBrokerClient(projectDir, { runtimeDir, token: approverClaim.token });
+			const begun = await admin.request({
+				op: "pair-begin",
+				name: "pending",
+				capabilities: ["observe", "git-read"],
+			});
+			if (begun.op !== "pair-begin") throw new Error("unexpected pairing begin result");
+
+			const preview = await approver.request({ op: "pair-preview", code: begun.code });
+			if (preview.op !== "pair-preview") throw new Error("unexpected pairing preview result");
+			expect(preview).toMatchObject({ name: "pending", capabilities: ["observe", "git-read"] });
+			expect(preview).not.toHaveProperty("code");
+			expect(preview).not.toHaveProperty("token");
+
+			const denied = await approver.request({ op: "pair-deny", code: begun.code });
+			expect(denied).toMatchObject({ op: "pair-deny", name: "pending" });
+			await expect(admin.request({ op: "pair-claim", code: begun.code })).rejects.toThrow(/unknown|expired/i);
+		} finally {
+			approver?.close();
+			await admin.request({ op: "shutdown" }).catch(() => undefined);
+			admin.close();
+			await broker.catch(() => undefined);
+		}
+	});
 });

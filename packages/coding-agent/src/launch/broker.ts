@@ -422,6 +422,8 @@ function capabilityForOperation(operation: DaemonOperation): DaemonCapability | 
 		case "restart":
 			return "control-session";
 		case "pair-approve":
+		case "pair-preview":
+		case "pair-deny":
 			return "approve";
 		case "pair-begin":
 		case "pair-list":
@@ -725,6 +727,10 @@ class DaemonBroker {
 				};
 			case "pair-approve":
 				return { op: "pair-approve", ...(await this.#pairing.approve(operation.code)) };
+			case "pair-preview":
+				return { op: "pair-preview", ...(await this.#pairing.preview(operation.code)) };
+			case "pair-deny":
+				return { op: "pair-deny", ...(await this.#pairing.deny(operation.code)) };
 			case "pair-claim":
 				return { op: "pair-claim", ...(await this.#pairing.claim(operation.code)) };
 			case "pair-list":

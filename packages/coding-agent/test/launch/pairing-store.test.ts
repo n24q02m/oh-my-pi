@@ -181,4 +181,26 @@ describe("capability-scoped pairing store", () => {
 		expect(listed[0]).toMatchObject({ name: "metadata-device", capabilities: observeOnly });
 		expect(listed[0]).not.toHaveProperty("tokenHash");
 	});
+	it("previews and denies only the matching pending enrollment without exposing its code", async () => {
+		using tempDir = TestTempDir.createSync("@omp-pairing-preview-deny-");
+		const store = await createStore(tempDir);
+		const enrolled = await approvedClaim(store, "enrolled", observeOnly);
+		const pending = await store.begin("pending", ["observe", "git-read"]);
+
+		const preview = await store.preview(pending.code);
+		expect(preview).toEqual({
+			name: "pending",
+			capabilities: ["observe", "git-read"],
+			createdAt: pending.createdAt,
+			expiresAt: pending.expiresAt,
+		});
+		expect(preview).not.toHaveProperty("code");
+		expect(preview).not.toHaveProperty("token");
+
+		await store.deny(pending.code);
+		await expect(store.preview(pending.code)).rejects.toThrow(/unknown|expired/i);
+		await expect(store.claim(pending.code)).rejects.toThrow(/unknown|expired/i);
+		expect(await store.authenticate(enrolled.token)).toMatchObject({ id: enrolled.device.id });
+		expect(await store.list()).toHaveLength(1);
+	});
 });

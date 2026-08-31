@@ -227,6 +227,7 @@ Run `omp <command> --help` for each command's own flags and examples.
 | `install` | Install or link an extension package (alias of `plugin install` / `plugin link`). | [extensions](./extensions.md) |
 | `join` | Join a shared collab session (same as `/join`). | [collab](./collab.md) |
 | `models` | List, search, and refresh available models. | [models](./models.md) |
+| `pair` | Create, approve, deny, claim, list, revoke, and rotate native broker enrollments. | [Pairing enrollment](#pairing-enrollment) |
 | `plugin` | Manage plugins (install, uninstall, list, etc.). | [extensions](./extensions.md), [marketplace](./marketplace.md) |
 | `ps` | List and control daemon-supervised background processes (logs, stop, kill, restart). | |
 | `say` | Synthesize text with the local TTS engine and play it through the speakers. | [tts tool](./tools/tts.md) |
@@ -248,3 +249,21 @@ Run `omp <command> --help` for each command's own flags and examples.
 > reachable through related mechanisms (the `plugin` command, the `/join` slash
 > command, and so on). The table lists each as it is registered in
 > `packages/coding-agent/src/cli-commands.ts`.
+
+### Pairing enrollment
+
+Use `omp pair begin <name> --endpoint <tcp://host:port|tls://host:port>` to create a one-time enrollment. It requests only `observe` by default; repeat `--capability <capability>` for additional permissions and use `--ttl-ms <milliseconds>` for a lifetime from 1 through 900000 milliseconds. TLS endpoints MAY include `--fingerprint <sha256>`; raw TCP endpoints MUST use exact loopback hosts.
+
+The command surface is:
+
+```text
+omp pair begin <name> --endpoint <endpoint> [--fingerprint <sha256>] [--capability <capability>...] [--ttl-ms <milliseconds>]
+omp pair approve <code>
+omp pair deny <code>
+omp pair claim <omp://pair?...>
+omp pair list
+omp pair revoke <device-id>
+omp pair rotate <device-id>
+```
+
+`approve` and `deny` require an interactive foreground TTY. They preview the pending device name and requested capabilities, then proceed only after typing `yes`; no background auto-approval is available. The QR/URI carries only endpoint metadata, an optional TLS fingerprint, and the one-time code. Codes and device tokens appear only in direct `begin`, `claim`, and `rotate` responses—never in list, preview, revoke, denial, or error output.

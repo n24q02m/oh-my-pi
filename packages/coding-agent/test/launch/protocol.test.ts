@@ -119,3 +119,37 @@ describe("regex-derived protocol fields", () => {
 		});
 	});
 });
+
+describe("pairing preview protocol", () => {
+	it("decodes preview and denial operations without accepting credential fields", () => {
+		const previewOperation: Extract<DaemonOperation, { op: "pair-preview" }> = {
+			op: "pair-preview",
+			code: "one-time-code",
+		};
+		const previewRequest = parseDaemonWireRequest({
+			id: "request-preview",
+			token: "broker-token",
+			operation: previewOperation,
+		});
+		expect(previewRequest.operation).toEqual(previewOperation);
+		expect(
+			parseDaemonRpcResult(previewOperation, {
+				name: "tablet",
+				capabilities: ["observe"],
+				createdAt: 1,
+				expiresAt: 2,
+			}),
+		).toEqual({ op: "pair-preview", name: "tablet", capabilities: ["observe"], createdAt: 1, expiresAt: 2 });
+
+		const denyOperation: Extract<DaemonOperation, { op: "pair-deny" }> = { op: "pair-deny", code: "one-time-code" };
+		expect(
+			parseDaemonRpcResult(denyOperation, { name: "tablet", capabilities: ["observe"], createdAt: 1, expiresAt: 2 }),
+		).toEqual({
+			op: "pair-deny",
+			name: "tablet",
+			capabilities: ["observe"],
+			createdAt: 1,
+			expiresAt: 2,
+		});
+	});
+});
