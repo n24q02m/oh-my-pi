@@ -18,6 +18,7 @@ import {
 	VALUELESS_FLAGS,
 } from "./cli/flag-tables";
 import { launchHelp } from "./commands/launch-help";
+import Pair from "./commands/pair";
 
 export const commands: CommandEntry[] = [
 	{ name: "launch", load: () => import("./commands/launch").then(m => m.default), help: launchHelp },
@@ -136,6 +137,11 @@ export const commands: CommandEntry[] = [
 		name: "models",
 		load: () => import("./commands/models").then(m => m.default),
 		help: commandHelp.modelsHelp,
+	},
+	{
+		name: "pair",
+		load: async () => Pair,
+		help: commandHelp.pairHelp,
 	},
 	{
 		name: "plugin",
