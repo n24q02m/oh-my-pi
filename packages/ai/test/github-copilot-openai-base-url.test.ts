@@ -79,6 +79,25 @@ describe("GitHub Copilot OpenAI transport base URL", () => {
 		expect(requestedUrls[0]).toBe("https://api.githubcopilot.com/chat/completions");
 	});
 
+	it("passes the literal Copilot Auto id to chat completions", async () => {
+		const requestedBodies: Record<string, unknown>[] = [];
+		const fetchMock = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+			requestedBodies.push(await getRequestBody(input, init));
+			return createUnauthorizedResponse();
+		});
+
+		const model = getBundledModel("github-copilot", "auto") as Model<"openai-completions">;
+		expect(model.api).toBe("openai-completions");
+		await streamOpenAICompletions(model, testContext, {
+			apiKey: testToken,
+			fetch: fetchMock as unknown as typeof fetch,
+		}).result();
+
+		expect(fetchMock).toHaveBeenCalledTimes(1);
+		expect(requestedBodies).toHaveLength(1);
+		expect(requestedBodies[0]?.model).toBe("auto");
+	});
+
 	it("uses model baseUrl for responses API", async () => {
 		const requestedUrls: string[] = [];
 		const fetchMock = vi.fn(async (input: string | URL | Request) => {

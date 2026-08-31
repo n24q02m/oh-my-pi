@@ -248,11 +248,23 @@ type UsageLimitOutcome = {
 	retryAtMs: number | undefined;
 };
 
+type RetryFallbackSkipReason =
+	| "already-attempted"
+	| "auth-unavailable"
+	| "context-too-large"
+	| "cooldown"
+	| "effort-ceiling-incompatible"
+	| "image-input-incompatible"
+	| "model-unavailable"
+	| "signed-anthropic-thinking-incompatible"
+	| "tool-use-incompatible";
+
 /** Owns terminal-stop recovery, automatic retries, and fallback routing. */
 export class TurnRecovery {
 	readonly #host: TurnRecoveryHost;
 	#retryAbortController: AbortController | undefined;
 	#retryAttempt = 0;
+	#sameModelRetryAttempt = 0;
 	#retryPromise: Promise<void> | undefined;
 	#retryResolve: (() => void) | undefined;
 	#activeRetryFallback: ActiveRetryFallbackState | undefined;
@@ -297,6 +309,14 @@ export class TurnRecovery {
 	#fallbackChainWarnings = new Set<string>();
 	/** Whether startup validation deferred any warning pending in-flight discovery (#10048). */
 	#pendingDiscoveryDeferredValidation = false;
+	#retryFallbackSkipNoticeGeneration = -1;
+	#retryFallbackSkipNotices = new Set<string>();
+	/**
+	 * Candidates examined while recovering one prompt. This cursor is independent
+	 * of cooldown expiry and same-model retry accounting, so a short-lived 429
+	 * cannot reopen an earlier node in a finite configured chain.
+	 */
+	#retryFallbackTraversal: { generation: number; selectors: Set<string> } | undefined;
 
 	constructor(host: TurnRecoveryHost, options: TurnRecoveryOptions = {}) {
 		this.#host = host;
@@ -316,6 +336,11 @@ export class TurnRecovery {
 		return this.#retryAttempt;
 	}
 
+	#resetRetryAttempts(): void {
+		this.#retryAttempt = 0;
+		this.#sameModelRetryAttempt = 0;
+	}
+
 	/** Promise settled when the active retry saga finishes. */
 	get retryPromise(): Promise<void> | undefined {
 		return this.#retryPromise;
@@ -330,6 +355,50 @@ export class TurnRecovery {
 
 	#markFallbackRouted(): void {
 		this.#fallbackRoutedFor = this.#host.sessionManager.getSessionId();
+	}
+
+	#retryFallbackTraversalSelectors(): Set<string> {
+		const generation = this.#host.promptGeneration();
+		if (this.#retryFallbackTraversal?.generation === generation) {
+			return this.#retryFallbackTraversal.selectors;
+		}
+		const selectors = new Set<string>();
+		this.#retryFallbackTraversal = { generation, selectors };
+		return selectors;
+	}
+
+	#retryFallbackTraversalKey(selector: RetryFallbackSelector): string {
+		return `${selector.provider}/${selector.id}`;
+	}
+
+	#hasTraversedRetryFallbackSelector(selector: RetryFallbackSelector): boolean {
+		const traversal = this.#retryFallbackTraversal;
+		return (
+			traversal?.generation === this.#host.promptGeneration() &&
+			traversal.selectors.has(this.#retryFallbackTraversalKey(selector))
+		);
+	}
+
+	async #emitRetryFallbackSkipNotice(params: {
+		selector: RetryFallbackSelector;
+		reason: RetryFallbackSkipReason;
+		role: string;
+		from: string;
+	}): Promise<void> {
+		const generation = this.#host.promptGeneration();
+		if (this.#retryFallbackSkipNoticeGeneration !== generation) {
+			this.#retryFallbackSkipNotices.clear();
+			this.#retryFallbackSkipNoticeGeneration = generation;
+		}
+		const key = `${params.selector.raw}\0${params.reason}`;
+		if (this.#retryFallbackSkipNotices.has(key)) return;
+		this.#retryFallbackSkipNotices.add(key);
+		await this.#host.emitSessionEvent({
+			type: "notice",
+			level: "info",
+			source: "retry-fallback",
+			message: `Retry fallback skipped [${params.reason}]: selector=${params.selector.raw} from=${params.from} role=${params.role}`,
+		});
 	}
 
 	/**
@@ -387,11 +456,14 @@ export class TurnRecovery {
 		}
 	}
 
-	/** Resets per-prompt recovery counters and terminal-stop acceptance. */
+	/** Resets per-prompt recovery counters, traversal state, and terminal-stop acceptance. */
 	resetForNewPrompt(): void {
 		this.#emptyStopRetryCount = 0;
 		this.#unexpectedStopRetryCount = 0;
 		this.#acceptTerminalEmptyStopForPrompt = false;
+		this.#retryFallbackTraversal = undefined;
+		this.#retryFallbackSkipNoticeGeneration = -1;
+		this.#retryFallbackSkipNotices.clear();
 	}
 
 	/** Sets whether one terminal empty stop is accepted for the current prompt. */
@@ -445,7 +517,7 @@ export class TurnRecovery {
 			retryErrors,
 		});
 		this.#clearPendingRetryErrors();
-		this.#retryAttempt = 0;
+		this.#resetRetryAttempts();
 		this.resolveRetry();
 	}
 
@@ -453,7 +525,7 @@ export class TurnRecovery {
 	async onErrorSettledWithoutRetry(message: AssistantMessage, compaction: RecoveryCompactionResult): Promise<void> {
 		if (message.stopReason !== "error" || this.#retryAttempt === 0 || compaction.continuationScheduled) return;
 		const attempt = this.#retryAttempt;
-		this.#retryAttempt = 0;
+		this.#resetRetryAttempts();
 		await this.#host.emitSessionEvent({
 			type: "auto_retry_end",
 			success: false,
@@ -783,7 +855,7 @@ export class TurnRecovery {
 				finalError,
 			});
 			this.#clearPendingRetryErrors();
-			this.#retryAttempt = 0;
+			this.#resetRetryAttempts();
 			this.resolveRetry();
 			// A turn with no actionable output carries no transcript value, while its
 			// provider usage can anchor the next prompt at the full failed-request size
@@ -1783,12 +1855,45 @@ export class TurnRecovery {
 			: this.#host.agent.state.messages.findLast(
 					(message): message is AssistantMessage => message.role === "assistant" && message !== failedMessage,
 				);
+		const retryContextHasImage = this.#host.agent.state.messages.some(message => {
+			if (!("content" in message) || !Array.isArray(message.content)) return false;
+			return message.content.some(
+				(block: unknown) =>
+					typeof block === "object" && block !== null && "type" in block && block.type === "image",
+			);
+		});
+		const retryRequestHasTools = this.#host.agent.state.tools.length > 0;
+		const traversalSelectors = this.#retryFallbackTraversalSelectors();
+		const current = parseRetryFallbackSelector(currentSelector, this.#host.modelRegistry);
+		if (current) traversalSelectors.add(this.#retryFallbackTraversalKey(current));
 		for (const role of this.retryFallbackChainKeys(currentSelector)) {
 			for (const selector of this.findRetryFallbackCandidates(role, currentSelector)) {
-				if (this.isRetryFallbackSelectorSuppressed(selector)) continue;
+				const selectorKey = this.#retryFallbackTraversalKey(selector);
+				if (traversalSelectors.has(selectorKey)) {
+					await this.#emitRetryFallbackSkipNotice({
+						selector,
+						reason: "already-attempted",
+						role,
+						from: currentSelector,
+					});
+					continue;
+				}
+				traversalSelectors.add(selectorKey);
+				if (this.isRetryFallbackSelectorSuppressed(selector)) {
+					await this.#emitRetryFallbackSkipNotice({ selector, reason: "cooldown", role, from: currentSelector });
+					continue;
+				}
 				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
-				if (!candidate) continue;
+				if (!candidate) {
+					await this.#emitRetryFallbackSkipNotice({
+						selector,
+						reason: "model-unavailable",
+						role,
+						from: currentSelector,
+					});
+					continue;
+				}
 				// Anthropic signatures and redacted blocks are model-bound, while the
 				// latest assistant response must remain byte-identical. A same-provider
 				// model switch can satisfy neither constraint, so keep retrying the
@@ -1805,20 +1910,74 @@ export class TurnRecovery {
 							block.type === "redactedThinking",
 					)
 				) {
+					await this.#emitRetryFallbackSkipNotice({
+						selector,
+						reason: "signed-anthropic-thinking-incompatible",
+						role,
+						from: currentSelector,
+					});
 					continue;
 				}
 				// A candidate whose effort floor exceeds the per-spawn ceiling would be
 				// clamped UP past the cap by its model floor — skip it entirely.
-				if (ceiling !== undefined && !modelSupportsEffortCeiling(candidate, ceiling)) continue;
+				if (ceiling !== undefined && !modelSupportsEffortCeiling(candidate, ceiling)) {
+					await this.#emitRetryFallbackSkipNotice({
+						selector,
+						reason: "effort-ceiling-incompatible",
+						role,
+						from: currentSelector,
+					});
+					continue;
+				}
+				if (retryContextHasImage && !candidate.input.includes("image")) {
+					await this.#emitRetryFallbackSkipNotice({
+						selector,
+						reason: "image-input-incompatible",
+						role,
+						from: currentSelector,
+					});
+					continue;
+				}
+				if (retryRequestHasTools && candidate.supportsTools === false) {
+					await this.#emitRetryFallbackSkipNotice({
+						selector,
+						reason: "tool-use-incompatible",
+						role,
+						from: currentSelector,
+					});
+					continue;
+				}
 				// Skip a candidate whose window cannot hold the retry context. The
 				// failed assistant is excluded only when retry removes it; preserved
 				// unexecuted-tool turns remain part of the request (issue #8065).
 				if (!this.#host.contextFitsModel(candidate, options?.preserveFailedTurn ? undefined : failedMessage)) {
+					await this.#emitRetryFallbackSkipNotice({
+						selector,
+						reason: "context-too-large",
+						role,
+						from: currentSelector,
+					});
 					continue;
 				}
-				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
-				if (!apiKey) continue;
-				return this.applyRetryFallbackCandidate(role, selector, currentSelector, options);
+				let apiKey: string | undefined;
+				try {
+					apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
+				} catch {
+					apiKey = undefined;
+				}
+				if (!apiKey) {
+					await this.#emitRetryFallbackSkipNotice({
+						selector,
+						reason: "auth-unavailable",
+						role,
+						from: currentSelector,
+					});
+					continue;
+				}
+				return this.applyRetryFallbackCandidate(role, selector, currentSelector, {
+					apiKey,
+					pinFallback: options?.pinFallback,
+				});
 			}
 		}
 
@@ -1962,6 +2121,7 @@ export class TurnRecovery {
 			return false;
 		}
 		if (this.isRetryFallbackSelectorSuppressed(originalSelector)) return false;
+		if (this.#hasTraversedRetryFallbackSelector(originalSelector)) return false;
 
 		const resolvedPrimary = resolveModelOverride(
 			[originalSelector.raw],
@@ -2067,6 +2227,7 @@ export class TurnRecovery {
 
 		const generation = this.#host.promptGeneration();
 		this.#retryAttempt++;
+		this.#sameModelRetryAttempt++;
 
 		// Create retry promise on first attempt so waitForRetry() can await it
 		// Ensure only one promise exists (avoid orphaned promises from concurrent calls)
@@ -2085,7 +2246,10 @@ export class TurnRecovery {
 		const maxRetries = this.#isBoundedThinkingStreamClose(message)
 			? Math.min(retrySettings.maxRetries, 1)
 			: retrySettings.maxRetries;
-		const retryBudgetExhausted = this.#retryAttempt > maxRetries;
+		const retryBudgetExhausted = this.#sameModelRetryAttempt > maxRetries;
+		const classifierFallbackBudgetExhausted = this.#retryAttempt > maxRetries;
+		const terminalRetryBudgetExhausted =
+			retryBudgetExhausted || (classifierRefusal && classifierFallbackBudgetExhausted);
 
 		const errorMessage = message.errorMessage || "Unknown error";
 		const id = this.#classifyRetryMessage(message);
@@ -2100,7 +2264,7 @@ export class TurnRecovery {
 		const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
 		let delayMs = staleOpenAIResponsesReplayError
 			? 0
-			: calculateRetryBackoffDelayMs(retrySettings.baseDelayMs, this.#retryAttempt);
+			: calculateRetryBackoffDelayMs(retrySettings.baseDelayMs, this.#sameModelRetryAttempt);
 		// Transient rate/concurrency caps stay on the same credential, but must
 		// honor their reason-specific windows. The default exponential base
 		// (≈500ms, capped at 8s) otherwise re-hits the cap and burns the retry
@@ -2188,7 +2352,7 @@ export class TurnRecovery {
 				allowModelFallback &&
 				retrySettings.modelFallback &&
 				!thinkingLoop &&
-				!(retryBudgetExhausted && classifierRefusal)
+				!(classifierFallbackBudgetExhausted && classifierRefusal)
 			) {
 				if (!classifierRefusal) {
 					this.noteRetryFallbackCooldown(currentSelector, parsedRetryAfterMs, errorMessage);
@@ -2207,14 +2371,15 @@ export class TurnRecovery {
 			}
 			if (switchedModel) {
 				delayMs = 0;
+				this.#sameModelRetryAttempt = 0;
 			} else if (usageLimitWaitMs === undefined && parsedRetryAfterMs && parsedRetryAfterMs > delayMs) {
 				delayMs = parsedRetryAfterMs;
 			}
 		}
 
-		if (retryBudgetExhausted) {
+		if (terminalRetryBudgetExhausted) {
 			if (!switchedModel && !switchedCredential) {
-				const attempt = this.#retryAttempt - 1;
+				const attempt = classifierRefusal ? this.#retryAttempt - 1 : this.#sameModelRetryAttempt - 1;
 				message.errorMessage = `Retry budget exhausted after ${attempt} ${attempt === 1 ? "retry" : "retries"}: ${errorMessage}`;
 				await this.persistTerminalEmptyErrorTurn(message);
 				const retryErrors = await this.#markPendingRetryErrors({ status: "superseded" });
@@ -2226,7 +2391,7 @@ export class TurnRecovery {
 					retryErrors,
 				});
 				this.#clearPendingRetryErrors();
-				this.#retryAttempt = 0;
+				this.#resetRetryAttempts();
 				this.resolveRetry(); // Resolve so waitForRetry() completes
 				return false;
 			}
@@ -2253,7 +2418,7 @@ export class TurnRecovery {
 				});
 				this.#clearPendingRetryErrors();
 			}
-			this.#retryAttempt = 0;
+			this.#resetRetryAttempts();
 			this.resolveRetry();
 			return false;
 		}
@@ -2278,7 +2443,7 @@ export class TurnRecovery {
 				});
 				this.#clearPendingRetryErrors();
 			}
-			this.#retryAttempt = 0;
+			this.#resetRetryAttempts();
 			this.resolveRetry();
 			return false;
 		}
@@ -2294,7 +2459,7 @@ export class TurnRecovery {
 		if (maxDelayMs > 0 && delayMs > maxDelayMs && !switchedCredential && !switchedModel) {
 			await this.persistTerminalEmptyErrorTurn(message);
 			const attempt = this.#retryAttempt;
-			this.#retryAttempt = 0;
+			this.#resetRetryAttempts();
 			await this.#host.emitSessionEvent({
 				type: "auto_retry_end",
 				success: false,
@@ -2341,7 +2506,7 @@ export class TurnRecovery {
 			}
 			// Aborted during sleep - emit end event so UI can clean up
 			const attempt = this.#retryAttempt;
-			this.#retryAttempt = 0;
+			this.#resetRetryAttempts();
 			this.#retryAbortController = undefined;
 			await this.#host.emitSessionEvent({
 				type: "auto_retry_end",
@@ -2413,7 +2578,7 @@ export class TurnRecovery {
 	async #failRetryAfterLocalContinueError(message: AssistantMessage, error: unknown): Promise<void> {
 		if (this.#retryAttempt === 0) return;
 		const attempt = this.#retryAttempt;
-		this.#retryAttempt = 0;
+		this.#resetRetryAttempts();
 		const localError = error instanceof Error ? error.message : String(error);
 		await this.persistTerminalEmptyErrorTurn(message);
 		await this.#host.emitSessionEvent({
@@ -2571,7 +2736,7 @@ export class TurnRecovery {
 		}
 
 		// Reset retry budget for a fresh attempt
-		this.#retryAttempt = 0;
+		this.#resetRetryAttempts();
 
 		// Re-attempt the turn
 		this.#host.scheduleAgentContinue({ source: "manual-retry", delayMs: 1 });
