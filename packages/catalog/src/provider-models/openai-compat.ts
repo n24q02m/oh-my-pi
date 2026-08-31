@@ -6474,6 +6474,29 @@ export function githubCopilotModelManagerOptions(config?: GithubCopilotModelMana
 		}),
 	};
 }
+/**
+ * GitHub Copilot server-side Auto route (issue #9005): literal `requestModelId=auto`
+ * over `https://api.githubcopilot.com`. The server selects the concrete backing
+ * model — OMP must pass `auto` verbatim and never synthesize a concrete choice.
+ * Metadata is conservative and unverified until an authenticated discovery or
+ * probe proves more: text-only, no reasoning, bounded 128k window / 8k output,
+ * openai-completions transport, and the canonical Copilot wire headers.
+ */
+export const GITHUB_COPILOT_AUTO_STATIC_MODELS: readonly ModelSpec<"openai-completions">[] = [
+	{
+		id: "auto",
+		name: "Auto",
+		api: "openai-completions",
+		provider: "github-copilot",
+		baseUrl: "https://api.githubcopilot.com",
+		reasoning: false,
+		input: ["text"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 128_000,
+		maxTokens: 8192,
+		headers: { ...COPILOT_API_HEADERS },
+	},
+];
 
 // ---------------------------------------------------------------------------
 // 24. Anthropic

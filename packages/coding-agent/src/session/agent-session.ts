@@ -5958,6 +5958,7 @@ export class AgentSession {
 		const generation = this.#promptGeneration;
 		this.#promptSequence++;
 		try {
+			this.#resetPromptMaintenanceState();
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
 			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
 			// Flush any pending bash messages before the new prompt
@@ -5966,7 +5967,6 @@ export class AgentSession {
 			this.#irc.flushPending();
 
 			this.#todo.resetCycle();
-			this.#resetPromptMaintenanceState();
 			this.#recovery.setAcceptTerminalEmptyStop(options?.acceptTerminalEmptyStop === true);
 
 			// Validate model
