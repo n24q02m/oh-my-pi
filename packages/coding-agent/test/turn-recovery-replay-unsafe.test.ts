@@ -84,6 +84,8 @@ function createHost(
 		sessionId: () => "test-session",
 		emitSessionEvent: async () => {},
 		scheduleAgentContinue: () => {},
+		startRetryWaitLiveness: () => "retry-liveness",
+		finishRetryWaitLiveness: () => {},
 		waitForSessionMessagePersistence: async () => {},
 		appendSessionMessage: () => {},
 		sessionMessageAlreadyPersisted: () => false,

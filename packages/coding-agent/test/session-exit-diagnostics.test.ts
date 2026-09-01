@@ -13,12 +13,22 @@ import {
 	collectPendingToolCalls,
 	createInterruptedTurnAbortMessage,
 	describePendingToolCalls,
+	findLastSessionLiveness,
 	SESSION_EXIT_CUSTOM_TYPE,
+	SESSION_LIVENESS_CUSTOM_TYPE,
+	type SessionLivenessData,
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 	type ToolExecutionStartData,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { recordAbnormalSessionExit, runSessionExitSentinel } from "@oh-my-pi/pi-coding-agent/session/session-sentinel";
+import {
+	SESSION_SENTINEL_PARENT_PID_ENV,
+	SESSION_SENTINEL_SESSION_FILE_ENV,
+	SESSION_SENTINEL_WORKER_ARG,
+} from "@oh-my-pi/pi-coding-agent/session/session-sentinel-protocol";
+import { resolveWorkerSpawnCmd, workerEnvFromParent } from "@oh-my-pi/pi-coding-agent/subprocess/worker-client";
 import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
 
 const pendingAssistant: AssistantMessage = {
@@ -80,7 +90,7 @@ describe("session exit diagnostics", () => {
 		session = new AgentSession({
 			agent,
 			sessionManager,
-			settings: Settings.isolated({ "compaction.enabled": false }),
+			settings: Settings.isolated({ "compaction.enabled": false, "tools.maxTimeout": 1 }),
 			modelRegistry,
 		});
 
@@ -102,6 +112,17 @@ describe("session exit diagnostics", () => {
 			toolCallId: "toolu_repro",
 			toolName: "bash",
 			args: { command: "bun run check:ts" },
+		});
+
+		const livenessMarker = sessionManager
+			.getEntries()
+			.find(entry => entry.type === "custom" && entry.customType === SESSION_LIVENESS_CUSTOM_TYPE);
+		if (livenessMarker?.type !== "custom") throw new Error("Expected tool execution liveness marker");
+		expect(livenessMarker.data).toMatchObject({
+			operation: "tool_execution",
+			phase: "start",
+			toolName: "bash",
+			watchdogMs: 1_000,
 		});
 
 		const pending = collectPendingToolCalls(sessionManager.getBranch());
@@ -139,6 +160,117 @@ describe("session exit diagnostics", () => {
 		});
 	});
 
+	it("records configured provider watchdog liveness before the first stream event", async () => {
+		tempDir = TempDir.createSync("@pi-provider-liveness-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		const agent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({
+				"compaction.enabled": false,
+				"providers.streamFirstEventTimeoutSeconds": 1,
+			}),
+			modelRegistry,
+		});
+
+		agent.emitExternalEvent({ type: "agent_start" });
+		await Promise.resolve();
+
+		const livenessMarker = sessionManager
+			.getEntries()
+			.find(entry => entry.type === "custom" && entry.customType === SESSION_LIVENESS_CUSTOM_TYPE);
+		if (livenessMarker?.type !== "custom") throw new Error("Expected provider stream liveness marker");
+		expect(livenessMarker.data).toMatchObject({
+			operation: "provider_stream",
+			phase: "start",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			watchdogMs: 1_000,
+		});
+	});
+	it("closes provider and tool liveness after a completed tool turn", async () => {
+		tempDir = TempDir.createSync("@pi-completed-liveness-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		const agent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+
+		agent.emitExternalEvent({ type: "agent_start" });
+		await Promise.resolve();
+		agent.emitExternalEvent({ type: "message_end", message: pendingAssistant });
+		await Promise.resolve();
+		agent.emitExternalEvent({
+			type: "tool_execution_start",
+			toolCallId: "toolu_repro",
+			toolName: "bash",
+			args: { command: "bun run check:ts" },
+		});
+		await Promise.resolve();
+		agent.emitExternalEvent({
+			type: "tool_execution_end",
+			toolCallId: "toolu_repro",
+			toolName: "bash",
+			isError: false,
+			result: { content: [{ type: "text", text: "ok" }] },
+		});
+		await Promise.resolve();
+		agent.emitExternalEvent({
+			type: "message_end",
+			message: {
+				role: "toolResult",
+				toolCallId: "toolu_repro",
+				toolName: "bash",
+				content: [{ type: "text", text: "ok" }],
+				isError: false,
+				timestamp: Date.now(),
+			},
+		});
+		await Promise.resolve();
+		agent.emitExternalEvent({ type: "agent_end", messages: [] });
+		await Promise.resolve();
+
+		const livenessEntries = sessionManager
+			.getBranch()
+			.filter(entry => entry.type === "custom" && entry.customType === SESSION_LIVENESS_CUSTOM_TYPE)
+			.map(entry => (entry.type === "custom" ? entry.data : undefined));
+		expect(livenessEntries).toContainEqual(
+			expect.objectContaining({
+				operation: "tool_execution",
+				operationId: "toolu_repro",
+				phase: "end",
+			}),
+		);
+		expect(findLastSessionLiveness(sessionManager.getBranch())).toBeUndefined();
+	});
 	it("signal teardown persists the postmortem reason, not the generic dispose", async () => {
 		tempDir = TempDir.createSync("@pi-session-exit-signal-");
 		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
@@ -204,6 +336,11 @@ describe("session exit diagnostics", () => {
 		expect(exitEntry.data).toMatchObject({
 			reason: "sigterm",
 			kind: "signal",
+			processOutcome: {
+				observation: "known",
+				observedBy: "parent",
+				signal: "SIGTERM",
+			},
 		});
 	});
 
@@ -470,4 +607,197 @@ describe("session exit diagnostics", () => {
 		expect(createInterruptedTurnAbortMessage(completedTurn.getBranch())).toBeUndefined();
 		expect(createInterruptedTurnAbortMessage(supersededExit.getBranch())).toBeUndefined();
 	});
+	it("reconstructs an unclosed liveness tail when the prior process outcome was not observable", () => {
+		const sessionManager = SessionManager.inMemory();
+		sessionManager.appendMessage({ role: "user", content: "inspect the file", timestamp: Date.now() });
+		sessionManager.appendMessage(pendingAssistant);
+		const liveness = {
+			recordedAt: "2026-07-11T02:20:08.800Z",
+			operationId: "toolu_repro",
+			operation: "tool_execution",
+			phase: "start",
+			toolName: "bash",
+		} satisfies SessionLivenessData;
+		sessionManager.appendCustomEntry(SESSION_LIVENESS_CUSTOM_TYPE, liveness);
+
+		const recovered = createInterruptedTurnAbortMessage(sessionManager.getBranch());
+
+		expect(recovered).toMatchObject({
+			role: "assistant",
+			stopReason: "aborted",
+		});
+		expect(recovered?.errorMessage).toContain("could not be observed");
+	});
+	it("records one abnormal sentinel exit for an unclosed liveness marker", () => {
+		const sessionManager = SessionManager.inMemory();
+		const liveness = {
+			recordedAt: "2026-07-11T02:20:08.800Z",
+			operationId: "retry-wait-1",
+			operation: "retry_wait",
+			phase: "wait",
+			provider: "anthropic",
+			model: "claude-sonnet-4-5",
+			watchdogMs: 1_000,
+		} satisfies SessionLivenessData;
+		sessionManager.appendCustomEntry(SESSION_LIVENESS_CUSTOM_TYPE, liveness);
+
+		expect(recordAbnormalSessionExit(sessionManager)).toBe(true);
+		expect(recordAbnormalSessionExit(sessionManager)).toBe(false);
+		const exitEntry = sessionManager
+			.getBranch()
+			.find(entry => entry.type === "custom" && entry.customType === SESSION_EXIT_CUSTOM_TYPE);
+
+		if (exitEntry?.type !== "custom") throw new Error("Expected abnormal session exit marker");
+		expect(exitEntry.data).toMatchObject({
+			reason: "parent_disappeared",
+			kind: "abnormal",
+			lastLiveness: liveness,
+			processOutcome: {
+				observation: "unknown",
+				observedBy: "sentinel",
+			},
+		});
+	});
+	it("does not recover a completed tool operation as interrupted", () => {
+		const sessionManager = SessionManager.inMemory();
+		const operationId = "toolu_repro";
+		sessionManager.appendMessage({ role: "user", content: "inspect the file", timestamp: Date.now() });
+		sessionManager.appendMessage(pendingAssistant);
+		sessionManager.appendCustomEntry(SESSION_LIVENESS_CUSTOM_TYPE, {
+			recordedAt: "2026-07-11T02:20:08.800Z",
+			operation: "tool_execution",
+			operationId,
+			phase: "start",
+			toolName: "bash",
+		});
+		sessionManager.appendMessage({
+			role: "toolResult",
+			toolCallId: "toolu_repro",
+			toolName: "bash",
+			content: [{ type: "text", text: "ok" }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+		sessionManager.appendCustomEntry(SESSION_LIVENESS_CUSTOM_TYPE, {
+			recordedAt: "2026-07-11T02:20:09.800Z",
+			operation: "tool_execution",
+			operationId,
+			phase: "end",
+			toolName: "bash",
+		});
+
+		expect(findLastSessionLiveness(sessionManager.getBranch())).toBeUndefined();
+		expect(createInterruptedTurnAbortMessage(sessionManager.getBranch())).toBeUndefined();
+	});
+	it("persists an unknown sentinel outcome after the parent disappears", async () => {
+		const directory = TempDir.createSync("@pi-session-sentinel-");
+		try {
+			const sessionManager = SessionManager.create(directory.path(), directory.path());
+			sessionManager.appendMessage({ role: "user", content: "inspect the file", timestamp: Date.now() });
+			sessionManager.appendMessage(pendingAssistant);
+			sessionManager.appendCustomEntry(SESSION_LIVENESS_CUSTOM_TYPE, {
+				recordedAt: "2026-07-11T02:20:08.800Z",
+				operation: "provider_stream",
+				operationId: "provider-1",
+				phase: "start",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				watchdogMs: 1_000,
+			});
+			sessionManager.flushSync();
+			const sessionFile = sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a persisted session file");
+			await sessionManager.close();
+
+			const recorded = await runSessionExitSentinel({
+				sessionFile,
+				parentPid: process.pid,
+				parentIsAlive: () => false,
+			});
+
+			expect(recorded).toBe(true);
+			const reopened = await SessionManager.open(sessionFile, directory.path());
+			const exitEntry = reopened
+				.getBranch()
+				.find(entry => entry.type === "custom" && entry.customType === SESSION_EXIT_CUSTOM_TYPE);
+			await reopened.close();
+			if (exitEntry?.type !== "custom") throw new Error("Expected sentinel exit marker");
+			expect(exitEntry.data).toMatchObject({
+				kind: "abnormal",
+				processOutcome: {
+					observation: "unknown",
+					observedBy: "sentinel",
+				},
+			});
+		} finally {
+			directory.removeSync();
+		}
+	});
+	it("records an abnormal outcome through the real CLI sentinel worker", async () => {
+		const directory = TempDir.createSync("@pi-session-sentinel-worker-");
+		try {
+			const sessionManager = SessionManager.create(directory.path(), directory.path());
+			sessionManager.appendMessage({ role: "user", content: "inspect the file", timestamp: Date.now() });
+			sessionManager.appendMessage(pendingAssistant);
+			sessionManager.appendCustomEntry(SESSION_LIVENESS_CUSTOM_TYPE, {
+				recordedAt: "2026-07-11T02:20:08.800Z",
+				operation: "provider_stream",
+				operationId: "provider-1",
+				phase: "start",
+				provider: "anthropic",
+				model: "claude-sonnet-4-5",
+				watchdogMs: 1_000,
+			});
+			sessionManager.flushSync();
+			const sessionFile = sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a persisted session file");
+			await sessionManager.close();
+
+			const watchedParent = Bun.spawn([process.execPath, "-e", "process.stdin.resume()"], {
+				stdin: "pipe",
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+			const { cmd, cwd } = resolveWorkerSpawnCmd(SESSION_SENTINEL_WORKER_ARG);
+			const worker = Bun.spawn(cmd, {
+				cwd,
+				env: workerEnvFromParent({
+					[SESSION_SENTINEL_PARENT_PID_ENV]: String(watchedParent.pid),
+					[SESSION_SENTINEL_SESSION_FILE_ENV]: sessionFile,
+				}),
+				stdin: "ignore",
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+			try {
+				watchedParent.kill();
+				await watchedParent.exited;
+				expect(await worker.exited).toBe(0);
+			} finally {
+				try {
+					watchedParent.kill();
+				} catch {}
+				try {
+					worker.kill();
+				} catch {}
+				await Promise.all([watchedParent.exited, worker.exited]);
+			}
+
+			const reopened = await SessionManager.open(sessionFile, directory.path());
+			const exitEntry = reopened
+				.getBranch()
+				.find(entry => entry.type === "custom" && entry.customType === SESSION_EXIT_CUSTOM_TYPE);
+			await reopened.close();
+			if (exitEntry?.type !== "custom") throw new Error("Expected CLI sentinel exit marker");
+			expect(exitEntry.data).toMatchObject({
+				kind: "abnormal",
+				processOutcome: {
+					observation: "unknown",
+					observedBy: "sentinel",
+				},
+			});
+		} finally {
+			directory.removeSync();
+		}
+	}, 15_000);
 });

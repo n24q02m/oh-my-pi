@@ -199,6 +199,8 @@ export interface TurnRecoveryHost {
 		generation?: number;
 		onError?: (error: unknown) => void;
 	}): void;
+	startRetryWaitLiveness(delayMs: number): string;
+	finishRetryWaitLiveness(operationId: string): void;
 	waitForSessionMessagePersistence(message: AssistantMessage): Promise<void>;
 	appendSessionMessage(message: AssistantMessage): void;
 	persistedAssistantEntryId(message: AssistantMessage): string | undefined;
@@ -2333,6 +2335,7 @@ export class TurnRecovery {
 		const retryAbortController = new AbortController();
 		this.#retryAbortController?.abort();
 		this.#retryAbortController = retryAbortController;
+		const livenessOperationId = this.#host.startRetryWaitLiveness(delayMs);
 		try {
 			await scheduler.wait(delayMs, { signal: retryAbortController.signal });
 		} catch {
@@ -2352,6 +2355,8 @@ export class TurnRecovery {
 			this.#clearPendingRetryErrors();
 			this.resolveRetry();
 			return false;
+		} finally {
+			this.#host.finishRetryWaitLiveness(livenessOperationId);
 		}
 		if (this.#retryAbortController === retryAbortController) {
 			this.#retryAbortController = undefined;

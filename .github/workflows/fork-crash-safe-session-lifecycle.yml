@@ -1,0 +1,35 @@
+name: Fork crash-safe-session-lifecycle
+
+on:
+  push:
+    branches: [fix/crash-safe-session-lifecycle]
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle_contract:
+    name: Crash-safe lifecycle contract
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/bun-install
+      - name: Install release native addons
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="$(npm view @oh-my-pi/pi-natives-linux-x64@latest dist.tarball)"
+          echo "Fetching $tarball"
+          curl -fsSL --retry 3 "$tarball" | tar -xz -C "$RUNNER_TEMP"
+          cp "$RUNNER_TEMP/package/pi_natives.linux-x64-baseline.node" packages/natives/native/
+          cp "$RUNNER_TEMP/package/pi_natives.linux-x64-modern.node" packages/natives/native/
+      - name: Check TypeScript types
+        working-directory: packages/coding-agent
+        run: bun run check:types
+      - name: Run lifecycle diagnostics tests
+        working-directory: packages/coding-agent
+        env:
+          PI_TEST_RUNTIME: "1"
+          BUN_JSC_useConcurrentGC: "0"
+          BUN_JSC_numberOfGCMarkers: "1"
+        run: bun test test/session-exit-diagnostics.test.ts test/agent-session-retry-cap.test.ts test/turn-recovery-replay-unsafe.test.ts

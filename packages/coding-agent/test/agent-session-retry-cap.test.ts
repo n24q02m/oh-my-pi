@@ -23,6 +23,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
+import { SESSION_LIVENESS_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -211,9 +212,10 @@ describe("AgentSession retry delay cap", () => {
 		});
 		settings.setModelRole("default", `${model.provider}/${model.id}`);
 
+		const sessionManager = SessionManager.inMemory();
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager,
 			settings,
 			modelRegistry,
 		});
@@ -225,6 +227,23 @@ describe("AgentSession retry delay cap", () => {
 
 		await session.prompt("Trigger transient rate limit without retry-after");
 		await session.waitForIdle();
+		const livenessEntries = sessionManager
+			.getBranch()
+			.filter(entry => entry.type === "custom" && entry.customType === SESSION_LIVENESS_CUSTOM_TYPE)
+			.map(entry => (entry.type === "custom" ? entry.data : undefined));
+		expect(livenessEntries).toContainEqual(
+			expect.objectContaining({
+				operation: "retry_wait",
+				phase: "wait",
+				watchdogMs: 30_000,
+			}),
+		);
+		expect(livenessEntries).toContainEqual(
+			expect.objectContaining({
+				operation: "retry_wait",
+				phase: "end",
+			}),
+		);
 
 		expect(retryStartEvents).toHaveLength(1);
 		expect(retryStartEvents[0].delayMs).toBe(30_000);

@@ -283,8 +283,12 @@ import { EvalRunner, type EvalRunnerHost } from "./eval-runner";
 import {
 	collectPendingToolCalls,
 	createInterruptedTurnAbortMessage,
+	findLastSessionLiveness,
 	SESSION_EXIT_CUSTOM_TYPE,
+	SESSION_LIVENESS_CUSTOM_TYPE,
 	type SessionExitData,
+	type SessionLivenessData,
+	type SessionProcessOutcome,
 	summarizeToolArguments,
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 	type ToolExecutionStartData,
@@ -348,6 +352,7 @@ import { cleanupEmptyMoveSession, copySessionArtifacts, type SessionManager } fr
 import { SessionMemory, type SessionMemoryHost } from "./session-memory";
 import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
+import { startSessionExitSentinel } from "./session-sentinel";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import { SessionTools, type SessionToolsHost } from "./session-tools";
 import type { ShakeMode, ShakeResult } from "./shake-types";
@@ -369,6 +374,13 @@ import { TtsrCoordinator, type TtsrCoordinatorHost } from "./ttsr-coordinator";
 
 const PLAN_MODE_REMINDER_MAX = 3;
 const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
+const SESSION_LIVENESS_PROGRESS_INTERVAL_MS = 15_000;
+
+function configuredWatchdogMs(timeoutSeconds: number): number | undefined {
+	if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0) return undefined;
+	if (timeoutSeconds === 0) return 0;
+	return Math.max(1, Math.trunc(timeoutSeconds * 1000));
+}
 
 /** Internal marker for hook messages queued through the agent loop */
 // ============================================================================
@@ -529,8 +541,11 @@ export class AgentSession {
 	// Event subscription state
 	#unsubscribeAgent?: () => void;
 	#cancelExitRecorder?: () => void;
+	#stopSessionExitSentinel?: () => void;
 	#cancelFatalRecoveryHint?: () => void;
 	#exitRecorded = false;
+	#providerLivenessOperationId?: string;
+	#lastProviderLivenessAt = 0;
 	#unsubscribeAppendOnly?: () => void;
 	#unsubscribeModelRoles?: () => void;
 	#unsubscribeExtendedContext?: () => void;
@@ -1196,6 +1211,8 @@ export class AgentSession {
 			sessionId: () => this.sessionId,
 			emitSessionEvent: event => this.#emitSessionEvent(event),
 			scheduleAgentContinue: options => this.#scheduleAgentContinue(options),
+			startRetryWaitLiveness: delayMs => this.#startRetryWaitLiveness(delayMs),
+			finishRetryWaitLiveness: operationId => this.#finishRetryWaitLiveness(operationId),
 			waitForSessionMessagePersistence: message => this.#waitForSessionMessagePersistence(message),
 			appendSessionMessage: message => this.#appendSessionMessage(message),
 			persistedAssistantEntryId: message => (message as PersistedAssistantMessage)[kPersistedSessionEntryId],
@@ -2118,6 +2135,129 @@ export class AgentSession {
 		this.#emit({ type: "notice", level, message, source });
 	}
 
+	#recordSessionLiveness(data: Omit<SessionLivenessData, "recordedAt">): void {
+		const marker: SessionLivenessData = {
+			...data,
+			recordedAt: new Date().toISOString(),
+		};
+		try {
+			this.sessionManager.appendCustomEntry(SESSION_LIVENESS_CUSTOM_TYPE, marker);
+			this.sessionManager.flushSync();
+			if (marker.phase !== "end") this.#ensureSessionExitSentinel();
+		} catch (error) {
+			logger.warn("Failed to persist session liveness", {
+				sessionId: this.sessionManager.getSessionId(),
+				operation: data.operation,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	#ensureSessionExitSentinel(): void {
+		if (isBunTestRuntime() || this.#stopSessionExitSentinel) return;
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (!sessionFile) return;
+		try {
+			this.#stopSessionExitSentinel = startSessionExitSentinel(sessionFile);
+		} catch (error) {
+			logger.warn("Failed to start session-exit sentinel", {
+				sessionId: this.sessionManager.getSessionId(),
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	#rearmSessionExitSentinel(): void {
+		this.#stopSessionExitSentinel?.();
+		this.#stopSessionExitSentinel = undefined;
+		if (findLastSessionLiveness(this.sessionManager.getBranch())) this.#ensureSessionExitSentinel();
+	}
+	#recordProviderStreamLiveness(
+		operationId: string,
+		phase: "start" | "progress" | "end",
+		watchdogMs: number | undefined,
+	): void {
+		const model = this.model;
+		const data: Omit<SessionLivenessData, "recordedAt"> = {
+			operation: "provider_stream",
+			operationId,
+			phase,
+		};
+		if (model) {
+			data.provider = model.provider;
+			data.model = model.id;
+		}
+		if (watchdogMs !== undefined) data.watchdogMs = watchdogMs;
+		this.#recordSessionLiveness(data);
+	}
+
+	#startProviderStreamLiveness(): void {
+		this.#finishProviderStreamLiveness();
+		const operationId = Snowflake.next();
+		this.#providerLivenessOperationId = operationId;
+		this.#lastProviderLivenessAt = Date.now();
+		this.#recordProviderStreamLiveness(
+			operationId,
+			"start",
+			configuredWatchdogMs(this.settings.get("providers.streamFirstEventTimeoutSeconds")),
+		);
+	}
+
+	#recordProviderStreamProgress(): void {
+		const operationId = this.#providerLivenessOperationId;
+		if (!operationId) {
+			this.#startProviderStreamLiveness();
+			return;
+		}
+		const now = Date.now();
+		if (now - this.#lastProviderLivenessAt < SESSION_LIVENESS_PROGRESS_INTERVAL_MS) return;
+		this.#lastProviderLivenessAt = now;
+		this.#recordProviderStreamLiveness(
+			operationId,
+			"progress",
+			configuredWatchdogMs(this.settings.get("providers.streamIdleTimeoutSeconds")),
+		);
+	}
+
+	#finishProviderStreamLiveness(): void {
+		const operationId = this.#providerLivenessOperationId;
+		if (!operationId) return;
+		this.#providerLivenessOperationId = undefined;
+		this.#lastProviderLivenessAt = 0;
+		this.#recordProviderStreamLiveness(operationId, "end", undefined);
+	}
+
+	#startRetryWaitLiveness(delayMs: number): string {
+		const operationId = Snowflake.next();
+		const model = this.model;
+		const data: Omit<SessionLivenessData, "recordedAt"> = {
+			operation: "retry_wait",
+			operationId,
+			phase: "wait",
+		};
+		if (model) {
+			data.provider = model.provider;
+			data.model = model.id;
+		}
+		if (Number.isSafeInteger(delayMs) && delayMs >= 0) data.watchdogMs = delayMs;
+		this.#recordSessionLiveness(data);
+		return operationId;
+	}
+
+	#finishRetryWaitLiveness(operationId: string): void {
+		const model = this.model;
+		const data: Omit<SessionLivenessData, "recordedAt"> = {
+			operation: "retry_wait",
+			operationId,
+			phase: "end",
+		};
+		if (model) {
+			data.provider = model.provider;
+			data.model = model.id;
+		}
+		this.#recordSessionLiveness(data);
+	}
+
 	#recordToolExecutionStart(event: Extract<AgentEvent, { type: "tool_execution_start" }>): void {
 		const data: ToolExecutionStartData = {
 			toolCallId: event.toolCallId,
@@ -2130,14 +2270,47 @@ export class AgentSession {
 		if (args) data.args = args;
 		if (event.intent) data.intent = event.intent;
 		this.sessionManager.appendCustomEntry(TOOL_EXECUTION_START_CUSTOM_TYPE, data);
+		const liveness: Omit<SessionLivenessData, "recordedAt"> = {
+			operation: "tool_execution",
+			operationId: event.toolCallId,
+			phase: "start",
+			toolName: event.toolName,
+		};
+		const watchdogMs = configuredWatchdogMs(this.settings.get("tools.maxTimeout"));
+		if (watchdogMs !== undefined) liveness.watchdogMs = watchdogMs;
+		this.#recordSessionLiveness(liveness);
+	}
+
+	#observedProcessOutcome(reason: postmortem.Reason | "dispose"): SessionProcessOutcome | undefined {
+		switch (reason) {
+			case postmortem.Reason.SIGINT:
+				return { observation: "known", observedBy: "parent", signal: "SIGINT" };
+			case postmortem.Reason.SIGTERM:
+				return { observation: "known", observedBy: "parent", signal: "SIGTERM" };
+			case postmortem.Reason.SIGHUP:
+				return { observation: "known", observedBy: "parent", signal: "SIGHUP" };
+			case postmortem.Reason.UNCAUGHT_EXCEPTION:
+			case postmortem.Reason.UNHANDLED_REJECTION:
+				return { observation: "known", observedBy: "parent", exitCode: 1 };
+			case postmortem.Reason.EXIT: {
+				const exitCode = process.exitCode;
+				if (typeof exitCode !== "number" || !Number.isSafeInteger(exitCode) || exitCode < 0) return undefined;
+				return { observation: "known", observedBy: "parent", exitCode };
+			}
+			default:
+				return undefined;
+		}
 	}
 
 	#recordSessionExit(reason: postmortem.Reason | "dispose"): void {
 		if (this.#exitRecorded) return;
 		this.#exitRecorded = true;
-		const pendingToolCalls = collectPendingToolCalls(this.sessionManager.getBranch());
+		const branch = this.sessionManager.getBranch();
+		const pendingToolCalls = collectPendingToolCalls(branch);
+		const lastLiveness = findLastSessionLiveness(branch);
 		if (
 			pendingToolCalls.length === 0 &&
+			!lastLiveness &&
 			!this.sessionManager.getEntries().some(entry => entry.type === "message" && entry.message.role === "assistant")
 		) {
 			return;
@@ -2155,6 +2328,9 @@ export class AgentSession {
 			kind,
 			recordedAt: new Date().toISOString(),
 		};
+		if (lastLiveness) data.lastLiveness = lastLiveness.data;
+		const processOutcome = this.#observedProcessOutcome(reason);
+		if (processOutcome) data.processOutcome = processOutcome;
 		if (pendingToolCalls.length > 0) data.pendingToolCalls = pendingToolCalls;
 		try {
 			this.sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, data);
@@ -2641,7 +2817,9 @@ export class AgentSession {
 		if (event.type === "agent_start") {
 			this.#prunedTerminalRefusal = undefined;
 			this.#emitRunState("running");
+			this.#startProviderStreamLiveness();
 		}
+		if (event.type === "message_update") this.#recordProviderStreamProgress();
 		// This must happen before event fan-out awaits: streamed tool-call deltas
 		// can otherwise queue validation that a delayed turn-start reset erases.
 		if (event.type === "turn_start") this.#streamingEditGuard.reset();
@@ -2781,6 +2959,7 @@ export class AgentSession {
 		}
 
 		if (event.type === "tool_execution_start") {
+			this.#finishProviderStreamLiveness();
 			this.#recordToolExecutionStart(event);
 		}
 
@@ -2818,6 +2997,13 @@ export class AgentSession {
 			}
 		}
 		if (event.type === "tool_execution_end") {
+			this.#recordSessionLiveness({
+				operation: "tool_execution",
+				operationId: event.toolCallId,
+				phase: "end",
+				toolName: event.toolName,
+			});
+			this.#startProviderStreamLiveness();
 			if (event.toolName === "goal") {
 				await this.#goalRuntime.onGoalToolCompleted();
 			} else {
@@ -2988,6 +3174,7 @@ export class AgentSession {
 
 		// Check auto-retry and auto-compaction after agent completes
 		if (event.type === "agent_end") {
+			this.#finishProviderStreamLiveness();
 			const settledMessages = event.messages;
 			const activeMessages = this.agent.state.messages;
 			// TTSR retry work runs concurrently and clears the live flag before
@@ -4293,6 +4480,8 @@ export class AgentSession {
 	async #doDispose(options: AgentSessionDisposeOptions = {}): Promise<void> {
 		this.beginDispose();
 		this.#recordSessionExit(options.reason ?? "dispose");
+		this.#stopSessionExitSentinel?.();
+		this.#stopSessionExitSentinel = undefined;
 		this.#cancelExitRecorder?.();
 		this.#cancelExitRecorder = undefined;
 		this.#cancelFatalRecoveryHint?.();
@@ -7236,6 +7425,7 @@ export class AgentSession {
 				// point keeps the status line honest even if a later step below throws.
 				this.#advisors.clearCost();
 				sessionTransitioned = true;
+				this.#rearmSessionExitSentinel();
 			} finally {
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
@@ -7346,6 +7536,7 @@ export class AgentSession {
 			}
 			this.#bash.markSessionTransition(bashTransition);
 			this.#bash.finishSessionTransition(bashTransition, true);
+			this.#rearmSessionExitSentinel();
 			// The fork clones the transcript and keeps this recovery state running
 			// under a fresh id, so the work already produced is still this session's.
 			this.#recovery.reanchorServedAttribution(previousSessionId);
@@ -7380,6 +7571,7 @@ export class AgentSession {
 	async moveSession(newCwd: string, targetSessionDir?: string): Promise<void> {
 		this.#assertVibeSessionTransitionAllowed("move the session");
 		await this.sessionManager.moveTo(newCwd, targetSessionDir);
+		this.#rearmSessionExitSentinel();
 	}
 
 	// =========================================================================
@@ -8530,6 +8722,7 @@ export class AgentSession {
 				this.#advisors.restoreCost(costs, providersBySlug);
 			}
 			this.#bash.finishSessionTransition(bashTransition, true);
+			this.#rearmSessionExitSentinel();
 			if (previousSessionState.sessionId !== this.sessionManager.getSessionId()) {
 				this.#notifySessionChangeCallbacks();
 			}
@@ -8684,6 +8877,7 @@ export class AgentSession {
 				this.#bash.markSessionTransition(bashTransition);
 				this.#advisors.clearCost();
 				sessionTransitioned = true;
+				this.#rearmSessionExitSentinel();
 			} finally {
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
@@ -8807,6 +9001,7 @@ export class AgentSession {
 				this.#bash.markSessionTransition(bashTransition);
 				this.#advisors.clearCost();
 				sessionTransitioned = true;
+				this.#rearmSessionExitSentinel();
 			} finally {
 				this.#bash.finishSessionTransition(bashTransition, sessionTransitioned);
 			}
