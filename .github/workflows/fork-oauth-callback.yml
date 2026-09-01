@@ -1,0 +1,32 @@
+name: Fork oauth-callback
+
+on:
+  push:
+    branches: [fix/oauth-callback-port-conflict]
+
+permissions:
+  contents: read
+
+jobs:
+  oauth_callback_contract:
+    name: OAuth callback listener contract
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/bun-install
+      - name: Install release native addons
+        shell: bash
+        run: |
+          set -euo pipefail
+          tarball="$(npm view @oh-my-pi/pi-natives-linux-x64@latest dist.tarball)"
+          echo "Fetching $tarball"
+          curl -fsSL --retry 3 "$tarball" | tar -xz -C "$RUNNER_TEMP"
+          cp "$RUNNER_TEMP/package/pi_natives.linux-x64-baseline.node" packages/natives/native/
+          cp "$RUNNER_TEMP/package/pi_natives.linux-x64-modern.node" packages/natives/native/
+      - name: Run OAuth callback tests
+        env:
+          PI_TEST_RUNTIME: "1"
+          BUN_JSC_useConcurrentGC: "0"
+          BUN_JSC_numberOfGCMarkers: "1"
+        run: |
+          bun test packages/ai/test/callback-server-port-fallback.test.ts packages/ai/test/callback-server-dual-stack.test.ts packages/ai/test/callback-server-security.test.ts packages/ai/test/callback-server-launch-route.test.ts packages/ai/test/callback-server-manual-input.test.ts packages/ai/test/anthropic-oauth.test.ts packages/coding-agent/test/mcp-oauth-flow.test.ts packages/coding-agent/test/oauth-manual-input.test.ts
