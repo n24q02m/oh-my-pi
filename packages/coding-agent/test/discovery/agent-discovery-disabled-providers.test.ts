@@ -8,6 +8,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { disableProvider, enableProvider } from "@oh-my-pi/pi-coding-agent/capability";
 import { clearCache as clearFsCache } from "@oh-my-pi/pi-coding-agent/capability/fs";
+import { resolveAgentModelSelection } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { clearClaudePluginRootsCache } from "@oh-my-pi/pi-coding-agent/discovery/helpers";
 import { discoverAgents } from "@oh-my-pi/pi-coding-agent/task/discovery";
 import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
@@ -16,6 +18,7 @@ const PLUGIN_AGENT_MD = [
 	"---",
 	"name: simplifier",
 	"description: A code simplifier agent from a Claude plugin",
+	"model: opus",
 	"---",
 	"Simplify code.",
 ].join("\n");
@@ -67,9 +70,48 @@ describe("discoverAgents — claude-plugins disabled provider", () => {
 		clearClaudePluginRootsCache();
 	});
 
-	test("includes plugin agents when claude-plugins is enabled", async () => {
+	test("keeps Claude marketplace aliases from selecting an unchosen provider", async () => {
 		const { agents } = await discoverAgents(tempHome, tempHome);
-		expect(agents.map(a => a.name)).toContain("simplifier");
+		const agent = agents.find(candidate => candidate.name === "simplifier");
+		expect(agent?.model).toBeUndefined();
+		const settings = Settings.isolated({
+			modelRoles: { slow: "openai-codex/gpt-5.6-mini" },
+		});
+
+		expect(
+			resolveAgentModelSelection({
+				agentModel: agent?.model,
+				settings,
+				activeModelPattern: "openai-codex/gpt-5.6-sol",
+			}),
+		).toEqual({
+			patterns: ["openai-codex/gpt-5.6-sol"],
+			role: undefined,
+		});
+		expect(
+			resolveAgentModelSelection({
+				settingsOverride: "@slow",
+				agentModel: agent?.model,
+				settings,
+				activeModelPattern: "openai-codex/gpt-5.6-sol",
+			}),
+		).toEqual({
+			patterns: ["openai-codex/gpt-5.6-mini"],
+			role: "slow",
+		});
+
+		expect(
+			resolveAgentModelSelection({
+				requestModel: "openai-codex/gpt-5.6-max",
+				settingsOverride: "@slow",
+				agentModel: agent?.model,
+				settings,
+				activeModelPattern: "openai-codex/gpt-5.6-sol",
+			}),
+		).toEqual({
+			patterns: ["openai-codex/gpt-5.6-max"],
+			role: undefined,
+		});
 	});
 
 	test("excludes plugin agents when claude-plugins is disabled", async () => {
