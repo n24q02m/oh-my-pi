@@ -1798,7 +1798,30 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 
+	"retry.maxRetriesByProvider": {
+		type: "record",
+		default: EMPTY_NUMBER_RECORD,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Provider Retry Attempts",
+			description:
+				'Optional per-provider retry budgets keyed by provider id, for example {"anthropic":3}. Omitted or invalid entries use Retry Attempts.',
+		},
+	},
+
 	"retry.baseDelayMs": { type: "number", default: 500 },
+	"retry.baseDelayMsByProvider": {
+		type: "record",
+		default: EMPTY_NUMBER_RECORD,
+		ui: {
+			tab: "model",
+			group: "Retry & Fallback",
+			label: "Provider Retry Base Delay",
+			description:
+				'Optional per-provider exponential-backoff bases in ms keyed by provider id, for example {"anthropic":1000}. Omitted or invalid entries use the global base delay.',
+		},
+	},
 	"retry.maxDelayMs": {
 		type: "number",
 		default: 5 * 60 * 1000,
@@ -6151,7 +6174,9 @@ export interface ContextPromotionSettings {
 export interface RetrySettings {
 	enabled: boolean;
 	maxRetries: number;
+	maxRetriesByProvider: Record<string, number>;
 	baseDelayMs: number;
+	baseDelayMsByProvider: Record<string, number>;
 	maxDelayMs: number;
 	modelFallback: boolean;
 	usageAwareFallback: boolean;
