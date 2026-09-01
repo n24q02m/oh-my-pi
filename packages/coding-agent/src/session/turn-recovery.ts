@@ -84,6 +84,16 @@ const PREMATURE_STREAM_CLOSE_ERROR_RE = /stream closed before a (?:finish_reason
 const IMMUTABLE_ANTHROPIC_THINKING_ERROR_PATTERN =
 	/messages\.\d+\.content\.\d+.*\b(?:thinking|redacted_thinking)\b.*\blatest assistant message cannot be modified\b/is;
 
+function resolveProviderRetrySetting(
+	overrides: Record<string, number>,
+	provider: string | undefined,
+	fallback: number,
+): number {
+	const override = provider === undefined ? undefined : overrides[provider];
+	if (typeof override !== "number" || !Number.isFinite(override) || override < 0) return fallback;
+	return override;
+}
+
 function hasNonWhitespace(value: string): boolean {
 	return NON_WHITESPACE_RE.test(value);
 }
@@ -2224,6 +2234,7 @@ export class TurnRecovery {
 		// the model once and lets the base turn proceed.
 		if (!retrySettings.enabled && !options?.fireworksFastFallback) return false;
 		const classifierRefusal = this.isClassifierRefusal(message);
+		const currentModel = this.#host.model();
 
 		const generation = this.#host.promptGeneration();
 		this.#retryAttempt++;
@@ -2237,15 +2248,23 @@ export class TurnRecovery {
 			this.#retryResolve = resolve;
 		}
 
-		// All attempts on the current model are spent. Don't fail yet: the
-		// fallback chain below gets one last consult. Credential rotation can
-		// consume the entire budget without the fallback branch ever running
-		// (every rotation sets switchedCredential and skips it), so without
-		// this last resort a provider-wide usage cap never fails over to the
-		// configured chain.
+		// Ordinary transient failures spend the current provider's budget before
+		// consulting a configured fallback. Explicit hard failures retain their
+		// immediate recovery path below.
+		const provider = currentModel?.provider;
+		const configuredMaxRetries = resolveProviderRetrySetting(
+			retrySettings.maxRetriesByProvider,
+			provider,
+			retrySettings.maxRetries,
+		);
+		const configuredBaseDelayMs = resolveProviderRetrySetting(
+			retrySettings.baseDelayMsByProvider,
+			provider,
+			retrySettings.baseDelayMs,
+		);
 		const maxRetries = this.#isBoundedThinkingStreamClose(message)
-			? Math.min(retrySettings.maxRetries, 1)
-			: retrySettings.maxRetries;
+			? Math.min(configuredMaxRetries, 1)
+			: configuredMaxRetries;
 		const retryBudgetExhausted = this.#sameModelRetryAttempt > maxRetries;
 		const classifierFallbackBudgetExhausted = this.#retryAttempt > maxRetries;
 		const terminalRetryBudgetExhausted =
@@ -2259,12 +2278,14 @@ export class TurnRecovery {
 				this.#unexecutedToolCallsReplaySafe(message));
 		const rateLimitReason = parseRateLimitReason(errorMessage);
 		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
+		const usageLimit = AIError.is(id, AIError.Flag.UsageLimit);
+		const authFailure = AIError.is(id, AIError.Flag.AuthFailed);
 		const accountPolicyDenial = AIError.is(id, AIError.Flag.AccountPolicy);
 		const recordedUsageLimitOutcome = await this.#usageLimitOutcomes.get(message);
 		const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
 		let delayMs = staleOpenAIResponsesReplayError
 			? 0
-			: calculateRetryBackoffDelayMs(retrySettings.baseDelayMs, this.#sameModelRetryAttempt);
+			: calculateRetryBackoffDelayMs(configuredBaseDelayMs, this.#sameModelRetryAttempt);
 		// Transient rate/concurrency caps stay on the same credential, but must
 		// honor their reason-specific windows. The default exponential base
 		// (≈500ms, capped at 8s) otherwise re-hits the cap and burns the retry
@@ -2273,7 +2294,7 @@ export class TurnRecovery {
 		// window only applies when the error carries no parsed timing.
 		if (
 			!staleOpenAIResponsesReplayError &&
-			!AIError.is(id, AIError.Flag.UsageLimit) &&
+			!usageLimit &&
 			parsedRetryAfterMs === undefined &&
 			(rateLimitReason === "CONCURRENT_LIMIT" || rateLimitReason === "RATE_LIMIT_EXCEEDED")
 		) {
@@ -2325,7 +2346,6 @@ export class TurnRecovery {
 		}
 
 		const allowModelFallback = options?.allowModelFallback !== false;
-		const currentModel = this.#host.model();
 		const currentSelector = currentModel
 			? formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel())
 			: undefined;
@@ -2345,6 +2365,13 @@ export class TurnRecovery {
 		// contents, not model health (issue #8760). Keep it on the same model; the
 		// retry budget still bounds a genuinely stuck stream.
 		const thinkingLoop = AIError.is(id, AIError.Flag.ThinkingLoop);
+		const requiresImmediateModelFallback =
+			terminalRetryBudgetExhausted ||
+			classifierRefusal ||
+			usageLimit ||
+			authFailure ||
+			accountPolicyDenial ||
+			options?.hardErrorFallback === true;
 		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector) {
 			// A refusal chain stops at the retry budget: the exhausted-attempt
 			// last resort is for provider failures, not classifier decisions.
@@ -2352,6 +2379,7 @@ export class TurnRecovery {
 				allowModelFallback &&
 				retrySettings.modelFallback &&
 				!thinkingLoop &&
+				requiresImmediateModelFallback &&
 				!(classifierFallbackBudgetExhausted && classifierRefusal)
 			) {
 				if (!classifierRefusal) {
