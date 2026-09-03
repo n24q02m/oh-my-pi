@@ -1,5 +1,4 @@
-import { logger } from "@oh-my-pi/pi-utils";
-
+import { isEnoent, logger } from "@oh-my-pi/pi-utils";
 export interface BoundedCommandResult {
 	stdout: string;
 	stderr: string;
@@ -21,7 +20,7 @@ const DEFAULT_MAX_STDOUT_BYTES = 8 * 1024 * 1024;
 const DEFAULT_MAX_STDERR_BYTES = 1024 * 1024;
 
 function sanitizeMaxBytes(value: number | undefined, defaultValue: number): number {
-	if (!Number.isFinite(value) || value <= 0) {
+	if (value === undefined || !Number.isFinite(value) || value <= 0) {
 		return defaultValue;
 	}
 	return Math.floor(value);
@@ -82,35 +81,48 @@ export async function runBoundedGitCommand(
 	const maxStdoutBytes = sanitizeMaxBytes(options.maxStdoutBytes, DEFAULT_MAX_STDOUT_BYTES);
 	const maxStderrBytes = sanitizeMaxBytes(options.maxStderrBytes, DEFAULT_MAX_STDERR_BYTES);
 
-	const child = Bun.spawn(["git", ...args], {
-		cwd: options.cwd,
-		env: options.env,
-		stdin: "ignore",
-		stdout: "pipe",
-		stderr: "pipe",
-		timeout: options.timeout,
-		windowsHide: true,
-	});
-
-	const [stdout, stderr, exitCode] = await Promise.all([
-		collectLimited(child.stdout, maxStdoutBytes),
-		collectLimited(child.stderr, maxStderrBytes),
-		child.exited,
-	]);
-
-	if (options.logNonZeroExit && exitCode !== 0 && stderr.text.length > 0) {
-		logger.warn("runBoundedGitCommand: command finished with non-zero exit", {
-			args,
-			exitCode,
-			stderr: stderr.text.slice(0, 2000),
+	try {
+		const child = Bun.spawn(["git", ...args], {
+			cwd: options.cwd,
+			env: options.env,
+			stdin: "ignore",
+			stdout: "pipe",
+			stderr: "pipe",
+			timeout: options.timeout,
+			windowsHide: true,
 		});
-	}
 
-	return {
-		exitCode: exitCode ?? 0,
-		stdout: stdout.text,
-		stderr: stderr.text,
-		stdoutTruncated: stdout.truncated,
-		stderrTruncated: stderr.truncated,
-	};
+		const [stdout, stderr, exitCode] = await Promise.all([
+			collectLimited(child.stdout, maxStdoutBytes),
+			collectLimited(child.stderr, maxStderrBytes),
+			child.exited,
+		]);
+
+		if (options.logNonZeroExit && exitCode !== 0 && stderr.text.length > 0) {
+			logger.warn("runBoundedGitCommand: command finished with non-zero exit", {
+				args,
+				exitCode,
+				stderr: stderr.text.slice(0, 2000),
+			});
+		}
+
+		return {
+			exitCode: exitCode ?? 0,
+			stdout: stdout.text,
+			stderr: stderr.text,
+			stdoutTruncated: stdout.truncated,
+			stderrTruncated: stderr.truncated,
+		};
+	} catch (error) {
+		if (isEnoent(error)) {
+			return {
+				exitCode: 127,
+				stdout: "",
+				stderr: `Failed to execute git command: ${error.message}`,
+				stdoutTruncated: false,
+				stderrTruncated: false,
+			};
+		}
+		throw error;
+	}
 }

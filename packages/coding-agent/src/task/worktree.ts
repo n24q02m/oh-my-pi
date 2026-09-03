@@ -175,17 +175,11 @@ export async function applyBaseline(worktreeDir: string, baseline: WorktreeBasel
 			if (isEnoent(err)) continue;
 			throw err;
 		}
-		// Apply any uncommitted changes from the nested baseline
-		await applyRepoBaseline(nestedDir, entry.baseline, entry.baseline.repoRoot);
 		// Commit baseline state so captureRepoDeltaPatch can cleanly subtract it.
 		// Without this, `git add -A && git commit` by the task would include
 		// baseline untracked files in the diff-tree output.
-		const statusResult = await runBoundedGitCommand(["--no-optional-locks", "status", "--porcelain"], {
-			cwd: nestedDir,
-			maxStdoutBytes: GIT_STATUS_CHECK_OUTPUT_LIMIT_BYTES,
-		});
-		const hasChanges = Boolean(statusResult.stdout.trim()) || statusResult.stdoutTruncated;
-		if (hasChanges) {
+		const hasNestedChanges = await hasGitWorkingTreeChanges(nestedDir, GIT_STATUS_CHECK_OUTPUT_LIMIT_BYTES);
+		if (hasNestedChanges) {
 			await $`git add -A`.cwd(nestedDir).quiet();
 			await $`git commit -m omp-baseline --allow-empty`.cwd(nestedDir).quiet();
 			// Update baseline to reflect the committed state — prevents double-apply
@@ -196,6 +190,27 @@ export async function applyBaseline(worktreeDir: string, baseline: WorktreeBasel
 			entry.baseline.untracked = [];
 		}
 	}
+}
+
+async function hasGitWorkingTreeChanges(cwd: string, maxStdoutBytes: number): Promise<boolean> {
+	const statusResult = await runBoundedGitCommand(["--no-optional-locks", "status", "--porcelain"], {
+		cwd,
+		maxStdoutBytes,
+	});
+	return Boolean(statusResult.stdout.trim()) || statusResult.stdoutTruncated;
+}
+
+async function getNewUntrackedDiffs(repoDir: string, baselineUntracked: string[]): Promise<string[]> {
+	const currentUntracked = await listUntracked(repoDir);
+	const baselineSet = new Set(baselineUntracked);
+	const newUntracked = currentUntracked.filter(entry => !baselineSet.has(entry));
+	if (newUntracked.length === 0) return [];
+
+	return Promise.all(
+		newUntracked.map(entry =>
+			$`git diff --binary --no-index /dev/null ${entry}`.cwd(repoDir).quiet().nothrow().text(),
+		),
+	);
 }
 
 async function applyPatchToIndex(cwd: string, patch: string, indexFile: string): Promise<void> {
@@ -266,18 +281,8 @@ async function captureRepoDeltaPatch(repoDir: string, rb: RepoBaseline): Promise
 		if (staged.trim()) parts.push(staged);
 		if (unstaged.trim()) parts.push(unstaged);
 
-		// New untracked files (relative to both baseline and current tracking)
-		const currentUntracked = await listUntracked(repoDir);
-		const baselineUntracked = new Set(rb.untracked);
-		const newUntracked = currentUntracked.filter(entry => !baselineUntracked.has(entry));
-		if (newUntracked.length > 0) {
-			const untrackedDiffs = await Promise.all(
-				newUntracked.map(entry =>
-					$`git diff --binary --no-index /dev/null ${entry}`.cwd(repoDir).quiet().nothrow().text(),
-				),
-			);
-			parts.push(...untrackedDiffs.filter(d => d.trim()));
-		}
+		const untrackedDiffs = await getNewUntrackedDiffs(repoDir, rb.untracked);
+		parts.push(...untrackedDiffs.filter(d => d.trim()));
 
 		return parts.join("\n");
 	}
@@ -290,18 +295,11 @@ async function captureRepoDeltaPatch(repoDir: string, rb: RepoBaseline): Promise
 		await applyPatchToIndex(repoDir, rb.unstaged, tempIndex);
 		const diff = await $`git diff --binary`.cwd(repoDir).env({ GIT_INDEX_FILE: tempIndex }).quiet().text();
 
-		const currentUntracked = await listUntracked(repoDir);
-		const baselineUntracked = new Set(rb.untracked);
-		const newUntracked = currentUntracked.filter(entry => !baselineUntracked.has(entry));
+		const untrackedDiffs = await getNewUntrackedDiffs(repoDir, rb.untracked);
+		if (untrackedDiffs.length === 0) return diff;
 
-		if (newUntracked.length === 0) return diff;
-
-		const untrackedDiffs = await Promise.all(
-			newUntracked.map(entry =>
-				$`git diff --binary --no-index /dev/null ${entry}`.cwd(repoDir).quiet().nothrow().text(),
-			),
-		);
-		return `${diff}${diff && !diff.endsWith("\n") ? "\n" : ""}${untrackedDiffs.join("\n")}`;
+		const untrackedPatch = untrackedDiffs.join("\n");
+		return `${diff}${diff && !diff.endsWith("\n") ? "\n" : ""}${untrackedPatch}`;
 	} finally {
 		await fs.rm(tempIndex, { force: true });
 	}
@@ -368,12 +366,8 @@ export async function applyNestedPatches(
 		}
 
 		// Commit so nested repo history reflects the task changes
-		const statusResult = await runBoundedGitCommand(["--no-optional-locks", "status", "--porcelain"], {
-			cwd: nestedDir,
-			maxStdoutBytes: GIT_STATUS_CHECK_OUTPUT_LIMIT_BYTES,
-		});
-		const hasChanges = Boolean(statusResult.stdout.trim()) || statusResult.stdoutTruncated;
-		if (hasChanges) {
+		const hasNestedChanges = await hasGitWorkingTreeChanges(nestedDir, GIT_STATUS_CHECK_OUTPUT_LIMIT_BYTES);
+		if (hasNestedChanges) {
 			const msg = (await commitMessage?.(combinedDiff)) ?? "changes from isolated task(s)";
 			await $`git add -A`.cwd(nestedDir).quiet();
 			await $`git commit -m ${msg}`.cwd(nestedDir).quiet();
@@ -394,7 +388,6 @@ export async function cleanupWorktree(dir: string): Promise<void> {
 		await fs.rm(dir, { recursive: true, force: true });
 	}
 }
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Fuse-overlay isolation
 // ═══════════════════════════════════════════════════════════════════════════

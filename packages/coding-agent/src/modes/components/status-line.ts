@@ -11,6 +11,7 @@ import { findGitHeadPathSync, sanitizeStatusText } from "../shared";
 import { getPreset } from "./status-line/presets";
 import { renderSegment, type SegmentContext } from "./status-line/segments";
 import { getSeparator } from "./status-line/separators";
+
 const GIT_STATUS_CACHE_MS = 1_000;
 const GIT_STATUS_MAX_STDOUT_BYTES = 8 * 1024 * 1024;
 
@@ -68,6 +69,7 @@ export interface StatusLineSettings {
 // ═══════════════════════════════════════════════════════════════════════════
 
 export class StatusLineComponent implements Component {
+	#settings: StatusLineSettings = {};
 	#cachedBranch: string | null | undefined = undefined;
 	#gitWatcher: fs.FSWatcher | null = null;
 	#onBranchChange: (() => void) | null = null;
@@ -184,7 +186,7 @@ export class StatusLineComponent implements Component {
 	}
 
 	#getGitStatus(): { staged: number; unstaged: number; untracked: number } | null {
-		if (this.#gitStatusInFlight || Date.now() - this.#gitStatusLastFetch < 1000) {
+		if (this.#gitStatusInFlight || Date.now() - this.#gitStatusLastFetch < GIT_STATUS_CACHE_MS) {
 			return this.#cachedGitStatus;
 		}
 
@@ -195,40 +197,15 @@ export class StatusLineComponent implements Component {
 			try {
 				const result = await runBoundedGitCommand(["--no-optional-locks", "status", "--porcelain"], {
 					cwd: process.cwd(),
-					maxStdoutBytes: 8 * 1024 * 1024,
+					maxStdoutBytes: GIT_STATUS_MAX_STDOUT_BYTES,
 				});
 
-				if (result.exitCode !== 0 || result.stdoutTruncated) {
-					this.#cachedGitStatus = null;
+				if (result.exitCode === 0 && !result.stdoutTruncated) {
+					this.#cachedGitStatus = parseGitStatusCounts(result.stdout);
 					return;
 				}
 
-				const output = result.stdout;
-
-				let staged = 0;
-				let unstaged = 0;
-				let untracked = 0;
-
-				for (const line of output.split("\n")) {
-					if (!line) continue;
-					const x = line[0];
-					const y = line[1];
-
-					if (x === "?" && y === "?") {
-						untracked++;
-						continue;
-					}
-
-					if (x && x !== " " && x !== "?") {
-						staged++;
-					}
-
-					if (y && y !== " ") {
-						unstaged++;
-					}
-				}
-
-				this.#cachedGitStatus = { staged, unstaged, untracked };
+				this.#cachedGitStatus = null;
 			} catch {
 				this.#cachedGitStatus = null;
 			} finally {
