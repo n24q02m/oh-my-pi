@@ -4,8 +4,11 @@ import * as os from "node:os";
 import path from "node:path";
 import { getWorktreeDir, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
+import { runBoundedGitCommand } from "../utils/git-command";
 
-/** Baseline state for a single git repository. */
+const GIT_STATUS_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024;
+const GIT_STATUS_CHECK_OUTPUT_LIMIT_BYTES = 64 * 1024;
+
 export interface RepoBaseline {
 	repoRoot: string;
 	headCommit: string;
@@ -100,11 +103,7 @@ async function captureRepoBaseline(repoRoot: string): Promise<RepoBaseline> {
 	const headCommit = (await $`git rev-parse HEAD`.cwd(repoRoot).quiet().text()).trim();
 	const staged = await $`git diff --cached --binary`.cwd(repoRoot).quiet().text();
 	const unstaged = await $`git diff --binary`.cwd(repoRoot).quiet().text();
-	const untrackedRaw = await $`git ls-files --others --exclude-standard`.cwd(repoRoot).quiet().text();
-	const untracked = untrackedRaw
-		.split("\n")
-		.map(line => line.trim())
-		.filter(line => line.length > 0);
+	const untracked = await listUntracked(repoRoot);
 	return { repoRoot, headCommit, staged, unstaged, untracked };
 }
 
@@ -181,9 +180,11 @@ export async function applyBaseline(worktreeDir: string, baseline: WorktreeBasel
 		// Commit baseline state so captureRepoDeltaPatch can cleanly subtract it.
 		// Without this, `git add -A && git commit` by the task would include
 		// baseline untracked files in the diff-tree output.
-		const hasChanges = (
-			await $`git --no-optional-locks status --porcelain`.cwd(nestedDir).quiet().nothrow().text()
-		).trim();
+		const statusResult = await runBoundedGitCommand(["--no-optional-locks", "status", "--porcelain"], {
+			cwd: nestedDir,
+			maxStdoutBytes: GIT_STATUS_CHECK_OUTPUT_LIMIT_BYTES,
+		});
+		const hasChanges = Boolean(statusResult.stdout.trim()) || statusResult.stdoutTruncated;
 		if (hasChanges) {
 			await $`git add -A`.cwd(nestedDir).quiet();
 			await $`git commit -m omp-baseline --allow-empty`.cwd(nestedDir).quiet();
@@ -213,8 +214,30 @@ async function applyPatchToIndex(cwd: string, patch: string, indexFile: string):
 }
 
 async function listUntracked(cwd: string): Promise<string[]> {
-	const raw = await $`git ls-files --others --exclude-standard`.cwd(cwd).quiet().text();
-	return raw
+	const result = await runBoundedGitCommand(["ls-files", "--others", "--exclude-standard"], {
+		cwd,
+		maxStdoutBytes: GIT_STATUS_OUTPUT_LIMIT_BYTES,
+	});
+
+	if (result.exitCode !== 0) {
+		logger.warn("listUntracked failed; falling back to empty untracked snapshot", {
+			cwd,
+			exitCode: result.exitCode,
+			stderr: result.stderr.slice(0, 500),
+		});
+		return [];
+	}
+
+	if (result.stdoutTruncated) {
+		logger.warn("listUntracked output truncated; skipping untracked baseline/delta scan", {
+			cwd,
+			maxBytes: GIT_STATUS_OUTPUT_LIMIT_BYTES,
+			lineCountApprox: result.stdout.split("\n").filter(line => line.trim()).length,
+		});
+		return [];
+	}
+
+	return result.stdout
 		.split("\n")
 		.map(line => line.trim())
 		.filter(line => line.length > 0);
@@ -345,9 +368,11 @@ export async function applyNestedPatches(
 		}
 
 		// Commit so nested repo history reflects the task changes
-		const hasChanges = (
-			await $`git --no-optional-locks status --porcelain`.cwd(nestedDir).quiet().nothrow().text()
-		).trim();
+		const statusResult = await runBoundedGitCommand(["--no-optional-locks", "status", "--porcelain"], {
+			cwd: nestedDir,
+			maxStdoutBytes: GIT_STATUS_CHECK_OUTPUT_LIMIT_BYTES,
+		});
+		const hasChanges = Boolean(statusResult.stdout.trim()) || statusResult.stdoutTruncated;
 		if (hasChanges) {
 			const msg = (await commitMessage?.(combinedDiff)) ?? "changes from isolated task(s)";
 			await $`git add -A`.cwd(nestedDir).quiet();

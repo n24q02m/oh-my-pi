@@ -2,15 +2,50 @@ import * as fs from "node:fs";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { type Component, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import { formatCount } from "@oh-my-pi/pi-utils";
-import { $ } from "bun";
 import { settings } from "../../config/settings";
 import type { StatusLinePreset, StatusLineSegmentId, StatusLineSeparatorStyle } from "../../config/settings-schema";
 import { theme } from "../../modes/theme/theme";
 import type { AgentSession } from "../../session/agent-session";
+import { runBoundedGitCommand } from "../../utils/git-command";
 import { findGitHeadPathSync, sanitizeStatusText } from "../shared";
 import { getPreset } from "./status-line/presets";
 import { renderSegment, type SegmentContext } from "./status-line/segments";
 import { getSeparator } from "./status-line/separators";
+const GIT_STATUS_CACHE_MS = 1_000;
+const GIT_STATUS_MAX_STDOUT_BYTES = 8 * 1024 * 1024;
+
+function parseGitStatusCounts(output: string): { staged: number; unstaged: number; untracked: number } {
+	let staged = 0;
+	let unstaged = 0;
+	let untracked = 0;
+
+	for (const line of output.split("\n")) {
+		if (!line) continue;
+		const x = line[0];
+		const y = line[1];
+
+		if (x === "?" && y === "?") {
+			untracked++;
+			continue;
+		}
+		if (x && x !== " " && x !== "?") {
+			staged++;
+		}
+		if (y && y !== " ") {
+			unstaged++;
+		}
+	}
+
+	return { staged, unstaged, untracked };
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Rendering Helpers
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════════════
+// StatusLineComponent
+// ═══════════════════════════════════════════════════════════════════════════
 
 export interface StatusLineSegmentOptions {
 	model?: { showThinkingLevel?: boolean };
@@ -29,15 +64,10 @@ export interface StatusLineSettings {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// Rendering Helpers
-// ═══════════════════════════════════════════════════════════════════════════
-
-// ═══════════════════════════════════════════════════════════════════════════
 // StatusLineComponent
 // ═══════════════════════════════════════════════════════════════════════════
 
 export class StatusLineComponent implements Component {
-	#settings: StatusLineSettings = {};
 	#cachedBranch: string | null | undefined = undefined;
 	#gitWatcher: fs.FSWatcher | null = null;
 	#onBranchChange: (() => void) | null = null;
@@ -163,14 +193,17 @@ export class StatusLineComponent implements Component {
 		// Fire async fetch, return cached value
 		(async () => {
 			try {
-				const result = await $`git --no-optional-locks status --porcelain`.quiet().nothrow();
+				const result = await runBoundedGitCommand(["--no-optional-locks", "status", "--porcelain"], {
+					cwd: process.cwd(),
+					maxStdoutBytes: 8 * 1024 * 1024,
+				});
 
-				if (result.exitCode !== 0) {
+				if (result.exitCode !== 0 || result.stdoutTruncated) {
 					this.#cachedGitStatus = null;
 					return;
 				}
 
-				const output = result.stdout.toString();
+				const output = result.stdout;
 
 				let staged = 0;
 				let unstaged = 0;

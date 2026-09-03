@@ -410,7 +410,7 @@ async function getCurrentBranch(api: CustomCommandAPI): Promise<string> {
 
 async function getGitStatus(api: CustomCommandAPI): Promise<string> {
 	try {
-		const result = await api.exec("git", ["status", "--porcelain"]);
+		const result = await api.exec("git", ["status", "--porcelain", "--untracked-files=no"], { timeout: 30000 });
 		return result.stdout;
 	} catch {
 		return "";
