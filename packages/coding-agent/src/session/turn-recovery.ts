@@ -81,6 +81,14 @@ const HTTP2_STREAM_RESET_ERROR_RE =
 // response event"). Same transport-failure class as the stall/reset entries:
 // retriable, and eligible for preserved-turn continuation on resolved tool turns.
 const PREMATURE_STREAM_CLOSE_ERROR_RE = /stream closed before a (?:finish_reason|terminal response event)/i;
+
+export function formatParkedUntilIso(untilMs: number): string {
+	const d = new Date(untilMs);
+	if (d.getUTCSeconds() === 0 && d.getUTCMilliseconds() === 0) {
+		return `${d.toISOString().slice(0, 16)}Z`;
+	}
+	return d.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
 const IMMUTABLE_ANTHROPIC_THINKING_ERROR_PATTERN =
 	/messages\.\d+\.content\.\d+.*\b(?:thinking|redacted_thinking)\b.*\blatest assistant message cannot be modified\b/is;
 
@@ -1531,7 +1539,75 @@ export class TurnRecovery {
 			const reason = parseRateLimitReason(errorMessage);
 			cooldownMs = reason === "UNKNOWN" ? 5 * 60 * 1000 : calculateRateLimitBackoffMs(reason);
 		}
-		this.#host.modelRegistry.suppressSelector(currentSelector, Date.now() + cooldownMs);
+		const untilMs = Date.now() + cooldownMs;
+		this.#host.modelRegistry.suppressSelector(currentSelector, untilMs);
+
+		const maxDelayMs = this.#host.settings.get("retry.maxDelayMs");
+		if (retryAfterMs !== undefined && maxDelayMs > 0 && cooldownMs > maxDelayMs) {
+			const resetTimeIso = formatParkedUntilIso(untilMs);
+			const modelLabel = currentSelector.split("/").pop() ?? currentSelector;
+			void this.#host.emitSessionEvent({
+				type: "notice",
+				level: "warning",
+				source: "retry-fallback",
+				message: `${modelLabel} parked until ${resetTimeIso}`,
+			});
+		}
+	}
+
+	/**
+	 * When the active model is parked on cooldown, advance to an available fallback candidate
+	 * or surface the parked notice if no candidate is available.
+	 */
+	async maybeAdvanceSuppressedActiveModel(): Promise<boolean> {
+		const currentModel = this.#host.model();
+		if (!currentModel) return false;
+		const currentSelector = formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel());
+		const parsed = parseRetryFallbackSelector(currentSelector, this.#host.modelRegistry);
+		if (!parsed || !this.isRetryFallbackSelectorSuppressed(parsed)) return false;
+
+		const untilMs = this.#host.modelRegistry.getSelectorSuppressedUntil(currentSelector);
+		if (!untilMs) return false;
+		const maxDelayMs = this.#host.settings.get("retry.maxDelayMs");
+		if (maxDelayMs > 0 && untilMs - Date.now() <= maxDelayMs) {
+			return false;
+		}
+
+		const resetTimeIso = formatParkedUntilIso(untilMs);
+		const modelLabel = currentModel.id;
+
+		for (const role of this.retryFallbackChainKeys(currentSelector, currentModel)) {
+			for (const selector of this.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
+				if (this.isRetryFallbackSelectorSuppressed(selector)) continue;
+				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
+				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
+				if (!candidate) continue;
+				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
+				if (!apiKey) continue;
+
+				const targetSelector = formatModelStringWithRouting(candidate);
+				await this.#host.setModelWithProviderSessionReset(candidate);
+				this.#host.sessionManager.appendModelChange(targetSelector, EPHEMERAL_MODEL_CHANGE_ROLE);
+				this.#host.settings.getStorage()?.recordModelUsage(targetSelector);
+				await this.#host.emitSessionEvent({
+					type: "retry_fallback_applied",
+					from: currentSelector,
+					to: targetSelector,
+					role,
+				});
+				return true;
+			}
+		}
+
+		if (resetTimeIso) {
+			await this.#host.emitSessionEvent({
+				type: "notice",
+				level: "warning",
+				source: "retry-fallback",
+				message: `${modelLabel} parked until ${resetTimeIso}`,
+			});
+		}
+		return false;
 	}
 
 	/**
@@ -2365,12 +2441,18 @@ export class TurnRecovery {
 		// contents, not model health (issue #8760). Keep it on the same model; the
 		// retry budget still bounds a genuinely stuck stream.
 		const thinkingLoop = AIError.is(id, AIError.Flag.ThinkingLoop);
+		const maxDelayMs = retrySettings.maxDelayMs;
+		const quotaDelayExceedsBudget =
+			(usageLimit || parsedRetryAfterMs !== undefined) &&
+			maxDelayMs > 0 &&
+			(parsedRetryAfterMs ?? delayMs) > maxDelayMs;
 		const requiresImmediateModelFallback =
 			terminalRetryBudgetExhausted ||
 			classifierRefusal ||
 			usageLimit ||
 			authFailure ||
 			accountPolicyDenial ||
+			quotaDelayExceedsBudget ||
 			options?.hardErrorFallback === true;
 		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector) {
 			// A refusal chain stops at the retry budget: the exhausted-attempt
@@ -2483,16 +2565,23 @@ export class TurnRecovery {
 		// subagent (or interactive session) silently hung. The original
 		// assistant error message is preserved in agent state so the caller
 		// can act on it.
-		const maxDelayMs = retrySettings.maxDelayMs;
 		if (maxDelayMs > 0 && delayMs > maxDelayMs && !switchedCredential && !switchedModel) {
+			if (currentSelector) {
+				this.noteRetryFallbackCooldown(currentSelector, delayMs, errorMessage);
+			}
 			await this.persistTerminalEmptyErrorTurn(message);
 			const attempt = this.#retryAttempt;
 			this.#resetRetryAttempts();
+			const untilMs = Date.now() + delayMs;
+			const resetTimeIso = formatParkedUntilIso(untilMs);
+			const modelLabel = currentModel?.id ?? currentSelector ?? "Provider";
+			const finalError = `${modelLabel} parked until ${resetTimeIso}: retry delay (${delayMs}ms) exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`;
+			message.errorMessage = finalError;
 			await this.#host.emitSessionEvent({
 				type: "auto_retry_end",
 				success: false,
 				attempt,
-				finalError: `Provider requested ${delayMs}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`,
+				finalError,
 			});
 			this.#clearPendingRetryErrors();
 			this.resolveRetry();

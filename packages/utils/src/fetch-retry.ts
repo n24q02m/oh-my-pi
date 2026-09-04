@@ -1,7 +1,20 @@
 import { scheduler } from "node:timers/promises";
 
-// "reset after 1h2m3s" / "10m15s" / "39s"
-const QUOTA_RESET_PATTERN = /reset after (?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s/i;
+function parseDurationComponentsMs(text: string): number | undefined {
+	const match = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?$/i.exec(text.trim());
+	if (!match || (!match[1] && !match[2] && !match[3])) return undefined;
+	const hours = match[1] ? Number.parseInt(match[1], 10) : 0;
+	const minutes = match[2] ? Number.parseInt(match[2], 10) : 0;
+	const seconds = match[3] ? Number.parseFloat(match[3]) : 0;
+	const totalMs = ((hours * 60 + minutes) * 60 + seconds) * 1000;
+	return totalMs > 0 ? totalMs : undefined;
+}
+
+// "reset after 1h2m3s" / "10m15s" / "39s" / "51h59m"
+const QUOTA_RESET_PATTERN = /reset after\s+(?:(\d+)h)?(?:(\d+)m)?(?:(\d+(?:\.\d+)?)s)?\b/i;
+// "quotaResetDelay": "51h59m" / quotaResetDelay of 51h59m / quotaResetDelay: 51h59m
+const QUOTA_RESET_DELAY_PATTERN =
+	/(?:"quotaResetDelay"|quotaResetDelay)(?:\s*[:=]\s*|\s+of\s+|\s+)"?([0-9a-zA-Z.]+)"?/i;
 // "Please retry in 250ms" / "Please retry in 12s"
 const PLEASE_RETRY_PATTERN = /Please retry in ([0-9.]+)(ms|s)/i;
 // JSON field: "retryDelay": "34.074824224s"
@@ -75,15 +88,20 @@ export function extractRetryHint(source: Response | Headers | null | undefined, 
 
 	if (!body) return undefined;
 
+	const quotaResetDelayMatch = QUOTA_RESET_DELAY_PATTERN.exec(body);
+	if (quotaResetDelayMatch?.[1]) {
+		const cleaned = quotaResetDelayMatch[1].replace(/["']/g, "");
+		const parsed = parseDurationComponentsMs(cleaned);
+		if (parsed !== undefined) return parsed;
+	}
+
 	const quotaMatch = QUOTA_RESET_PATTERN.exec(body);
-	if (quotaMatch) {
+	if (quotaMatch && (quotaMatch[1] || quotaMatch[2] || quotaMatch[3])) {
 		const hours = quotaMatch[1] ? Number.parseInt(quotaMatch[1], 10) : 0;
 		const minutes = quotaMatch[2] ? Number.parseInt(quotaMatch[2], 10) : 0;
-		const seconds = Number.parseFloat(quotaMatch[3]!);
-		if (!Number.isNaN(seconds)) {
-			const totalMs = ((hours * 60 + minutes) * 60 + seconds) * 1000;
-			if (totalMs > 0) return totalMs;
-		}
+		const seconds = quotaMatch[3] ? Number.parseFloat(quotaMatch[3]) : 0;
+		const totalMs = ((hours * 60 + minutes) * 60 + seconds) * 1000;
+		if (totalMs > 0) return totalMs;
 	}
 	// Account-reset hints ("will reset in …") take precedence over short
 	// retry hints ("please retry in 5s"): a body carrying both must honour the

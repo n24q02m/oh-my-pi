@@ -5960,6 +5960,7 @@ export class AgentSession {
 		try {
 			this.#resetPromptMaintenanceState();
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
+			await this.#recovery.maybeAdvanceSuppressedActiveModel();
 			if (!(await this.#runUsageAwarePreflightForNextModelCall())) return false;
 			// Flush any pending bash messages before the new prompt
 			await this.#bash.flushPending();

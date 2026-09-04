@@ -2763,6 +2763,23 @@ export class ModelRegistry {
 	}
 
 	/**
+	 * Return the suppression expiry timestamp for a model selector, or undefined if not currently suppressed.
+	 */
+	getSelectorSuppressedUntil(selector: string): number | undefined {
+		const normalizedSelector = normalizeSuppressedSelector(
+			selector,
+			(provider, id) => this.find(provider, id) !== undefined,
+		);
+		const suppressedUntil = this.#suppressedSelectors.get(normalizedSelector);
+		if (!suppressedUntil) return undefined;
+		if (suppressedUntil <= Date.now()) {
+			this.#suppressedSelectors.delete(normalizedSelector);
+			return undefined;
+		}
+		return suppressedUntil;
+	}
+
+	/**
 	 * Clear the cooldown suppression for one selector after an explicit user selection.
 	 */
 	clearSuppressedSelector(selector: string): void {

@@ -6746,4 +6746,143 @@ describe("AgentSession retry fallback", () => {
 		expect(retryEnds).toEqual([expect.objectContaining({ success: true })]);
 		expect(getLastAssistantMessage(session).content).toEqual([{ type: "text", text: "ok:cursor-after-retry" }]);
 	});
+
+	it("parks quota-exhausted provider when quotaResetDelay exceeds retry.maxDelayMs and propagates reset time to notice and error", async () => {
+		const gemini = getBundledModel("google-antigravity", "gemini-3.7-flash");
+		const sonnet = getBundledModel("google-antigravity", "claude-sonnet-4-6");
+		if (!gemini || !sonnet) {
+			throw new Error("Expected bundled gemini and sonnet models to exist");
+		}
+		const geminiSelector = `${gemini.provider}/${gemini.id}`;
+		const sonnetSelector = `${sonnet.provider}/${sonnet.id}`;
+		authStorage.setRuntimeApiKey("google-antigravity", "antigravity-test-key");
+
+		const requested: string[] = [];
+		const applied: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const notices: string[] = [];
+		const retryEnds: AutoRetryEndEvent[] = [];
+		const mock = createMockModel();
+
+		// Fixed reference time for deterministic ISO assertions
+		// 2026-09-02T11:50:00.000Z + 51h59m = 2026-09-04T15:49:00.000Z
+		const fixedNow = Date.parse("2026-09-02T11:50:00.000Z");
+		vi.spyOn(Date, "now").mockReturnValue(fixedNow);
+
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: gemini, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				const selector = `${model.provider}/${model.id}`;
+				requested.push(selector);
+				if (selector === geminiSelector) {
+					mock.push({
+						throw: 'Google 429 RESOURCE_EXHAUSTED with "quotaResetDelay": "51h59m"',
+					});
+				} else if (selector === sonnetSelector) {
+					mock.push({ content: ["ok:sonnet"] });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.maxRetries": 2,
+			"retry.baseDelayMs": 1000,
+			"retry.maxDelayMs": 300_000, // 5 minutes < 51h59m
+			"retry.modelFallback": true,
+			"retry.fallbackChains": {
+				[geminiSelector]: [sonnetSelector],
+			},
+		});
+		settings.setModelRole("default", geminiSelector);
+
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") applied.push(event);
+			if (event.type === "notice") notices.push(event.message);
+			if (event.type === "auto_retry_end") retryEnds.push(event);
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("Trigger quotaResetDelay parking");
+		await session.waitForIdle();
+
+		// 1. Gemini was called once, not retried repeatedly
+		expect(requested).toEqual([geminiSelector, sonnetSelector]);
+		// 2. Fallback applied to sonnet
+		expect(applied.map(event => event.to)).toEqual([sonnetSelector]);
+		// 3. User notice emitted with concrete ISO reset timestamp
+		expect(notices).toContain("gemini-3.7-flash parked until 2026-09-04T15:49Z");
+		// 4. Gemini is suppressed (parked) in model registry
+		expect(modelRegistry.isSelectorSuppressed(geminiSelector)).toBe(true);
+		expect(modelRegistry.getSelectorSuppressedUntil(geminiSelector)).toBe(fixedNow + (51 * 60 + 59) * 60_000);
+		// 5. Turn completed on sonnet
+		expect(getLastAssistantMessage(session).content).toEqual([{ type: "text", text: "ok:sonnet" }]);
+
+		// Subsequent turn: gemini remains parked and is skipped by fallback traversals
+		await session.prompt("Subsequent turn while gemini is parked");
+		await session.waitForIdle();
+		// Stays on sonnet, does not attempt gemini
+		expect(requested).toEqual([geminiSelector, sonnetSelector, sonnetSelector]);
+	});
+
+	it("parks quota-exhausted provider and surfaces reset time in terminal error when no fallback is available", async () => {
+		const gemini = getBundledModel("google-antigravity", "gemini-3.7-flash");
+		if (!gemini) throw new Error("Expected gemini model");
+		const geminiSelector = `${gemini.provider}/${gemini.id}`;
+		authStorage.setRuntimeApiKey("google-antigravity", "antigravity-test-key");
+
+		const requested: string[] = [];
+		const notices: string[] = [];
+		const retryEnds: AutoRetryEndEvent[] = [];
+		const mock = createMockModel();
+
+		const fixedNow = Date.parse("2026-09-02T11:50:00.000Z");
+		vi.spyOn(Date, "now").mockReturnValue(fixedNow);
+
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: gemini, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				mock.push({
+					throw: 'Google 429 RESOURCE_EXHAUSTED with "quotaResetDelay": "51h59m"',
+				});
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.maxRetries": 2,
+			"retry.baseDelayMs": 1000,
+			"retry.maxDelayMs": 300_000,
+			"retry.modelFallback": false, // No fallback
+		});
+		settings.setModelRole("default", geminiSelector);
+
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+			if (event.type === "auto_retry_end") retryEnds.push(event);
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("Trigger fail-fast parking without fallback");
+		await session.waitForIdle();
+
+		// Gemini was attempted once, fail-fast triggered without immediate retry
+		expect(requested).toEqual([geminiSelector]);
+		// Parked notice emitted
+		expect(notices).toContain("gemini-3.7-flash parked until 2026-09-04T15:49Z");
+		// Node is parked in registry
+		expect(modelRegistry.isSelectorSuppressed(geminiSelector)).toBe(true);
+		// auto_retry_end emitted with finalError containing parked reset time
+		expect(retryEnds).toHaveLength(1);
+		expect(retryEnds[0].success).toBe(false);
+		expect(retryEnds[0].finalError).toContain("gemini-3.7-flash parked until 2026-09-04T15:49Z");
+	});
 });
