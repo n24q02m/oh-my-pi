@@ -13,6 +13,7 @@
 ### Fixed
 
 - Fixed retry fallback traversal to give each selected model its own retry budget, avoid revisiting candidates during a prompt, and defer restoration of a previously attempted primary until the next prompt.
+- Park quota-exhausted provider nodes when the server-provided reset delay exceeds `retry.maxDelayMs`, propagating the concrete reset time into notices and terminal errors and skipping parked nodes across subsequent turns and fallback traversals.
 
 ## [18.0.11] - 2026-08-29
 
