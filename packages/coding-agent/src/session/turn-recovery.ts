@@ -2503,9 +2503,39 @@ export class TurnRecovery {
 			quotaDelayExceedsBudget ||
 			options?.hardErrorFallback === true;
 		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector) {
+			// and the account exposes Luna Reserve with remaining capacity, hop to gpt-reserve
+			// before walking external fallback chains.
+			if (
+				allowModelFallback &&
+				retrySettings.modelFallback &&
+				usageLimit &&
+				currentModel &&
+				currentModel.provider === "openai-codex" &&
+				(currentModel.id.toLowerCase().includes("luna") || currentModel.id.toLowerCase().startsWith("gpt-5.6")) &&
+				currentModel.id !== "gpt-reserve"
+			) {
+				const reserveSelector = parseRetryFallbackSelector("openai-codex/gpt-reserve", this.#host.modelRegistry);
+				if (reserveSelector && !this.isRetryFallbackSelectorSuppressed(reserveSelector)) {
+					const hasReserve = await this.#host.modelRegistry.authStorage.hasCodexLunaReserveCapacity(
+						this.#host.sessionId(),
+					);
+					if (hasReserve) {
+						switchedModel = await this.applyRetryFallbackCandidate(
+							"openai-codex/*",
+							reserveSelector,
+							currentSelector,
+							{
+								pinFallback: true,
+							},
+						);
+					}
+				}
+			}
+
 			// A refusal chain stops at the retry budget: the exhausted-attempt
 			// last resort is for provider failures, not classifier decisions.
 			if (
+				!switchedModel &&
 				allowModelFallback &&
 				retrySettings.modelFallback &&
 				!thinkingLoop &&
