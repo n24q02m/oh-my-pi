@@ -269,6 +269,7 @@ type UsageLimitOutcome = {
 type RetryFallbackSkipReason =
 	| "already-attempted"
 	| "auth-unavailable"
+	| "no-credentials"
 	| "context-too-large"
 	| "cooldown"
 	| "effort-ceiling-incompatible"
@@ -335,6 +336,7 @@ export class TurnRecovery {
 	 * cannot reopen an earlier node in a finite configured chain.
 	 */
 	#retryFallbackTraversal: { generation: number; selectors: Set<string> } | undefined;
+	#lastFallbackChainSummary: string | undefined;
 
 	constructor(host: TurnRecoveryHost, options: TurnRecoveryOptions = {}) {
 		this.#host = host;
@@ -449,6 +451,11 @@ export class TurnRecovery {
 		};
 		this.#bootstrapCache = { model, level, routed: this.#fallbackRouted, value };
 		return value;
+	}
+
+	/** Details of all skipped nodes when a fallback chain was traversed and exhausted. */
+	get lastFallbackChainSummary(): string | undefined {
+		return this.#lastFallbackChainSummary;
 	}
 
 	/**
@@ -1952,6 +1959,8 @@ export class TurnRecovery {
 		const traversalSelectors = this.#retryFallbackTraversalSelectors();
 		const current = parseRetryFallbackSelector(currentSelector, this.#host.modelRegistry);
 		if (current) traversalSelectors.add(this.#retryFallbackTraversalKey(current));
+		this.#lastFallbackChainSummary = undefined;
+		const skippedNodes = new Map<string, string>();
 		for (const role of this.retryFallbackChainKeys(currentSelector)) {
 			for (const selector of this.findRetryFallbackCandidates(role, currentSelector)) {
 				const selectorKey = this.#retryFallbackTraversalKey(selector);
@@ -1962,11 +1971,22 @@ export class TurnRecovery {
 						role,
 						from: currentSelector,
 					});
+					if (!skippedNodes.has(selector.raw)) {
+						skippedNodes.set(selector.raw, "hard-error");
+					}
 					continue;
 				}
 				traversalSelectors.add(selectorKey);
 				if (this.isRetryFallbackSelectorSuppressed(selector)) {
 					await this.#emitRetryFallbackSkipNotice({ selector, reason: "cooldown", role, from: currentSelector });
+					if (!skippedNodes.has(selector.raw)) {
+						const untilMs = this.#host.modelRegistry.getSelectorSuppressedUntil(selector.raw);
+						const reasonDesc =
+							untilMs && untilMs > Date.now()
+								? `quota-exhausted-until ${formatParkedUntilIso(untilMs)}`
+								: "cooldown";
+						skippedNodes.set(selector.raw, reasonDesc);
+					}
 					continue;
 				}
 				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
@@ -1978,6 +1998,9 @@ export class TurnRecovery {
 						role,
 						from: currentSelector,
 					});
+					if (!skippedNodes.has(selector.raw)) {
+						skippedNodes.set(selector.raw, "model-unavailable");
+					}
 					continue;
 				}
 				// Anthropic signatures and redacted blocks are model-bound, while the
@@ -2002,6 +2025,9 @@ export class TurnRecovery {
 						role,
 						from: currentSelector,
 					});
+					if (!skippedNodes.has(selector.raw)) {
+						skippedNodes.set(selector.raw, "signed-anthropic-thinking-incompatible");
+					}
 					continue;
 				}
 				// A candidate whose effort floor exceeds the per-spawn ceiling would be
@@ -2013,6 +2039,9 @@ export class TurnRecovery {
 						role,
 						from: currentSelector,
 					});
+					if (!skippedNodes.has(selector.raw)) {
+						skippedNodes.set(selector.raw, "effort-ceiling-incompatible");
+					}
 					continue;
 				}
 				if (retryContextHasImage && !candidate.input.includes("image")) {
@@ -2022,6 +2051,9 @@ export class TurnRecovery {
 						role,
 						from: currentSelector,
 					});
+					if (!skippedNodes.has(selector.raw)) {
+						skippedNodes.set(selector.raw, "image-input-incompatible");
+					}
 					continue;
 				}
 				if (retryRequestHasTools && candidate.supportsTools === false) {
@@ -2031,6 +2063,9 @@ export class TurnRecovery {
 						role,
 						from: currentSelector,
 					});
+					if (!skippedNodes.has(selector.raw)) {
+						skippedNodes.set(selector.raw, "tool-use-incompatible");
+					}
 					continue;
 				}
 				// Skip a candidate whose window cannot hold the retry context. The
@@ -2043,6 +2078,9 @@ export class TurnRecovery {
 						role,
 						from: currentSelector,
 					});
+					if (!skippedNodes.has(selector.raw)) {
+						skippedNodes.set(selector.raw, "context-too-large");
+					}
 					continue;
 				}
 				let apiKey: string | undefined;
@@ -2051,13 +2089,16 @@ export class TurnRecovery {
 				} catch {
 					apiKey = undefined;
 				}
-				if (!apiKey) {
+				if (!apiKey || (typeof apiKey === "string" && !apiKey.trim())) {
 					await this.#emitRetryFallbackSkipNotice({
 						selector,
 						reason: "auth-unavailable",
 						role,
 						from: currentSelector,
 					});
+					if (!skippedNodes.has(selector.raw)) {
+						skippedNodes.set(selector.raw, "no-credentials");
+					}
 					continue;
 				}
 				return this.applyRetryFallbackCandidate(role, selector, currentSelector, {
@@ -2065,6 +2106,13 @@ export class TurnRecovery {
 					pinFallback: options?.pinFallback,
 				});
 			}
+		}
+
+		if (skippedNodes.size > 0) {
+			const summary = Array.from(skippedNodes.entries())
+				.map(([sel, r]) => `${sel} (${r})`)
+				.join(", ");
+			this.#lastFallbackChainSummary = summary;
 		}
 
 		return false;
@@ -2490,14 +2538,21 @@ export class TurnRecovery {
 		if (terminalRetryBudgetExhausted) {
 			if (!switchedModel && !switchedCredential) {
 				const attempt = classifierRefusal ? this.#retryAttempt - 1 : this.#sameModelRetryAttempt - 1;
-				message.errorMessage = `Retry budget exhausted after ${attempt} ${attempt === 1 ? "retry" : "retries"}: ${errorMessage}`;
+				const baseError = `Retry budget exhausted after ${attempt} ${attempt === 1 ? "retry" : "retries"}: ${errorMessage}`;
+				const finalTurnError = this.#lastFallbackChainSummary
+					? `Fallback chain exhausted: ${this.#lastFallbackChainSummary}. ${baseError}`
+					: baseError;
+				message.errorMessage = finalTurnError;
 				await this.persistTerminalEmptyErrorTurn(message);
 				const retryErrors = await this.#markPendingRetryErrors({ status: "superseded" });
+				const finalEndError = this.#lastFallbackChainSummary
+					? `Fallback chain exhausted: ${this.#lastFallbackChainSummary}. ${errorMessage}`
+					: errorMessage;
 				await this.#host.emitSessionEvent({
 					type: "auto_retry_end",
 					success: false,
 					attempt,
-					finalError: errorMessage,
+					finalError: finalEndError,
 					retryErrors,
 				});
 				this.#clearPendingRetryErrors();
@@ -2542,14 +2597,36 @@ export class TurnRecovery {
 			!switchedModel &&
 			!this.isRetryableError(message)
 		) {
-			// Same auto_retry_end backstop as the classifier-refusal branch above.
+			const finalError = this.#lastFallbackChainSummary
+				? `Fallback chain exhausted: ${this.#lastFallbackChainSummary}. Original error: ${errorMessage}`
+				: errorMessage;
+			message.errorMessage = finalError;
 			if (this.#retryAttempt > 1) {
 				await this.persistTerminalEmptyErrorTurn(message);
 				await this.#host.emitSessionEvent({
 					type: "auto_retry_end",
 					success: false,
 					attempt: this.#retryAttempt - 1,
-					finalError: errorMessage,
+					finalError,
+				});
+				this.#clearPendingRetryErrors();
+			}
+			this.#resetRetryAttempts();
+			this.resolveRetry();
+			return false;
+		}
+		if (authFailure && !switchedCredential && !switchedModel) {
+			const finalError = this.#lastFallbackChainSummary
+				? `Fallback chain exhausted: ${this.#lastFallbackChainSummary}. Original error: ${errorMessage}`
+				: errorMessage;
+			message.errorMessage = finalError;
+			if (this.#retryAttempt > 1) {
+				await this.persistTerminalEmptyErrorTurn(message);
+				await this.#host.emitSessionEvent({
+					type: "auto_retry_end",
+					success: false,
+					attempt: this.#retryAttempt - 1,
+					finalError,
 				});
 				this.#clearPendingRetryErrors();
 			}
@@ -2575,7 +2652,10 @@ export class TurnRecovery {
 			const untilMs = Date.now() + delayMs;
 			const resetTimeIso = formatParkedUntilIso(untilMs);
 			const modelLabel = currentModel?.id ?? currentSelector ?? "Provider";
-			const finalError = `${modelLabel} parked until ${resetTimeIso}: retry delay (${delayMs}ms) exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`;
+			const baseError = `${modelLabel} parked until ${resetTimeIso}: retry delay (${delayMs}ms) exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`;
+			const finalError = this.#lastFallbackChainSummary
+				? `Fallback chain exhausted: ${this.#lastFallbackChainSummary}. ${baseError}`
+				: baseError;
 			message.errorMessage = finalError;
 			await this.#host.emitSessionEvent({
 				type: "auto_retry_end",
