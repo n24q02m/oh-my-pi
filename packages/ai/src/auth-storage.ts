@@ -4127,6 +4127,47 @@ export class AuthStorage {
 	}
 
 	/**
+	 * Check whether the active OpenAI Codex account exposes the Luna Reserve
+	 * (`base-model-inference` / `gpt-reserve`) meter with remaining capacity.
+	 */
+	async hasCodexLunaReserveCapacity(sessionId?: string): Promise<boolean> {
+		const sessionCredential = this.#getSessionCredential("openai-codex", sessionId);
+		const credentials = this.#getStoredCredentials("openai-codex");
+		const target = sessionCredential
+			? credentials[sessionCredential.index]
+			: credentials.find(c => c.credential.type === "oauth");
+		if (!target || target.credential.type !== "oauth") return false;
+
+		let report: UsageReport | null = null;
+		try {
+			report = await this.#getUsageReport("openai-codex", target.credential, {
+				timeoutMs: this.#usageRequestTimeoutMs,
+			});
+		} catch {
+			report = null;
+		}
+		if (!report || !Array.isArray(report.limits)) return false;
+
+		const reserveLimit = report.limits.find(limit => {
+			const id = limit.id.toLowerCase();
+			const tier = limit.scope?.tier?.toLowerCase();
+			return (
+				id.includes("base-model-inference") ||
+				id.includes("gpt-reserve") ||
+				tier === "base-model-inference" ||
+				tier === "gpt-reserve"
+			);
+		});
+
+		if (!reserveLimit) return false;
+		if (reserveLimit.status === "exhausted") return false;
+		if (reserveLimit.amount?.usedFraction !== undefined && reserveLimit.amount.usedFraction >= 1) return false;
+		if (reserveLimit.amount?.remainingFraction !== undefined && reserveLimit.amount.remainingFraction <= 0)
+			return false;
+		return true;
+	}
+
+	/**
 	 * Fetch every requested report, keeping normal polls parallel while a
 	 * manually invalidated provider probes accounts one at a time.
 	 */

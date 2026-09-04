@@ -7039,4 +7039,137 @@ describe("AgentSession retry fallback", () => {
 		expect(lastMessage.errorMessage).toContain(`${parkedSelector} (quota-exhausted-until 2026-09-04T15:49Z)`);
 		expect(lastMessage.errorMessage).toContain("fatal unrecoverable primary fault");
 	});
+
+	it("hops from chat-exhausted Luna to gpt-reserve when reserve meter is available", async () => {
+		const luna =
+			modelRegistry.find("openai-codex", "gpt-5.6-luna") ?? modelRegistry.find("openai-codex", "gpt-5.6-sol");
+		const externalFallback = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!luna || !externalFallback) {
+			throw new Error("Expected test models to resolve");
+		}
+
+		vi.spyOn(modelRegistry.authStorage, "hasCodexLunaReserveCapacity").mockResolvedValue(true);
+		vi.spyOn(modelRegistry.authStorage, "markUsageLimitReached").mockResolvedValue({ switched: false });
+		vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const requested: string[] = [];
+		const fallbackApplied: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const mock = createMockModel();
+
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: luna, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				if (model.id === luna.id) {
+					mock.push({ throw: "429 usage_limit_reached" });
+				} else {
+					mock.push({ content: ["ok:luna-reserve"] });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const lunaSelector = `${luna.provider}/${luna.id}`;
+		const externalSelector = `${externalFallback.provider}/${externalFallback.id}`;
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				"openai-codex/*": [externalSelector],
+			},
+		});
+		settings.setModelRole("default", lunaSelector);
+
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") fallbackApplied.push(event);
+		});
+		await session.prompt("Trigger Luna Reserve hop");
+		await session.waitForIdle();
+
+		// 1. Primary was called and hit usage limit
+		expect(requested).toContain(lunaSelector);
+		// 2. Hopped to gpt-reserve rather than external provider
+		expect(fallbackApplied).toEqual([
+			{
+				type: "retry_fallback_applied",
+				from: lunaSelector,
+				to: "openai-codex/gpt-reserve",
+				role: "openai-codex/*",
+			},
+		]);
+		expect(requested).toContain("openai-codex/gpt-reserve");
+		expect(requested).not.toContain(externalSelector);
+		expect(getLastAssistantMessage(session).content).toEqual([{ type: "text", text: "ok:luna-reserve" }]);
+	});
+
+	it("preserves normal fallback when Luna reserve meter is absent or exhausted", async () => {
+		const luna =
+			modelRegistry.find("openai-codex", "gpt-5.6-luna") ?? modelRegistry.find("openai-codex", "gpt-5.6-sol");
+		const externalFallback = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!luna || !externalFallback) {
+			throw new Error("Expected test models to resolve");
+		}
+
+		// Reserve absent or exhausted
+		vi.spyOn(modelRegistry.authStorage, "hasCodexLunaReserveCapacity").mockResolvedValue(false);
+		vi.spyOn(modelRegistry.authStorage, "markUsageLimitReached").mockResolvedValue({ switched: false });
+		vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const requested: string[] = [];
+		const fallbackApplied: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const mock = createMockModel();
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: luna, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				if (model.id === luna.id) {
+					mock.push({ throw: "429 usage_limit_reached" });
+				} else {
+					mock.push({ content: ["ok:external-fallback"] });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const lunaSelector = `${luna.provider}/${luna.id}`;
+		const externalSelector = `${externalFallback.provider}/${externalFallback.id}`;
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				"openai-codex/*": [externalSelector],
+			},
+		});
+		settings.setModelRole("default", lunaSelector);
+
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") fallbackApplied.push(event);
+		});
+
+		await session.prompt("Trigger standard fallback without reserve");
+		await session.waitForIdle();
+
+		// 1. Primary was called and hit usage limit
+		expect(requested).toContain(lunaSelector);
+		// 2. Normal fallback chain was used (external provider)
+		expect(fallbackApplied).toEqual([
+			{
+				type: "retry_fallback_applied",
+				from: lunaSelector,
+				to: externalSelector,
+				role: "openai-codex/*",
+			},
+		]);
+		expect(requested).toContain(externalSelector);
+		expect(requested).not.toContain("openai-codex/gpt-reserve");
+		expect(getLastAssistantMessage(session).content).toEqual([{ type: "text", text: "ok:external-fallback" }]);
+	});
 });
