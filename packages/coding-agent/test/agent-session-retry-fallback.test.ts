@@ -6885,4 +6885,160 @@ describe("AgentSession retry fallback", () => {
 		expect(retryEnds[0].success).toBe(false);
 		expect(retryEnds[0].finalError).toContain("gemini-3.7-flash parked until 2026-09-04T15:49Z");
 	});
+
+	it("skips credential-less fallback nodes during traversal and continues to subsequent candidates", async () => {
+		const primary = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		const credentialLess = modelRegistry.find("openai", "gpt-4o-mini");
+		const validFallback = modelRegistry.find("openai", "gpt-4o");
+		if (!primary || !credentialLess || !validFallback) {
+			throw new Error("Expected test models to resolve");
+		}
+
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId) => {
+			if (model.provider === credentialLess.provider && model.id === credentialLess.id) {
+				return undefined; // no credentials
+			}
+			if (model.provider === validFallback.provider && model.id === validFallback.id) {
+				return "valid-openai-key";
+			}
+			return originalGetApiKey(model, sessionId);
+		});
+
+		const requested: string[] = [];
+		const fallbackApplied: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const notices: string[] = [];
+		const mock = createMockModel();
+
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				if (model.id === primary.id) {
+					mock.push({ throw: "unrecoverable primary error" });
+				} else {
+					mock.push({ content: ["ok:valid-fallback"] });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const primarySelector = `${primary.provider}/${primary.id}`;
+		const credLessSelector = `${credentialLess.provider}/${credentialLess.id}`;
+		const validSelector = `${validFallback.provider}/${validFallback.id}`;
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				[primarySelector]: [credLessSelector, validSelector],
+			},
+		});
+		settings.setModelRole("default", primarySelector);
+
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+			if (event.type === "retry_fallback_applied") fallbackApplied.push(event);
+		});
+
+		await session.prompt("Run fallback with credential-less node in chain");
+		await session.waitForIdle();
+
+		// 1. Primary was called and failed
+		expect(requested).toContain(primarySelector);
+		// 2. Credential-less node was skipped with notice, not invoked
+		expect(requested).not.toContain(credLessSelector);
+		expect(notices).toContain(
+			`Retry fallback skipped [auth-unavailable]: selector=${credLessSelector} from=${primarySelector} role=${primarySelector}`,
+		);
+		// 3. Fallback continued to validSelector and succeeded
+		expect(fallbackApplied).toEqual([
+			{
+				type: "retry_fallback_applied",
+				from: primarySelector,
+				to: validSelector,
+				role: primarySelector,
+			},
+		]);
+		expect(requested).toContain(validSelector);
+		expect(getLastAssistantMessage(session).content).toEqual([{ type: "text", text: "ok:valid-fallback" }]);
+	});
+
+	it("enumerates all skip reasons in the aggregated error when a fallback chain is exhausted", async () => {
+		const primary = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		const credLess = modelRegistry.find("openai", "gpt-4o-mini");
+		const parked = modelRegistry.find("openai", "gpt-4o");
+		if (!primary || !credLess || !parked) {
+			throw new Error("Expected test models to resolve");
+		}
+
+		const fixedUntil = Date.parse("2026-09-04T15:49:00.000Z");
+		const parkedSelector = `${parked.provider}/${parked.id}`;
+		modelRegistry.suppressSelector(parkedSelector, fixedUntil);
+
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId) => {
+			if (model.id === credLess.id) {
+				return undefined; // no credentials
+			}
+			return originalGetApiKey(model, sessionId);
+		});
+
+		const requested: string[] = [];
+		const notices: string[] = [];
+		const retryEnds: Array<Extract<AgentSessionEvent, { type: "auto_retry_end" }>> = [];
+		const mock = createMockModel();
+
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				mock.push({ throw: "fatal unrecoverable primary fault" });
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const primarySelector = `${primary.provider}/${primary.id}`;
+		const credLessSelector = `${credLess.provider}/${credLess.id}`;
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				[primarySelector]: [credLessSelector, parkedSelector],
+			},
+		});
+		settings.setModelRole("default", primarySelector);
+
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+			if (event.type === "auto_retry_end") retryEnds.push(event);
+		});
+
+		await session.prompt("Run fallback when all nodes in chain are skipped");
+		await session.waitForIdle();
+
+		// Primary failed
+		expect(requested).toEqual([primarySelector]);
+		// Notices for both skipped nodes
+		expect(notices).toContain(
+			`Retry fallback skipped [auth-unavailable]: selector=${credLessSelector} from=${primarySelector} role=${primarySelector}`,
+		);
+		expect(notices).toContain(
+			`Retry fallback skipped [cooldown]: selector=${parkedSelector} from=${primarySelector} role=${primarySelector}`,
+		);
+		// Chain exhausted, terminal error aggregates skip reasons
+		const lastMessage = getLastAssistantMessage(session);
+		expect(lastMessage.stopReason).toBe("error");
+		expect(lastMessage.errorMessage).toContain("Fallback chain exhausted:");
+		expect(lastMessage.errorMessage).toContain(`${credLessSelector} (no-credentials)`);
+		expect(lastMessage.errorMessage).toContain(`${parkedSelector} (quota-exhausted-until 2026-09-04T15:49Z)`);
+		expect(lastMessage.errorMessage).toContain("fatal unrecoverable primary fault");
+	});
 });
