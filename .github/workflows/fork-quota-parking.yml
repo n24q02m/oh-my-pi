@@ -1,0 +1,36 @@
+name: Fork quota-reset-delay-parking
+
+on:
+   pull_request:
+      branches: [fix/retry-before-fallback]
+   push:
+      branches: [fix/quota-reset-delay-parking]
+
+permissions:
+   contents: read
+
+jobs:
+   quota_parking_contract:
+      name: Quota parking contract
+      runs-on: ubuntu-22.04
+      steps:
+         - uses: actions/checkout@v4
+         - uses: ./.github/actions/bun-install
+         - name: Install release native addons
+           shell: bash
+           run: |
+              set -euo pipefail
+              tarball="$(npm view @oh-my-pi/pi-natives-linux-x64@latest dist.tarball)"
+              echo "Fetching $tarball"
+              curl -fsSL --retry 3 "$tarball" | tar -xz -C "$RUNNER_TEMP"
+              cp "$RUNNER_TEMP/package/pi_natives.linux-x64-baseline.node" packages/natives/native/
+              cp "$RUNNER_TEMP/package/pi_natives.linux-x64-modern.node" packages/natives/native/
+         - name: Run quota parking tests
+           working-directory: packages/coding-agent
+           env:
+              PI_TEST_RUNTIME: "1"
+              BUN_JSC_useConcurrentGC: "0"
+              BUN_JSC_numberOfGCMarkers: "1"
+           run: |
+              bun test test/agent-session-retry-fallback.test.ts
+              bun test ../ai/test/google-gemini-cli-429.test.ts
