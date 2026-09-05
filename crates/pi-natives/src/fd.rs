@@ -180,8 +180,9 @@ fn fuzzy_find_sync(config: FuzzyFindConfig, ct: task::CancelToken) -> Result<Fuz
 	let mut scored = if use_cache {
 		let scan = fs_cache::get_or_scan(&root, include_hidden, respect_gitignore, &ct)?;
 		let mut scored = score_entries(&scan.entries, &query_lower, &normalized_query, &ct)?;
-		// Empty-result recheck: if the query was non-trivial but produced zero matches
-		// from a cached scan that's old enough, force one rescan before giving up.
+		// Empty-result recheck: if the query was non-trivial but produced zero
+		// matches from a cached scan that's old enough, force one rescan before
+		// giving up.
 		if scored.is_empty()
 			&& !query_lower.is_empty()
 			&& scan.cache_age_ms >= fs_cache::empty_recheck_ms()

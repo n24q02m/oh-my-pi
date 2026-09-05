@@ -1037,7 +1037,8 @@ fn slice_with_width_impl(
 		}
 	}
 
-	// Include trailing ANSI sequences (e.g., reset codes) that immediately follow
+	// Include trailing ANSI sequences (e.g., reset codes) that immediately
+	// follow
 	while i < line.len() {
 		if line[i] == ESC
 			&& let Some(len) = ansi_seq_len_u16(line, i)
