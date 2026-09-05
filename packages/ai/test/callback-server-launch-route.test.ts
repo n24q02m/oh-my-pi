@@ -48,7 +48,9 @@ describe("OAuthCallbackFlow /launch route", () => {
 		// Fetch /launch with redirect manual
 		const launchResponse = await fetch(launchUrl, { redirect: "manual" });
 		expect(launchResponse.status).toBe(302);
-		expect(launchResponse.headers.get("Location")).toBe(flow.lastAuthInfo?.url);
+		const authUrl = flow.lastAuthInfo?.url;
+		if (!authUrl) throw new Error("Expected auth URL");
+		expect(launchResponse.headers.get("Location")).toBe(authUrl);
 
 		// Complete login
 		const redirectUri = new URL(launchUrl);

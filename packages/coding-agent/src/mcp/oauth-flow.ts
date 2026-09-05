@@ -25,6 +25,8 @@ export interface MCPOAuthConfig {
 	scopes?: string;
 	/** Custom callback port (default: 3000) */
 	callbackPort?: number;
+	/** Pinned redirect URI (optional; its port seeds callback-port resolution) */
+	redirectUri?: string;
 }
 function staticClientIdFromConfig(config: MCPOAuthConfig): string | undefined {
 	const fromConfig = config.clientId?.trim();
