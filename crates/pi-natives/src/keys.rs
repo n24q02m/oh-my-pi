@@ -238,9 +238,7 @@ pub fn matches_kitty_sequence(
 		&& base == expected_codepoint
 	{
 		let cp = parsed.codepoint;
-		let is_ascii_letter = u8::try_from(cp)
-			.ok()
-			.is_some_and(|b| b.is_ascii_alphabetic());
+		let is_ascii_letter = u8::try_from(cp).is_ok_and(|b| b.is_ascii_alphabetic());
 		let is_known_symbol = is_symbol_key(cp);
 		if !is_ascii_letter && !is_known_symbol {
 			return true;
@@ -483,9 +481,8 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 		if let Some(base) = parsed_base
 			&& base == codepoint
 		{
-			let is_ascii_letter = u8::try_from(parsed_codepoint)
-				.ok()
-				.is_some_and(|b| b.is_ascii_alphabetic());
+			let is_ascii_letter =
+				u8::try_from(parsed_codepoint).is_ok_and(|b| b.is_ascii_alphabetic());
 			let is_known_symbol = is_symbol_key(parsed_codepoint);
 			if !is_ascii_letter && !is_known_symbol {
 				return true;
@@ -1175,9 +1172,7 @@ fn format_kitty_key(parsed: &ParsedKittySequence) -> Option<Cow<'static, str>> {
 	let effective_mod = parsed.modifier & !LOCK_MASK;
 	let effective_codepoint = {
 		let cp = parsed.codepoint;
-		let is_ascii_letter = u8::try_from(cp)
-			.ok()
-			.is_some_and(|b| b.is_ascii_alphabetic());
+		let is_ascii_letter = u8::try_from(cp).is_ok_and(|b| b.is_ascii_alphabetic());
 		let is_known_symbol = is_symbol_key(cp);
 		if is_ascii_letter || is_known_symbol {
 			cp
