@@ -578,7 +578,7 @@ fn run_find_for_pattern(
 		} else {
 			match compile_pattern(pattern, selector, strictness, language) {
 				Ok(compiled) => {
-					compiled_cache.insert(lang_key.clone(), compiled.clone());
+					compiled_cache.insert(lang_key, compiled.clone());
 					compiled
 				},
 				Err(err) => {
@@ -599,7 +599,7 @@ fn run_find_for_pattern(
 			continue;
 		}
 
-		for matched in ast.root().find_all(compiled.clone()) {
+		for matched in ast.root().find_all(compiled) {
 			ct.heartbeat()?;
 			total_matches = total_matches.saturating_add(1);
 			let range = matched.range();

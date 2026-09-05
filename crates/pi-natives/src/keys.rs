@@ -232,15 +232,13 @@ pub fn matches_kitty_sequence(
 	}
 
 	// Only fall back to base layout key when the codepoint is NOT already a
-	// recognized ASCII letter (A-Z / a-z) or symbol. This prevents remapped layouts
-	// (Dvorak, Colemak) from causing false matches.
+	// recognized ASCII letter (A-Z / a-z) or symbol. This prevents remapped
+	// layouts (Dvorak, Colemak) from causing false matches.
 	if let Some(base) = parsed.base_layout_key
 		&& base == expected_codepoint
 	{
 		let cp = parsed.codepoint;
-		let is_ascii_letter = u8::try_from(cp)
-			.ok()
-			.is_some_and(|b| b.is_ascii_alphabetic());
+		let is_ascii_letter = u8::try_from(cp).is_ok_and(|b| b.is_ascii_alphabetic());
 		let is_known_symbol = is_symbol_key(cp);
 		if !is_ascii_letter && !is_known_symbol {
 			return true;
@@ -483,9 +481,8 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 		if let Some(base) = parsed_base
 			&& base == codepoint
 		{
-			let is_ascii_letter = u8::try_from(parsed_codepoint)
-				.ok()
-				.is_some_and(|b| b.is_ascii_alphabetic());
+			let is_ascii_letter =
+				u8::try_from(parsed_codepoint).is_ok_and(|b| b.is_ascii_alphabetic());
 			let is_known_symbol = is_symbol_key(parsed_codepoint);
 			if !is_ascii_letter && !is_known_symbol {
 				return true;
@@ -531,8 +528,8 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 				|| mok_matches(CP_TAB, MOD_SHIFT);
 		}
 
-		// alt+tab stays ESC+TAB in many legacy/kitty-disambiguate scenarios (Tab is an
-		// exception).
+		// alt+tab stays ESC+TAB in many legacy/kitty-disambiguate scenarios (Tab
+		// is an exception).
 		if modifier == MOD_ALT && bytes == b"\x1b\t" {
 			return true;
 		}
@@ -548,8 +545,8 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 	}
 
 	if key.eq_ignore_ascii_case("enter") || key.eq_ignore_ascii_case("return") {
-		// alt+enter is commonly ESC + CR even when kitty disambiguation is on (Enter is
-		// an exception).
+		// alt+enter is commonly ESC + CR even when kitty disambiguation is on
+		// (Enter is an exception).
 		if modifier == MOD_ALT && bytes == b"\x1b\r" {
 			return true;
 		}
@@ -572,8 +569,8 @@ fn matches_key_inner(bytes: &[u8], key_id: &str, kitty_protocol_active: bool) ->
 	}
 
 	if key.eq_ignore_ascii_case("backspace") {
-		// alt+backspace is commonly ESC + (DEL or BS) even in kitty disambiguate mode
-		// (Backspace is an exception).
+		// alt+backspace is commonly ESC + (DEL or BS) even in kitty disambiguate
+		// mode (Backspace is an exception).
 		if modifier == MOD_ALT {
 			return bytes == b"\x1b\x7f"
 				|| bytes == b"\x1b\x08"
@@ -982,8 +979,8 @@ fn parse_csi_u(bytes: &[u8]) -> Option<ParsedKittySequence> {
 		}
 	}
 
-	// ;modifiers:event-type   (modifiers field may be omitted OR empty if followed
-	// by ;text)
+	// ;modifiers:event-type   (modifiers field may be omitted OR empty if
+	// followed by ;text)
 	let mut mod_value: u32 = 1;
 	let mut event_type: Option<u32> = None;
 
@@ -999,7 +996,8 @@ fn parse_csi_u(bytes: &[u8]) -> Option<ParsedKittySequence> {
 			mod_value = 1;
 		}
 
-		// :event-type (allow even if modifiers were empty -> treat as modifiers=1)
+		// :event-type (allow even if modifiers were empty -> treat as
+		// modifiers=1)
 		if idx < end && bytes[idx] == b':' {
 			idx += 1;
 			let (ev, next_idx) = parse_digits(bytes, idx, end)?;
@@ -1174,9 +1172,7 @@ fn format_kitty_key(parsed: &ParsedKittySequence) -> Option<Cow<'static, str>> {
 	let effective_mod = parsed.modifier & !LOCK_MASK;
 	let effective_codepoint = {
 		let cp = parsed.codepoint;
-		let is_ascii_letter = u8::try_from(cp)
-			.ok()
-			.is_some_and(|b| b.is_ascii_alphabetic());
+		let is_ascii_letter = u8::try_from(cp).is_ok_and(|b| b.is_ascii_alphabetic());
 		let is_known_symbol = is_symbol_key(cp);
 		if is_ascii_letter || is_known_symbol {
 			cp

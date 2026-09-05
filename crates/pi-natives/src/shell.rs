@@ -811,7 +811,8 @@ async fn read_output(
 
 					match err.error_len() {
 						Some(p) => {
-							// Invalid byte sequence: emit replacement and drop those bytes.
+							// Invalid byte sequence: emit replacement and drop those
+							// bytes.
 							emit_chunk(REPLACEMENT, on_chunk.as_ref());
 							// copy p..it to the beginning of the buffer
 							buf.copy_within(p..it, 0);
@@ -820,7 +821,8 @@ async fn read_output(
 							// invalid sequence
 						},
 						None => {
-							// Incomplete UTF-8 sequence at end: keep bytes for next read.
+							// Incomplete UTF-8 sequence at end: keep bytes for next
+							// read.
 							break;
 						},
 					}
@@ -856,7 +858,8 @@ fn pipe_to_files(label: &str) -> Result<(fs::File, fs::File)> {
 		use std::os::unix::io::{FromRawFd, IntoRawFd};
 		let r = r.into_raw_fd();
 		let w = w.into_raw_fd();
-		// SAFETY: We just obtained these fds from os_pipe and own them exclusively.
+		// SAFETY: We just obtained these fds from os_pipe and own them
+		// exclusively.
 		unsafe { (FromRawFd::from_raw_fd(r), FromRawFd::from_raw_fd(w)) }
 	};
 
@@ -865,7 +868,8 @@ fn pipe_to_files(label: &str) -> Result<(fs::File, fs::File)> {
 		use std::os::windows::io::{FromRawHandle, IntoRawHandle};
 		let r = r.into_raw_handle();
 		let w = w.into_raw_handle();
-		// SAFETY: We just obtained these handles from os_pipe and own them exclusively.
+		// SAFETY: We just obtained these handles from os_pipe and own them
+		// exclusively.
 		unsafe { (FromRawHandle::from_raw_handle(r), FromRawHandle::from_raw_handle(w)) }
 	};
 
