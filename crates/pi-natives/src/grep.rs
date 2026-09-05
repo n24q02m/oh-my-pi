@@ -312,8 +312,8 @@ impl Sink for MatchCollector {
 	) -> std::result::Result<bool, Self::Error> {
 		self.match_count += 1;
 
-		// If we already hit the limit, stop now (after-context for previous match was
-		// collected).
+		// If we already hit the limit, stop now (after-context for previous match
+		// was collected).
 		if self.limit_reached {
 			return Ok(false);
 		}
@@ -342,7 +342,8 @@ impl Sink for MatchCollector {
 
 		self.collected_count += 1;
 
-		// Mark limit reached but don't stop yet - allow after-context to be collected.
+		// Mark limit reached but don't stop yet - allow after-context to be
+		// collected.
 		if let Some(max) = self.max_count
 			&& self.collected_count >= max
 		{
@@ -837,7 +838,8 @@ fn run_sequential_search(
 			break;
 		}
 
-		// Open file and search directly - no intermediate buffer, no precheck scan
+		// Open file and search directly - no intermediate buffer, no precheck
+		// scan
 		let Ok(file) = File::open(&entry.path) else {
 			continue;
 		};

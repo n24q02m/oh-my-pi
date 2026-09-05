@@ -153,7 +153,8 @@ fn filter_entries(
 		}
 
 		matches.push(matched_entry);
-		// Only early-break when not sorting; mtime sort requires full candidate set.
+		// Only early-break when not sorting; mtime sort requires full candidate
+		// set.
 		if !config.sort_by_mtime && matches.len() >= config.max_results {
 			break;
 		}
@@ -177,8 +178,8 @@ fn run_glob(
 		let scan =
 			fs_cache::get_or_scan(&config.root, config.include_hidden, config.use_gitignore, &ct)?;
 		let mut matches = filter_entries(&scan.entries, &glob_set, &config, on_match, &ct)?;
-		// Empty-result recheck: if we got zero matches from a cached scan that's old
-		// enough, force a rescan and try once more before returning empty.
+		// Empty-result recheck: if we got zero matches from a cached scan that's
+		// old enough, force a rescan and try once more before returning empty.
 		if matches.is_empty() && scan.cache_age_ms >= fs_cache::empty_recheck_ms() {
 			let fresh = fs_cache::force_rescan(
 				&config.root,
@@ -202,7 +203,8 @@ fn run_glob(
 	};
 
 	if config.sort_by_mtime {
-		// Sorting mode: rank by mtime descending, then apply max-results truncation.
+		// Sorting mode: rank by mtime descending, then apply max-results
+		// truncation.
 		matches.sort_by(|a, b| {
 			let a_mtime = a.mtime.unwrap_or(0.0);
 			let b_mtime = b.mtime.unwrap_or(0.0);
