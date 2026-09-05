@@ -18,18 +18,11 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.3"
+      - uses: dtolnay/rust-toolchain@nightly
       - name: Install dependencies
         run: bun install
-      - name: Install release native addons
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p packages/natives/native
-          tarball="$(npm view @oh-my-pi/pi-natives-linux-x64@latest dist.tarball)"
-          echo "Fetching $tarball"
-          curl -fsSL --retry 3 "$tarball" | tar -xz -C "$RUNNER_TEMP"
-          cp "$RUNNER_TEMP/package/pi_natives.linux-x64-baseline.node" packages/natives/native/
-          cp "$RUNNER_TEMP/package/pi_natives.linux-x64-modern.node" packages/natives/native/
+      - name: Build native addon
+        run: bun --cwd=packages/natives run build:native
       - name: Check TypeScript types
         run: bunx tsgo -p packages/coding-agent/tsconfig.json --noEmit
       - name: Run lifecycle diagnostics tests
