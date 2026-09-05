@@ -312,8 +312,8 @@ impl Sink for MatchCollector {
 	) -> std::result::Result<bool, Self::Error> {
 		self.match_count += 1;
 
-		// If we already hit the limit, stop now (after-context for previous match was
-		// collected).
+		// If we already hit the limit, stop now (after-context for previous match
+		// was collected).
 		if self.limit_reached {
 			return Ok(false);
 		}
@@ -342,7 +342,8 @@ impl Sink for MatchCollector {
 
 		self.collected_count += 1;
 
-		// Mark limit reached but don't stop yet - allow after-context to be collected.
+		// Mark limit reached but don't stop yet - allow after-context to be
+		// collected.
 		if let Some(max) = self.max_count
 			&& self.collected_count >= max
 		{
@@ -627,7 +628,7 @@ fn collect_files(
 /// Check if `bytes[start]` (which must be `b'{'`) begins a valid repetition
 /// quantifier: `{N}`, `{N,}`, or `{N,M}` where N and M are decimal digits.
 /// Returns the byte index of the closing `}` if valid.
-fn find_valid_repetition(bytes: &[u8], start: usize) -> Option<usize> {
+const fn find_valid_repetition(bytes: &[u8], start: usize) -> Option<usize> {
 	let len = bytes.len();
 	let mut i = start + 1;
 	// Must start with at least one digit.
@@ -660,7 +661,7 @@ fn find_valid_repetition(bytes: &[u8], start: usize) -> Option<usize> {
 	None
 }
 
-fn find_braced_escape_end(bytes: &[u8], start: usize) -> Option<usize> {
+const fn find_braced_escape_end(bytes: &[u8], start: usize) -> Option<usize> {
 	let mut i = start + 1;
 	while i < bytes.len() {
 		if bytes[i] == b'}' {
@@ -837,7 +838,8 @@ fn run_sequential_search(
 			break;
 		}
 
-		// Open file and search directly - no intermediate buffer, no precheck scan
+		// Open file and search directly - no intermediate buffer, no precheck
+		// scan
 		let Ok(file) = File::open(&entry.path) else {
 			continue;
 		};

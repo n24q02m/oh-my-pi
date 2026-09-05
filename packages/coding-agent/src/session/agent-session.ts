@@ -3479,7 +3479,7 @@ Be thorough - include exact file paths, function names, error messages, and tech
 
 	#closeCodexProviderSessionsForHistoryRewrite(): void {
 		const currentModel = this.model;
-		if (!currentModel || currentModel.api !== "openai-codex-responses") return;
+		if (currentModel?.api !== "openai-codex-responses") return;
 		this.#closeProviderSessionsForModelSwitch(currentModel, currentModel);
 	}
 
@@ -3985,6 +3985,7 @@ Be thorough - include exact file paths, function names, error messages, and tech
 
 		const errorMessage = message.errorMessage || "Unknown error";
 		let delayMs = retrySettings.baseDelayMs * 2 ** (this.#retryAttempt - 1);
+		const maxRetryDelayMs = retrySettings.maxDelayMs;
 
 		if (this.model && this.#isUsageLimitErrorMessage(errorMessage)) {
 			const retryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
@@ -3997,7 +3998,14 @@ Be thorough - include exact file paths, function names, error messages, and tech
 				},
 			);
 			if (switched) {
+				// If another credential was available and we switched to it, retry immediately.
 				delayMs = 0;
+			} else if (retryAfterMs !== undefined && maxRetryDelayMs > 0 && retryAfterMs > maxRetryDelayMs) {
+				// If we can't switch credentials, cap the provider-requested wait to the configured max.
+				delayMs = maxRetryDelayMs;
+			} else if (retryAfterMs !== undefined) {
+				// Use the provider-provided retry time when available.
+				delayMs = retryAfterMs;
 			}
 		}
 
@@ -4428,7 +4436,7 @@ Be thorough - include exact file paths, function names, error messages, and tech
 		const previousSessionFile = this.sessionFile;
 		const selectedEntry = this.sessionManager.getEntry(entryId);
 
-		if (!selectedEntry || selectedEntry.type !== "message" || selectedEntry.message.role !== "user") {
+		if (selectedEntry?.type !== "message" || selectedEntry.message.role !== "user") {
 			throw new Error("Invalid entry ID for branching");
 		}
 
