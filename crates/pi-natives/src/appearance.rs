@@ -148,7 +148,8 @@ mod platform {
 	/// Read `AppleInterfaceStyle` via CoreFoundation preferences.
 	/// Returns `"dark"` or `"light"`.
 	pub fn detect_appearance() -> String {
-		// SAFETY: CF pointers are null-checked, CF objects are released after use.
+		// SAFETY: CF pointers are null-checked, CF objects are released after
+		// use.
 		unsafe {
 			let key = create_cf_string("AppleInterfaceStyle");
 			if key.is_null() {
@@ -286,10 +287,11 @@ mod platform {
 					// -- Polling timer (keep-alive + fallback) ---------------
 					//
 					// Two purposes:
-					// 1. Keeps `CFRunLoopRun` alive — without any source/timer attached,
-					//    `CFRunLoopRun` returns immediately.
-					// 2. Polls `CFPreferencesCopyAppValue` every 2 s so we catch theme changes even
-					//    if the Mach-port notification doesn't fire on this thread.
+					// 1. Keeps `CFRunLoopRun` alive — without any source/timer
+					//    attached, `CFRunLoopRun` returns immediately.
+					// 2. Polls `CFPreferencesCopyAppValue` every 2 s so we catch
+					//    theme changes even if the Mach-port notification doesn't
+					//    fire on this thread.
 					let timer_ctx = TimerContext {
 						version:          0,
 						info:             ctx_ptr.cast::<c_void>(),
