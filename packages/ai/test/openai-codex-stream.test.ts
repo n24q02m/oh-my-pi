@@ -2991,6 +2991,7 @@ describe("openai-codex streaming", () => {
 		].join("\n\n")}\n\n`;
 		let firstRequest: Record<string, unknown> | undefined;
 		let continuationRequest: Record<string, unknown> | undefined;
+		const cancellationController = new AbortController();
 		let continuationHeaders: Headers | undefined;
 		const fetchMock = vi.fn(async (_input: string | URL, init?: RequestInit) => {
 			continuationHeaders = init?.headers instanceof Headers ? init.headers : new Headers(init?.headers);
@@ -3029,6 +3030,10 @@ describe("openai-codex streaming", () => {
 						type: "response.failed",
 						response: { error: { code: "invalid_request_error", message: "isolated compaction failed" } },
 					});
+					return;
+				}
+				if (websocketRequestCount === 4) {
+					queueMicrotask(() => cancellationController.abort());
 					return;
 				}
 				this.emitCodexResponse({
@@ -3123,6 +3128,24 @@ describe("openai-codex streaming", () => {
 			websocketConnected: true,
 			hasTurnState: true,
 		});
+		const cancelledCompaction = await streamOpenAICodexResponses(websocketModel, createCodexTestContext(), {
+			fetch: fetchMock as FetchImpl,
+			apiKey: token,
+			signal: cancellationController.signal,
+			sessionId: "ws-handshake-session",
+			providerSessionState,
+			codexCompaction: {
+				operationId: "isolated-cancel",
+				trigger: "auto",
+				reason: "context_limit",
+				implementation: "responses",
+				phase: "mid_turn",
+				strategy: "memento",
+			},
+		}).result();
+		expect(cancelledCompaction.stopReason).toBe("aborted");
+		expect(websocketInstances[0]?.readyState).toBe(MockWebSocket.OPEN);
+		expect(websocketInstances[3]?.readyState).toBe(MockWebSocket.CLOSED);
 		// Turn-state is scoped to the current turn, so the SSE replay must be a
 		// within-turn continuation (trailing tool result) to carry the header.
 		const followUp: Context = {
