@@ -33,6 +33,7 @@ import {
 	parseDaemonWireRequest,
 	validateDaemonBrokerToken,
 } from "./protocol";
+import { readDaemonGitStatus } from "./git-status";
 import { assertNativePathSafe, createDaemonNativeServer, type DaemonNativeRemoteServer } from "./remote-transport";
 import { resolveDaemonSpawnOptions } from "./spawn-options";
 import { renderTerminalOutput } from "./terminal-output";
@@ -416,10 +417,13 @@ function capabilityForOperation(operation: DaemonOperation): DaemonCapability | 
 		case "wait":
 		case "describe":
 			return "observe";
+		case "git-status":
+			return "git-read";
 		case "start":
 		case "send":
 		case "stop":
 		case "restart":
+		case "resume":
 			return "control-session";
 		case "pair-approve":
 		case "pair-preview":
@@ -434,6 +438,10 @@ function capabilityForOperation(operation: DaemonOperation): DaemonCapability | 
 		case "pair-claim":
 			return undefined;
 	}
+}
+
+interface DaemonAuthorization {
+	capabilities: DaemonCapability[];
 }
 
 class DaemonBroker {
@@ -613,14 +621,18 @@ class DaemonBroker {
 		});
 	}
 
-	async #handleLine(socket: net.Socket, line: string, onAuthenticated: () => void): Promise<void> {
+	async #handleLine(
+		socket: net.Socket,
+		line: string,
+		onAuthenticated: (authorization?: DaemonAuthorization) => void,
+	): Promise<void> {
 		let id = "unknown";
 		try {
 			const decoded: unknown = JSON.parse(line);
 			const request = parseDaemonWireRequest(decoded);
 			id = request.id;
-			await this.#authorize(request);
-			onAuthenticated();
+			const authorization = await this.#authorize(request);
+			onAuthenticated(authorization);
 			for (const owner of request.completionUnsubscribes ?? []) {
 				const subscriptionId = this.#completionSubscriptions.get(owner);
 				if (
@@ -693,7 +705,10 @@ class DaemonBroker {
 					if (registration?.subscriptionId === request.completionSubscriptionId) this.#ownerSockets.delete(owner);
 				}
 			}
-			const result = await this.#dispatch(request.operation);
+			let result = await this.#dispatch(request.operation);
+			if (request.operation.op === "ping" && result.op === "ping" && authorization) {
+				result = { ...result, capabilities: [...authorization.capabilities] };
+			}
 			socket.write(`${JSON.stringify({ id, ok: true, result })}\n`);
 			if (request.operation.op === "shutdown") setTimeout(() => void this.shutdown(), 10);
 		} catch (error) {
@@ -702,10 +717,10 @@ class DaemonBroker {
 		}
 	}
 
-	async #authorize(request: DaemonWireRequest): Promise<void> {
-		if (request.token === this.#token) return;
+	async #authorize(request: DaemonWireRequest): Promise<DaemonAuthorization | undefined> {
+		if (request.token === this.#token) return undefined;
 		if (request.operation.op === "pair-claim") {
-			if (request.token === request.operation.code) return;
+			if (request.token === request.operation.code) return { capabilities: [] };
 			throw new Error("Daemon broker authentication failed");
 		}
 		const device = await this.#pairing.authenticate(request.token);
@@ -714,6 +729,7 @@ class DaemonBroker {
 		if (required === undefined || !device.capabilities.includes(required)) {
 			throw new Error(`Daemon capability ${required ?? "none"} is required for ${request.operation.op}`);
 		}
+		return { capabilities: [...device.capabilities] };
 	}
 
 	async #dispatch(operation: DaemonOperation): Promise<DaemonRpcResult> {
@@ -749,6 +765,8 @@ class DaemonBroker {
 					daemons: orderDaemonsForListing([...this.#records.values()].map(record => record.snapshot)),
 				};
 			}
+			case "git-status":
+				return this.#gitStatus(operation);
 			case "logs":
 				return this.#logs(operation);
 			case "wait":
@@ -762,6 +780,8 @@ class DaemonBroker {
 			}
 			case "restart":
 				return this.#restart(operation.name);
+			case "resume":
+				return this.#resume(operation);
 			case "describe": {
 				const record = this.#record(operation.name);
 				await this.#refreshDetached(record);
@@ -1188,6 +1208,38 @@ class DaemonBroker {
 		// timer re-checks clients, remaining live persistent records, and detached
 		// project presence before it shuts anything down.
 		this.#scheduleIdleShutdown();
+	}
+	async #gitStatus(operation: Extract<DaemonOperation, { op: "git-status" }>): Promise<DaemonRpcResult> {
+		const record = this.#record(operation.name);
+		await this.#refreshDetached(record);
+		const status = await readDaemonGitStatus(record.snapshot.name, record.spec.cwd, {
+			refresh: operation.refresh === true,
+		});
+		return { op: "git-status", status };
+	}
+
+	async #resume(operation: Extract<DaemonOperation, { op: "resume" }>): Promise<DaemonRpcResult> {
+		const record = this.#record(operation.name);
+		await this.#stopRecord(record, operation.timeoutMs ?? 2_000);
+		await record.log?.close();
+		record.log = await DaemonLog.open(record.dir);
+		record.stopRequested = false;
+		if (operation.session !== undefined) {
+			const application = path.basename(record.spec.application).toLowerCase();
+			if (application !== "omp" && application !== "omp.exe") {
+				throw new Error("resume session is only supported for an omp daemon");
+			}
+			if (record.spec.args.includes("--resume")) {
+				throw new Error("daemon launch spec already contains --resume; omit session for a normal restart");
+			}
+			record.spec = {
+				...record.spec,
+				args: [...record.spec.args, "--resume", operation.session],
+			};
+		}
+		await this.#launch(record);
+		await record.persistQueue;
+		return { op: "resume", daemon: record.snapshot };
 	}
 
 	async #logs(operation: Extract<DaemonOperation, { op: "logs" }>): Promise<DaemonRpcResult> {

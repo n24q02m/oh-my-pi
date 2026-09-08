@@ -22,6 +22,7 @@ import { createDaemonBrokerClient, type DaemonBrokerClient } from "../launch/cli
 import { canonicalProjectDir, daemonRuntimeDir, readDaemonScopeMeta } from "../launch/paths";
 import { readLiveDaemonBrokerPid } from "../launch/presence";
 import {
+	type DaemonGitStatus,
 	type DaemonSnapshot,
 	type DaemonSpec,
 	type DaemonState,
@@ -46,6 +47,8 @@ export interface PsDaemonRow {
 	/** Launch command from the persisted spec, when readable. */
 	command?: string;
 	cwd?: string;
+	/** Read-only git status when requested by `omp ps --git`. */
+	git?: DaemonGitStatus;
 	/** False when the snapshot came from disk with no live broker supervising it. */
 	supervised: boolean;
 }

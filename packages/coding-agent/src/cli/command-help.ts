@@ -122,6 +122,9 @@ export const ttsrHelp = {
 } satisfies CommandMetadata;
 
 export const updateHelp = { description: "Check for and install updates" } satisfies CommandMetadata;
+export const webHelp = {
+	description: "Serve the same-origin remote supervisor for browser daemon control",
+} satisfies CommandMetadata;
 
 export const usageHelp = {
 	description: "Show provider usage limits for every authenticated account",
