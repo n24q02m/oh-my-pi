@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Recover interrupted sessions by appending a synthetic aborted assistant turn before resuming, preserving journal history and pending state without replaying the interrupted request.
+- Initialize extension tool renderers before installing read-only proxy properties so custom-rendered tools can load during session creation.
+
 ## [13.5.2] - 2026-03-01
 
 ### Added
