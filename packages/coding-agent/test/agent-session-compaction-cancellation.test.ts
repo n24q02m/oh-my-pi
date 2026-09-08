@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent, CompactionCancelledError } from "@oh-my-pi/pi-agent-core";
+import type { AssistantMessage, Message } from "@oh-my-pi/pi-ai";
+import * as codexResponses from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
+import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -10,7 +13,7 @@ import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { TempDir } from "@oh-my-pi/pi-utils";
+import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
 
 type HookMode = "extension-veto" | "park";
 
@@ -164,4 +167,181 @@ describe("AgentSession compaction cancellation source", () => {
 		await promptPromise;
 		expect(agentPrompt).toHaveBeenCalledTimes(1);
 	});
+	it(
+		"cancels automatic Codex V2 compaction before manual snapcompact and foreground recovery",
+		{ timeout: 30_000 },
+		async () => {
+		const bundledModel = getBundledModel("openai-codex", "gpt-5.6-terra");
+		if (!bundledModel) throw new Error("Expected bundled Codex model");
+		const model = { ...bundledModel, contextWindow: 200_000, maxTokens: 1_000 };
+		authStorage.setRuntimeApiKey("openai-codex", "test-key");
+		const automaticStarted = Promise.withResolvers<void>();
+		let nativeCalls = 0;
+		const nativeCompaction = vi.spyOn(codexResponses, "openCodexCompactionEventStream").mockImplementation(
+			async (_model, _body, options) => {
+				nativeCalls++;
+				if (nativeCalls === 1) {
+					automaticStarted.resolve();
+					return (async function* () {
+						await new Promise<void>(resolve => {
+							options.signal?.addEventListener("abort", () => resolve(), { once: true });
+						});
+						throw new DOMException("The operation was aborted", "AbortError");
+					})();
+				}
+				return (async function* () {
+					yield {
+						type: "response.output_item.done",
+						item: { type: "compaction", encrypted_content: "controlled-v2-summary" },
+					};
+					yield {
+						type: "response.completed",
+						response: { usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 } },
+					};
+				})();
+			},
+		);
+
+		const sessionManager = SessionManager.inMemory(tempDir.path());
+		const settings = Settings.isolated({
+			"compaction.methodOrder": ["remote", "snapcompact"],
+			"compaction.asyncEnabled": false,
+			"compaction.autoContinue": false,
+			"compaction.keepRecentTokens": 4000,
+			"compaction.reserveTokens": 100_000,
+			"compaction.thresholdTokens": 1,
+			"snapcompact.shape": "5x8-sent",
+		});
+		const preservedAssistant: Message = {
+			role: "assistant",
+			content: [{ type: "toolCall", id: "call-read-1", name: "read", arguments: { path: "notes.txt" } }],
+			api: model.api,
+			provider: model.provider,
+			model: model.id,
+			stopReason: "toolUse",
+			usage: {
+				input: 10,
+				output: 3,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 13,
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			},
+			timestamp: Date.now(),
+		};
+		const preservedToolResult: Message = {
+			role: "toolResult",
+			toolCallId: "call-read-1",
+			toolName: "read",
+			content: [{ type: "text", text: "important tool output" }],
+			isError: false,
+			timestamp: Date.now(),
+		};
+		const filler = "the quick brown fox jumps over the lazy dog. ".repeat(64);
+		for (let turn = 1; turn <= 70; turn++) {
+			sessionManager.appendMessage({
+				role: "user",
+				content: [{ type: "text", text: `turn ${turn}: ${filler}` }],
+				timestamp: Date.now(),
+			});
+			sessionManager.appendMessage({
+				role: "assistant",
+				content: [{ type: "text", text: `reply ${turn}: ${filler}` }],
+				api: model.api,
+				provider: model.provider,
+				model: model.id,
+				stopReason: "stop",
+				usage: {
+					input: 1000,
+					output: 1000,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2000,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			});
+		}
+		sessionManager.appendMessage({ role: "user", content: "second request" , timestamp: Date.now() });
+		sessionManager.appendMessage(preservedAssistant);
+		sessionManager.appendMessage(preservedToolResult);
+
+		let foregroundCalls = 0;
+		const agent = new Agent({
+			getApiKey: () => "test-key",
+			initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: () => {
+				foregroundCalls++;
+				const initialTurn = foregroundCalls === 1;
+				const answer: AssistantMessage = {
+					role: "assistant",
+					content: [{ type: "text", text: "foreground terminal response" }],
+					api: model.api,
+					provider: model.provider,
+					model: model.id,
+					stopReason: "stop",
+					usage: {
+						input: initialTurn ? 9_000 : 1,
+						output: initialTurn ? 100 : 2,
+						cacheRead: 0,
+						cacheWrite: 0,
+						totalTokens: initialTurn ? 9_100 : 3,
+						cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					},
+					timestamp: Date.now(),
+				};
+				const stream = new AssistantMessageEventStream();
+				queueMicrotask(() => {
+					stream.push({ type: "start", partial: answer });
+					stream.push({ type: "done", reason: "stop", message: answer });
+				});
+				return stream;
+			},
+		});
+		session = new AgentSession({ agent, sessionManager, settings, modelRegistry: new ModelRegistry(authStorage) });
+		const automatic = session.prompt("automatic threshold trigger");
+		await withTimeout(
+			automaticStarted.promise,
+			1000,
+			`automatic Codex V2 transport did not start (foregroundCalls=${foregroundCalls}, nativeCalls=${nativeCalls})`,
+		);
+		const abortPromise = session.abort({ reason: USER_INTERRUPT_LABEL });
+		await withTimeout(abortPromise, 1000, "session abort did not settle");
+		await withTimeout(automatic.catch(() => undefined), 1000, "automatic prompt did not settle");
+
+		expect(nativeCompaction).toHaveBeenCalledTimes(1);
+		expect(session.isCompacting).toBe(false);
+		expect(sessionManager.getBranch().filter(entry => entry.type === "compaction")).toHaveLength(0);
+
+		await withTimeout(session.compact(undefined, { mode: "snapcompact" }), 1000, "manual snapcompact did not settle");
+		const afterManual = sessionManager.getBranch();
+		expect(afterManual.filter(entry => entry.type === "compaction")).toHaveLength(1);
+		expect(
+			afterManual.some(
+				entry =>
+					entry.type === "message" &&
+					entry.message.role === "toolResult" &&
+					entry.message.content[0]?.type === "text" &&
+					entry.message.content[0].text === "important tool output",
+			),
+		).toBe(true);
+
+		session.settings.override("compaction.thresholdTokens", 150_000);
+		await withTimeout(session.prompt("next foreground turn"), 1000, "foreground prompt did not settle");
+		await session.waitForIdle();
+		const afterForeground = sessionManager.getBranch();
+		expect(foregroundCalls).toBe(1);
+		expect(
+			afterForeground.some(
+				entry =>
+					entry.type === "message" &&
+					entry.message.role === "assistant" &&
+					entry.message.content[0]?.type === "text" &&
+					entry.message.content[0].text === "foreground terminal response",
+			),
+		).toBe(true);
+		expect(afterForeground.filter(entry => entry.type === "compaction")).toHaveLength(1);
+		},
+	);
 });
+ 
