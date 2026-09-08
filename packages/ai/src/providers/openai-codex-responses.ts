@@ -1667,7 +1667,10 @@ export async function openCodexCompactionEventStream(
 	};
 	try {
 		requestContext = createCodexRequestContext(model, toCodexRequestBody(body), options, {
-			isolateCompactionTransport: false,
+			// Native compaction rewrites the conversation history. Give it an
+			// isolated transport/session state so a stalled or cancelled
+			// compaction cannot corrupt the live turn's append baseline.
+			isolateCompactionTransport: true,
 		});
 		initial = await openInitialCodexEventStream(model, options, requestSetup, requestContext);
 	} catch (error) {
