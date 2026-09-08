@@ -1,10 +1,10 @@
-name: Fork quota-reset-delay-parking
+name: Fork fallback-resilience
 
 on:
    pull_request:
-      branches: [fix/retry-before-fallback]
+      branches: [fix/retry-before-fallback, fix/quota-reset-delay-parking]
    push:
-      branches: [fix/quota-reset-delay-parking]
+      branches: [fix/quota-reset-delay-parking, fix/skip-unauthenticated-fallback-nodes]
 
 permissions:
    contents: read
