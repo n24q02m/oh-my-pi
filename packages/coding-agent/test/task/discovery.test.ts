@@ -15,6 +15,7 @@ const OMP_AGENT_MD = [
 	"---",
 	"name: omp-test-agent",
 	"description: OMP-native test agent.",
+	"model: @slow",
 	"---",
 	"You are an OMP task agent.",
 ].join("\n");
@@ -84,9 +85,11 @@ describe("discoverAgents", () => {
 		await fs.writeFile(path.join(projectDir, ".claude", "agents", "project-cc-test-agent.md"), CLAUDE_AGENT_MD);
 
 		const { agents, projectAgentsDir } = await discoverAgents(projectDir, tempHome);
+		const ompAgent = agents.find(agent => agent.name === "omp-test-agent");
 		const names = agents.map(agent => agent.name);
 
 		expect(names).toContain("omp-test-agent");
+		expect(ompAgent?.model).toEqual(["@slow"]);
 		expect(names).not.toContain("cc-test-agent");
 		expect(projectAgentsDir).toBe(path.join(projectDir, ".omp", "agents"));
 	});
