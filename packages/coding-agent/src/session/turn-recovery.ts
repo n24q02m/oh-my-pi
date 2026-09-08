@@ -1972,7 +1972,7 @@ export class TurnRecovery {
 						from: currentSelector,
 					});
 					if (!skippedNodes.has(selector.raw)) {
-						skippedNodes.set(selector.raw, "hard-error");
+						skippedNodes.set(selector.raw, "already-attempted");
 					}
 					continue;
 				}
