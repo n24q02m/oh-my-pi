@@ -27,6 +27,7 @@ export default class Ps extends Command {
 		all: Flags.boolean({ char: "a", description: "List every project and global service scope (list)" }),
 		json: Flags.boolean({ char: "j", description: "Emit machine-readable JSON" }),
 		plain: Flags.boolean({ description: "Static listing instead of the interactive monitor (list)" }),
+		git: Flags.boolean({ description: "Include read-only repository/worktree status (list)" }),
 		dir: Flags.string({ description: "Target another project directory instead of the current one" }),
 		global: Flags.string({ description: "Target a machine-global service scope (e.g. browser-relay)" }),
 		follow: Flags.boolean({ char: "f", description: "Keep streaming new output (logs)" }),
@@ -39,6 +40,7 @@ export default class Ps extends Command {
 	static examples = [
 		"omp ps",
 		"omp ps --all",
+		"omp ps --git --plain",
 		"omp ps logs web --follow",
 		"omp ps stop web",
 		"omp ps kill web",
@@ -54,6 +56,7 @@ export default class Ps extends Command {
 				all: flags.all ?? false,
 				json: flags.json ?? false,
 				plain: flags.plain ?? false,
+				git: flags.git ?? false,
 				dir: flags.dir,
 				global: flags.global,
 				follow: flags.follow ?? false,

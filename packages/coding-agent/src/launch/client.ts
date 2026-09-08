@@ -166,7 +166,8 @@ function requestTimeoutMs(operation: DaemonOperation): number {
 		case "wait":
 		case "logs":
 		case "stop":
-			return operation.timeoutMs + 5_000;
+		case "resume":
+			return (operation.op === "resume" ? (operation.timeoutMs ?? CONNECT_TIMEOUT_MS) : operation.timeoutMs) + 5_000;
 		default:
 			return 30_000;
 	}
