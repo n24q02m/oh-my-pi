@@ -73,6 +73,7 @@ describe("discoverAgents — claude-plugins disabled provider", () => {
 	test("keeps Claude marketplace aliases from selecting an unchosen provider", async () => {
 		const { agents } = await discoverAgents(tempHome, tempHome);
 		const agent = agents.find(candidate => candidate.name === "simplifier");
+		if (!agent) throw new Error("Expected enabled marketplace agent to be discovered");
 		expect(agent?.model).toBeUndefined();
 		const settings = Settings.isolated({
 			modelRoles: { slow: "openai-codex/gpt-5.6-mini" },
