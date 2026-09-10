@@ -1,6 +1,7 @@
 import type { AgentEvent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import type { Effort } from "@oh-my-pi/pi-ai";
+import type { AutoThinkingDecisionReceipt, PromptCacheDrop } from "../auto-thinking/decision-receipt";
 import type { Rule } from "../capability/rule";
 import type { RetryErrorUpdate } from "../extensibility/shared-events";
 import type { Goal, GoalModeState } from "../goals/state";
@@ -62,6 +63,16 @@ export type AgentSessionEvent =
 			configured?: ConfiguredThinkingLevel;
 			/** The level `auto` resolved to this turn, once classified. */
 			resolved?: Effort;
+	  }
+	| {
+			type: "auto_thinking_decision";
+			/** Redacted-by-construction decision record (EF1.4): no prompt, usage, or credential data. */
+			receipt: AutoThinkingDecisionReceipt;
+	  }
+	| {
+			type: "prompt_cache_dropped";
+			/** Warm→zero transition with cause kept distinct from the effort change itself (EF1.4). */
+			drop: PromptCacheDrop;
 	  }
 	| { type: "goal_updated"; goal: Goal | null; state?: GoalModeState };
 

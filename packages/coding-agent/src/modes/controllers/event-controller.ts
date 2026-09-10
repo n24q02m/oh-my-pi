@@ -301,6 +301,9 @@ export class EventController {
 				}
 				this.ctx.ui.requestRender(true);
 			},
+			// EF1.4 records: surfaced via logs/packet analysis, no live UI surface yet.
+			auto_thinking_decision: async () => {},
+			prompt_cache_dropped: async () => {},
 			goal_updated: async () => {},
 		} satisfies AgentSessionEventHandlers;
 	}

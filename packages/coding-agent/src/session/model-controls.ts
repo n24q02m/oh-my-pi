@@ -13,6 +13,7 @@ import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { logger } from "@oh-my-pi/pi-utils";
 import { classifyDifficulty, singletonAutoOutcome } from "../auto-thinking/classifier";
+import { type AutoThinkingDecisionSource, autoThinkingDecisionReceipt } from "../auto-thinking/decision-receipt";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	filterAvailableModelsByEnabledPatterns,
@@ -72,7 +73,21 @@ export class ModelControls {
 	readonly #thinkingLevelCeiling: Effort | undefined;
 	#autoThinking = false;
 	#autoResolvedLevel: Effort | undefined;
+	/** When the auto path last CHANGED the effective level (ms epoch); correlates prompt-cache drops. */
+	#lastAutoThinkingChangeAtMs: number | undefined;
+
 	#serviceTierByFamily: ServiceTierByFamily;
+
+	/**
+	 * Timestamp of the last effective-level change made by the auto path, for
+	 * EF1.4 cache-drop cause correlation. Undefined until a change happens;
+	 * callers pair it with consecutive per-model usage samples via
+	 * {@link detectPromptCacheDrop} — the detector keeps "drop observed" and
+	 * "cause established" as separate facts.
+	 */
+	lastAutoThinkingChangeAtMs(): number | undefined {
+		return this.#lastAutoThinkingChangeAtMs;
+	}
 
 	constructor(
 		host: ModelControlsHost,
@@ -597,6 +612,7 @@ export class ModelControls {
 	 * Never throws into the turn, and never clears `#autoThinking`.
 	 */
 	async applyAutoThinkingLevel(promptText: string, generation: number): Promise<void> {
+		const decisionStartMs = Date.now();
 		const model = this.#model;
 		if (!model?.reasoning) return;
 		// Models with reasoning but no controllable effort surface (devin-agent
@@ -605,11 +621,16 @@ export class ModelControls {
 		if (getSupportedEfforts(model).length === 0) return;
 
 		let resolved: Effort | undefined;
+		let source: AutoThinkingDecisionSource = "classifier";
+		let failure: string | undefined;
+		let classifierRequests: 0 | 1 = 0;
+		const previousLevel = this.#thinkingLevel;
 		if (this.#host.magicKeywordEnabled("ultrathink") && containsUltrathink(promptText)) {
 			// The user explicitly asked for maximum thinking; bypass the classifier
 			// (and the `providers.autoThinkingMaxEffort` ceiling) and jump straight
 			// to the highest supported level for this model.
 			resolved = clampAutoThinkingEffort(model, Effort.Max);
+			source = "ultrathink";
 		} else {
 			// EF1-R3 singleton fast-path: when every label the active classifier
 			// could emit clamps to one effective outcome, classification cannot
@@ -619,6 +640,7 @@ export class ModelControls {
 			const singleton = singletonAutoOutcome(model, this.#host.settings, this.#thinkingLevelCeiling);
 			if (singleton !== undefined) {
 				resolved = singleton;
+				source = "singleton";
 			} else {
 				const controller = new AbortController();
 				const timer = setTimeout(() => controller.abort(), ModelControls.#AUTO_THINKING_TIMEOUT_MS);
@@ -628,6 +650,7 @@ export class ModelControls {
 				// from the current foreground id; disposed with the attempt.
 				const identity = sideRequestIdentity(this.#host.modelRegistry.authStorage, this.#host.sessionId());
 				try {
+					classifierRequests = 1;
 					resolved = await classifyDifficulty(promptText, {
 						settings: this.#host.settings,
 						registry: this.#host.modelRegistry,
@@ -638,9 +661,9 @@ export class ModelControls {
 						metadataResolver: provider => identity.metadata(provider),
 					});
 				} catch (error) {
-					logger.debug("auto-thinking: classification failed; using fallback level", {
-						error: error instanceof Error ? error.message : String(error),
-					});
+					source = "fallback";
+					failure = error instanceof Error ? error.message : String(error);
+					logger.debug("auto-thinking: classification failed; using fallback level", { error: failure });
 				} finally {
 					clearTimeout(timer);
 					identity[Symbol.dispose]();
@@ -649,7 +672,24 @@ export class ModelControls {
 		}
 
 		// Drop the result if the turn was aborted/superseded while classifying.
-		if (this.#host.promptGeneration() !== generation || !this.#autoThinking) return;
+		if (this.#host.promptGeneration() !== generation || !this.#autoThinking) {
+			this.#host.emit({
+				type: "auto_thinking_decision",
+				receipt: autoThinkingDecisionReceipt({
+					generation,
+					provider: model.provider,
+					modelId: model.id,
+					source: "aborted",
+					previous: previousLevel === "inherit" ? undefined : previousLevel,
+					candidate: resolved,
+					applied: undefined,
+					durationMs: Date.now() - decisionStartMs,
+					classifierRequests,
+					failure,
+				}),
+			});
+			return;
+		}
 
 		const effort = clampThinkingLevelToCeiling(
 			model,
@@ -662,6 +702,7 @@ export class ModelControls {
 		this.#thinkingLevel = effort;
 		this.#applyThinkingLevelToAgent(effort);
 		if (shouldPersistResolution) {
+			this.#lastAutoThinkingChangeAtMs = Date.now();
 			this.#host.sessionManager.appendThinkingLevelChange(effort, AUTO_THINKING);
 		}
 		this.#host.emit({
@@ -669,6 +710,21 @@ export class ModelControls {
 			thinkingLevel: effort,
 			configured: AUTO_THINKING,
 			resolved: effort,
+		});
+		this.#host.emit({
+			type: "auto_thinking_decision",
+			receipt: autoThinkingDecisionReceipt({
+				generation,
+				provider: model.provider,
+				modelId: model.id,
+				source,
+				previous: previousLevel === "inherit" ? undefined : previousLevel,
+				candidate: resolved,
+				applied: effort,
+				durationMs: Date.now() - decisionStartMs,
+				classifierRequests,
+				failure,
+			}),
 		});
 	}
 

@@ -100,6 +100,7 @@ import {
 } from "@oh-my-pi/pi-utils";
 import { type AdvisorConfig, type AdvisorRuntimeStatus, loadAdvisorTranscriptCosts } from "../advisor";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJob, AsyncJobManager } from "../async";
+import { detectPromptCacheDrop, type PromptCacheSample } from "../auto-thinking/decision-receipt";
 import { reset as resetCapabilities } from "../capability";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
@@ -658,6 +659,8 @@ export class AgentSession {
 	#queuedMessageDrainBlocked = false;
 	#modeExitDrainSuppressionDepth = 0;
 	#usagePreflightReadyForNextModelCall = false;
+	/** Last completed-request cache-read sample per `provider/model` (EF1.4 cache-drop observer). */
+	readonly #lastCacheSampleByModel = new Map<string, PromptCacheSample>();
 	#usagePreflightReadyModel: Model | undefined;
 	#detachUsageBeforeQueueDequeue: (() => void) | undefined;
 	#detachUsageBeforeModelCall: (() => void) | undefined;
@@ -2913,6 +2916,26 @@ export class AgentSession {
 					},
 					costUsd: assistantMsg.usage.cost.total,
 				});
+				// EF1.4 cache-drop observer: track consecutive per-model cache reads
+				// and emit one redacted record on a warm→zero transition. The cause is
+				// attributed to an effort change only when one landed between samples.
+				{
+					const sampleKey = `${assistantMsg.provider}/${assistantMsg.model}`;
+					const previousSample = this.#lastCacheSampleByModel.get(sampleKey);
+					const nextSample: PromptCacheSample = {
+						cacheReadTokens: assistantMsg.usage.cacheRead,
+						atMs: assistantMsg.timestamp,
+					};
+					this.#lastCacheSampleByModel.set(sampleKey, nextSample);
+					const drop = detectPromptCacheDrop(
+						assistantMsg.provider,
+						assistantMsg.model,
+						previousSample,
+						nextSample,
+						this.#models.lastAutoThinkingChangeAtMs(),
+					);
+					if (drop) this.#emit({ type: "prompt_cache_dropped", drop });
+				}
 				// Persist which account served this turn so a resumed process can
 				// re-pin it and keep the provider's account-scoped prompt cache
 				// warm (broker-mode sticky routing is process-local).
