@@ -167,18 +167,16 @@ describe("AgentSession compaction cancellation source", () => {
 		await promptPromise;
 		expect(agentPrompt).toHaveBeenCalledTimes(1);
 	});
-	it(
-		"cancels automatic Codex V2 compaction before manual snapcompact and foreground recovery",
-		{ timeout: 30_000 },
-		async () => {
+	it("cancels automatic Codex V2 compaction before manual snapcompact and foreground recovery", async () => {
 		const bundledModel = getBundledModel("openai-codex", "gpt-5.6-terra");
 		if (!bundledModel) throw new Error("Expected bundled Codex model");
 		const model = { ...bundledModel, contextWindow: 200_000, maxTokens: 1_000 };
 		authStorage.setRuntimeApiKey("openai-codex", "test-key");
 		const automaticStarted = Promise.withResolvers<void>();
 		let nativeCalls = 0;
-		const nativeCompaction = vi.spyOn(codexResponses, "openCodexCompactionEventStream").mockImplementation(
-			async (_model, _body, options) => {
+		const nativeCompaction = vi
+			.spyOn(codexResponses, "openCodexCompactionEventStream")
+			.mockImplementation(async (_model, _body, options) => {
 				nativeCalls++;
 				if (nativeCalls === 1) {
 					automaticStarted.resolve();
@@ -199,8 +197,7 @@ describe("AgentSession compaction cancellation source", () => {
 						response: { usage: { input_tokens: 10, output_tokens: 2, total_tokens: 12 } },
 					};
 				})();
-			},
-		);
+			});
 
 		const sessionManager = SessionManager.inMemory(tempDir.path());
 		const settings = Settings.isolated({
@@ -262,7 +259,7 @@ describe("AgentSession compaction cancellation source", () => {
 				timestamp: Date.now(),
 			});
 		}
-		sessionManager.appendMessage({ role: "user", content: "second request" , timestamp: Date.now() });
+		sessionManager.appendMessage({ role: "user", content: "second request", timestamp: Date.now() });
 		sessionManager.appendMessage(preservedAssistant);
 		sessionManager.appendMessage(preservedToolResult);
 
@@ -307,7 +304,11 @@ describe("AgentSession compaction cancellation source", () => {
 		);
 		const abortPromise = session.abort({ reason: USER_INTERRUPT_LABEL });
 		await withTimeout(abortPromise, 1000, "session abort did not settle");
-		await withTimeout(automatic.catch(() => undefined), 1000, "automatic prompt did not settle");
+		await withTimeout(
+			automatic.catch(() => undefined),
+			1000,
+			"automatic prompt did not settle",
+		);
 
 		expect(nativeCompaction).toHaveBeenCalledTimes(1);
 		expect(session.isCompacting).toBe(false);
@@ -341,7 +342,5 @@ describe("AgentSession compaction cancellation source", () => {
 			),
 		).toBe(true);
 		expect(afterForeground.filter(entry => entry.type === "compaction")).toHaveLength(1);
-		},
-	);
+	}, 30_000);
 });
- 
