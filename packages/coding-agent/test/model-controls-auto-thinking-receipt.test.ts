@@ -56,6 +56,7 @@ describe("model controls auto thinking decision receipts", () => {
 		expect(receipt.source).toBe("ultrathink");
 		expect(receipt.classifierRequests).toBe(0);
 		expect(receipt.applied).toBeDefined();
+		expect(receipt.capabilityStrategy).toBe("inferred");
 		expect(receipt.candidate).toBe(receipt.applied);
 		expect(JSON.stringify(receipt)).not.toContain("MARKER-XYZ");
 		expect(JSON.stringify(receipt)).not.toContain("migration plan");

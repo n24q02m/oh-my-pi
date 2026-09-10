@@ -16,6 +16,13 @@ import type { Effort } from "@oh-my-pi/pi-ai";
 export type AutoThinkingDecisionSource = "ultrathink" | "singleton" | "classifier" | "fallback" | "aborted";
 
 /**
+ * How the decided model's thinking capability was established. Only catalog
+ * inference exists today; EF1-R2's endpoint capability override adds the
+ * `override` member when it lands.
+ */
+export type AutoThinkingCapabilityStrategy = "inferred" | "override";
+
+/**
  * One auto-thinking decision, recorded per prompt generation.
  *
  * Redaction is by construction: the type has no field that could carry the
@@ -36,6 +43,8 @@ export interface AutoThinkingDecisionReceipt {
 	candidate: Effort | undefined;
 	/** Level applied to the session; undefined for `aborted` (no change). */
 	applied: Effort | undefined;
+	/** How the model's thinking capability was established for this decision. */
+	capabilityStrategy: AutoThinkingCapabilityStrategy;
 	/** Wall time from decision start to resolution (or abandonment). */
 	durationMs: number;
 	/** 1 when a classifier request was made, 0 for all other sources. */

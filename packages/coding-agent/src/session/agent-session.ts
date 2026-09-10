@@ -2919,7 +2919,10 @@ export class AgentSession {
 				// EF1.4 cache-drop observer: track consecutive per-model cache reads
 				// and emit one redacted record on a warm→zero transition. The cause is
 				// attributed to an effort change only when one landed between samples.
-				{
+				// Error/aborted responses carry no trustworthy cache evidence, so they
+				// neither update nor compare against samples (same guard as
+				// #persistSessionMessageIfMissing).
+				if (assistantMsg.stopReason !== "error" && assistantMsg.stopReason !== "aborted") {
 					const sampleKey = `${assistantMsg.provider}/${assistantMsg.model}`;
 					const previousSample = this.#lastCacheSampleByModel.get(sampleKey);
 					const nextSample: PromptCacheSample = {
