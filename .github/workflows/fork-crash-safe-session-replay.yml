@@ -48,7 +48,7 @@ jobs:
           ls packages/natives/native/
       - name: Check TypeScript types
         working-directory: packages/coding-agent
-        run: bun run check:types
+        run: bun run check
       - name: Run session replay tests
         working-directory: packages/coding-agent
         env:
