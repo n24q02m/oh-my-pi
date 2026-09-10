@@ -16,19 +16,15 @@ jobs:
       # Inline shared bun-install composite (this branch predates
       # .github/actions/): install the pinned bun, then frozen install with
       # the same clean-cache retry as the composite.
-      - name: Install pinned bun
+      - name: Install bun when missing
         shell: bash
         run: |
-          want="$(sed -n 's/.*"packageManager": *"bun@\([^"]*\)".*/\1/p' package.json)"
-          if [ -z "$want" ]; then
-            echo "::error::could not read pinned bun version from package.json packageManager"
-            exit 1
-          fi
-          have="$(command -v bun >/dev/null 2>&1 && bun --version || true)"
-          if [ "$have" != "$want" ]; then
+          if ! command -v bun >/dev/null 2>&1; then
             export BUN_INSTALL="${HOME}/.bun"
-            curl -fsSL https://bun.sh/install | bash -s "bun-v${want}"
+            curl -fsSL https://bun.sh/install | bash
             echo "${BUN_INSTALL}/bin" >> "$GITHUB_PATH"
+          else
+            echo "bun present: $(bun --version)"
           fi
       - name: Install dependencies
         shell: bash
