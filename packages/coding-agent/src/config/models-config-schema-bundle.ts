@@ -178,6 +178,7 @@ export const getModelsConfigSchemaBundle = once(() => {
 		"imageInputDecoder?": '"stb"',
 		"tokenizer?": ModelTokenizerSchema,
 		"supportsTools?": "boolean",
+		"supportsConfigurationUpdate?": "boolean",
 		"cost?": {
 			input: "number",
 			output: "number",
@@ -236,6 +237,7 @@ export const getModelsConfigSchemaBundle = once(() => {
 			"cacheRead?": "number",
 			"cacheWrite?": "number",
 		},
+		"supportsConfigurationUpdate?": "boolean",
 		"premiumMultiplier?": "number",
 		"contextWindow?": "number",
 		"maxTokens?": "number",

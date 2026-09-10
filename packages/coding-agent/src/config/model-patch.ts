@@ -182,6 +182,12 @@ export interface ModelPatch {
 	imageInputDecoder?: Model<Api>["imageInputDecoder"];
 	tokenizer?: Model<Api>["tokenizer"];
 	supportsTools?: boolean;
+	/**
+	 * Configuration-update capability (spec EF1-R2). `false` is the only
+	 * unsupported signal and must be preserved verbatim through patches,
+	 * compat merges, and registry rebuilds.
+	 */
+	supportsConfigurationUpdate?: boolean;
 	cost?: Partial<Model<Api>["cost"]>;
 	contextWindow?: number;
 	maxTokens?: number;
@@ -213,6 +219,8 @@ export function applyModelPatch(base: Model<Api>, patch: ModelPatch, transport: 
 	if (patch.tokenizer !== undefined) result.tokenizer = patch.tokenizer;
 	if (patch.imageInputDecoder !== undefined) result.imageInputDecoder = patch.imageInputDecoder;
 	if (patch.supportsTools !== undefined) result.supportsTools = patch.supportsTools;
+	if (patch.supportsConfigurationUpdate !== undefined)
+		result.supportsConfigurationUpdate = patch.supportsConfigurationUpdate;
 	if (patch.contextWindow !== undefined) result.contextWindow = patch.contextWindow;
 	if (patch.maxTokens !== undefined) result.maxTokens = patch.maxTokens;
 	if (patch.omitMaxOutputTokens !== undefined) result.omitMaxOutputTokens = patch.omitMaxOutputTokens;

@@ -963,6 +963,16 @@ export interface Model<TApi extends Api = Api> {
 	 * reports that native tool calling is unsupported.
 	 */
 	supportsTools?: boolean;
+	/**
+	 * Whether this endpoint accepts configuration-update items (spec EF1-R2
+	 * `supportsConfigurationUpdate`). `false` is the only unsupported signal:
+	 * `true` and `undefined` both mean callers may attempt configuration
+	 * updates. Explicit `false` must survive provider/model overrides, compat
+	 * merges, and registry rebuilds — capability decisions never infer support
+	 * from model lineage. No wire consumer yet; declared so config plumbing
+	 * and provenance reporting exist before update-item support lands.
+	 */
+	supportsConfigurationUpdate?: boolean;
 	/** Whether this model accepts the GA OpenAI Responses `{ type: "computer" }` native tool. */
 	supportsComputerUse?: boolean;
 	/** Verbatim explicit computer-use support from the spec; undefined when `buildModel` inferred the runtime value. */
