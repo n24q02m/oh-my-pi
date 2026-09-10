@@ -39,8 +39,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tarball="$(npm view @oh-my-pi/pi-natives-linux-x64@latest dist.tarball)"
-          echo "Fetching $tarball"
+          natives_version="$(bun -p "require('./packages/natives/package.json').version")"
+          echo "Installing @oh-my-pi/pi-natives-linux-x64@${natives_version}"
+          tarball="$(npm view @oh-my-pi/pi-natives-linux-x64@${natives_version} dist.tarball)"
           addons_dir="$RUNNER_TEMP/natives-addons"
           rm -rf "$addons_dir" && mkdir -p "$addons_dir" packages/natives/native
           curl -fsSL --retry 3 "$tarball" | tar -xz -C "$addons_dir"
