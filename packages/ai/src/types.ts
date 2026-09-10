@@ -602,6 +602,16 @@ export interface SimpleStreamOptions extends Omit<StreamOptions, "apiKey"> {
 	 * ever see the resolved {@link StreamOptions.apiKey} string.
 	 */
 	apiKey?: ApiKey;
+	/**
+	 * Resolve request metadata after each {@link apiKey} resolver attempt.
+	 * Use when metadata identifies the selected credential (for example
+	 * Anthropic `account_uuid`): auth retry can rotate credentials, so a static
+	 * snapshot may disagree with the bearer sent on a later attempt.
+	 *
+	 * When present, this is authoritative over inherited `metadata`.
+	 * Providers receive only the resolved `metadata` object, never this callback.
+	 */
+	metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
 	reasoning?: Effort;
 	/**
 	 * Force-disable reasoning for the request even when the model supports it.

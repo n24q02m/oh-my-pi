@@ -86,6 +86,7 @@ export interface ClassifyDifficultyDeps {
 	sessionId?: string;
 	signal?: AbortSignal;
 	metadataResolver?: (provider: string) => Record<string, unknown> | undefined;
+	prepareProvider?: (provider: string) => void;
 }
 
 /**
@@ -153,12 +154,11 @@ async function classifyOnline(input: string, deps: ClassifyDifficultyDeps, ceili
 	if (!model) {
 		throw new Error("auto-thinking: no tiny/smol model available for classification");
 	}
+	deps.prepareProvider?.(model.provider);
 	const apiKey = await deps.registry.getApiKey(model, deps.sessionId);
 	if (!apiKey) {
 		throw new Error(`auto-thinking: no API key for ${model.provider}/${model.id}`);
 	}
-	// Resolve metadata after getApiKey so the session-sticky credential is recorded first.
-	const metadata = deps.metadataResolver?.(model.provider);
 	const maxTokens = ONLINE_REASONING_SAFE_MAX_TOKENS;
 
 	const response = await retryTransientCompletion(
@@ -173,7 +173,8 @@ async function classifyOnline(input: string, deps: ClassifyDifficultyDeps, ceili
 					apiKey: deps.registry.resolver(model, deps.sessionId),
 					maxTokens,
 					disableReasoning: true,
-					metadata,
+					sessionId: deps.sessionId,
+					metadataResolver: deps.metadataResolver,
 					signal: deps.signal,
 				},
 			),

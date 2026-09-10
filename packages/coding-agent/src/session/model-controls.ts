@@ -40,6 +40,7 @@ import type { ModelCycleResult, ResolvedRoleModel, RoleModelCycle, RoleModelCycl
 import { formatRoleModelValue, resolveRoleModelFull } from "./role-models";
 import { EPHEMERAL_MODEL_CHANGE_ROLE } from "./session-entries";
 import type { SessionManager } from "./session-manager";
+import { sideRequestIdentity } from "./side-request-identity";
 
 /** Capabilities borrowed from the owning AgentSession. */
 export interface ModelControlsHost {
@@ -621,14 +622,20 @@ export class ModelControls {
 			} else {
 				const controller = new AbortController();
 				const timer = setTimeout(() => controller.abort(), ModelControls.#AUTO_THINKING_TIMEOUT_MS);
+				// EF1-R1: side requests order under a fresh provider session id so a
+				// classifier rotation cannot clear or rotate the foreground turn's
+				// sticky credential (issues #10619/#10865). Minted per classification
+				// from the current foreground id; disposed with the attempt.
+				const identity = sideRequestIdentity(this.#host.modelRegistry.authStorage, this.#host.sessionId());
 				try {
 					resolved = await classifyDifficulty(promptText, {
 						settings: this.#host.settings,
 						registry: this.#host.modelRegistry,
 						model,
-						sessionId: this.#host.sessionId(),
+						sessionId: identity.sessionId,
 						signal: controller.signal,
-						metadataResolver: provider => this.#host.agent.metadataForProvider(provider),
+						prepareProvider: provider => identity.prepare(provider),
+						metadataResolver: provider => identity.metadata(provider),
 					});
 				} catch (error) {
 					logger.debug("auto-thinking: classification failed; using fallback level", {
@@ -636,6 +643,7 @@ export class ModelControls {
 					});
 				} finally {
 					clearTimeout(timer);
+					identity[Symbol.dispose]();
 				}
 			}
 		}
