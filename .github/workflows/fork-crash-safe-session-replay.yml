@@ -41,8 +41,10 @@ jobs:
           set -euo pipefail
           tarball="$(npm view @oh-my-pi/pi-natives-linux-x64@latest dist.tarball)"
           echo "Fetching $tarball"
-          mkdir -p packages/natives/native
-          find "$RUNNER_TEMP/package" -name "*.node" -exec cp {} packages/natives/native/ \;
+          addons_dir="$RUNNER_TEMP/natives-addons"
+          rm -rf "$addons_dir" && mkdir -p "$addons_dir" packages/natives/native
+          curl -fsSL --retry 3 "$tarball" | tar -xz -C "$addons_dir"
+          find "$addons_dir" -name "*.node" -exec cp {} packages/natives/native/ \;
           ls packages/natives/native/
       - name: Check TypeScript types
         working-directory: packages/coding-agent
