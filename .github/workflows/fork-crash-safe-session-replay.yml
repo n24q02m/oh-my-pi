@@ -42,8 +42,8 @@ jobs:
           tarball="$(npm view @oh-my-pi/pi-natives-linux-x64@latest dist.tarball)"
           echo "Fetching $tarball"
           mkdir -p packages/natives/native
-          cp "$RUNNER_TEMP/package/pi_natives.linux-x64-baseline.node" packages/natives/native/
-          cp "$RUNNER_TEMP/package/pi_natives.linux-x64-modern.node" packages/natives/native/
+          find "$RUNNER_TEMP/package" -name "*.node" -exec cp {} packages/natives/native/ \;
+          ls packages/natives/native/
       - name: Check TypeScript types
         working-directory: packages/coding-agent
         run: bun run check:types
