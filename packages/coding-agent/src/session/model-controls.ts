@@ -12,7 +12,7 @@ import { isFireworksFastModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id"
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { logger } from "@oh-my-pi/pi-utils";
-import { classifyDifficulty } from "../auto-thinking/classifier";
+import { classifyDifficulty, singletonAutoOutcome } from "../auto-thinking/classifier";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	filterAvailableModelsByEnabledPatterns,
@@ -610,23 +610,33 @@ export class ModelControls {
 			// to the highest supported level for this model.
 			resolved = clampAutoThinkingEffort(model, Effort.Max);
 		} else {
-			const controller = new AbortController();
-			const timer = setTimeout(() => controller.abort(), ModelControls.#AUTO_THINKING_TIMEOUT_MS);
-			try {
-				resolved = await classifyDifficulty(promptText, {
-					settings: this.#host.settings,
-					registry: this.#host.modelRegistry,
-					model,
-					sessionId: this.#host.sessionId(),
-					signal: controller.signal,
-					metadataResolver: provider => this.#host.agent.metadataForProvider(provider),
-				});
-			} catch (error) {
-				logger.debug("auto-thinking: classification failed; using fallback level", {
-					error: error instanceof Error ? error.message : String(error),
-				});
-			} finally {
-				clearTimeout(timer);
+			// EF1-R3 singleton fast-path: when every label the active classifier
+			// could emit clamps to one effective outcome, classification cannot
+			// change the result — resolve through the ordinary path below without
+			// paying a classifier call. Zero-candidate and multi-candidate models
+			// keep the existing classify/fallback flow unchanged.
+			const singleton = singletonAutoOutcome(model, this.#host.settings, this.#thinkingLevelCeiling);
+			if (singleton !== undefined) {
+				resolved = singleton;
+			} else {
+				const controller = new AbortController();
+				const timer = setTimeout(() => controller.abort(), ModelControls.#AUTO_THINKING_TIMEOUT_MS);
+				try {
+					resolved = await classifyDifficulty(promptText, {
+						settings: this.#host.settings,
+						registry: this.#host.modelRegistry,
+						model,
+						sessionId: this.#host.sessionId(),
+						signal: controller.signal,
+						metadataResolver: provider => this.#host.agent.metadataForProvider(provider),
+					});
+				} catch (error) {
+					logger.debug("auto-thinking: classification failed; using fallback level", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				} finally {
+					clearTimeout(timer);
+				}
 			}
 		}
 

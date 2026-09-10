@@ -23,7 +23,7 @@ import { resolveRoleSelection } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
 import difficultySystemPrompt from "../prompts/system/auto-thinking-difficulty.md" with { type: "text" };
 import difficultyLocalPrompt from "../prompts/system/auto-thinking-difficulty-local.md" with { type: "text" };
-import { clampAutoThinkingEffort } from "../thinking";
+import { clampAutoThinkingEffort, clampThinkingLevelToCeiling } from "../thinking";
 import { preprocessTinyMessage } from "../tiny/message-preproc";
 import {
 	isTinyMemoryLocalModelKey,
@@ -44,9 +44,9 @@ const DIFFICULTY_SYSTEM_PROMPTS: Partial<Record<"max" | "xhigh", string>> = {};
  * default keeps `auto` one tier below the top, so only an explicit
  * `ultrathink` reaches {@link Effort.Max}.
  */
-function autoEffortCeiling(deps: ClassifyDifficultyDeps): Effort {
-	if (deps.settings.get("providers.autoThinkingMaxEffort") !== Effort.Max) return Effort.XHigh;
-	return getSupportedEfforts(deps.model).includes(Effort.Max) ? Effort.Max : Effort.XHigh;
+function autoEffortCeiling(settings: Settings, model: Model): Effort {
+	if (settings.get("providers.autoThinkingMaxEffort") !== Effort.Max) return Effort.XHigh;
+	return getSupportedEfforts(model).includes(Effort.Max) ? Effort.Max : Effort.XHigh;
 }
 
 function difficultySystemPromptFor(ceiling: Effort): string {
@@ -104,11 +104,47 @@ export async function classifyDifficulty(
 	// The 3-bucket local classifier cannot select `max`, so its ceiling stays at
 	// XHigh whatever the setting says — otherwise a sparse ladder would snap its
 	// `hard` bucket up to a tier it never chose.
-	const ceiling = online ? autoEffortCeiling(deps) : Effort.XHigh;
+	const ceiling = online ? autoEffortCeiling(deps.settings, deps.model) : Effort.XHigh;
 	const effort = online ? await classifyOnline(input, deps, ceiling) : await classifyLocal(input, backend, deps);
 	// The ceiling goes into the clamp itself: capping the request alone is not
 	// enough, because a sparse ladder snaps an excluded request back up.
 	return clampAutoThinkingEffort(deps.model, effort, ceiling);
+}
+
+/**
+ * Compute every effective effort outcome the active classifier backend could
+ * produce for `model`, composed exactly like the production path: the
+ * classifier's own model/ceiling clamp ({@link clampAutoThinkingEffort}) with
+ * {@link classifyDifficulty}'s ceiling rules, followed by the session's hard
+ * ceiling clamp. When every eligible label collapses to one effective
+ * outcome, classification is redundant — the caller may resolve through the
+ * ordinary state/receipt/event path without invoking either classifier
+ * (EF1-R3 singleton fast-path).
+ *
+ * Returns `undefined` unless the outcomes collapse to exactly one concrete
+ * effort: multiple candidates mean normal classification must run, and zero
+ * eligible outcomes (e.g. a `["max"]` ladder under the default ceiling) keep
+ * the existing unsupported/fallback behavior — never a synthesized level.
+ */
+export function singletonAutoOutcome(
+	model: Model,
+	settings: Settings,
+	sessionCeiling: Effort | undefined,
+): Effort | undefined {
+	const online = settings.get("providers.autoThinkingModel") === ONLINE_AUTO_THINKING_MODEL_KEY;
+	// Mirror classifyDifficulty: the local 3-bucket classifier cannot select
+	// `max`, so its ceiling stays at XHigh whatever the setting says.
+	const ceiling = online ? autoEffortCeiling(settings, model) : Effort.XHigh;
+	const labels: Effort[] = online
+		? [Effort.Low, Effort.Medium, Effort.High, Effort.XHigh, ...(ceiling === Effort.Max ? [Effort.Max] : [])]
+		: [Effort.Low, Effort.High, Effort.XHigh];
+	const outcomes = new Set<Effort | undefined>();
+	for (const label of labels) {
+		outcomes.add(clampThinkingLevelToCeiling(model, clampAutoThinkingEffort(model, label, ceiling), sessionCeiling));
+	}
+	if (outcomes.size !== 1) return undefined;
+	const only = outcomes.values().next().value;
+	return only;
 }
 
 async function classifyOnline(input: string, deps: ClassifyDifficultyDeps, ceiling: Effort): Promise<Effort> {
