@@ -131,7 +131,14 @@ function runWindowsAclProbe(specs: readonly NativePathSafetySpec[]): Promise<voi
 			},
 			(error, stdout, stderr) => {
 				if (error) {
-					const detail = stderr.trim().split(/\r?\n/u).filter(Boolean).at(-1) ?? error.message;
+					const detail =
+						stderr
+							.trim()
+							.split(/\r?\n/u)
+							.filter(Boolean)
+							.join(" ")
+							.replace(/\s+/gu, " ")
+							.trim() || error.message;
 					reject(new Error(`Windows native path ACL verification failed: ${detail}`));
 					return;
 				}
