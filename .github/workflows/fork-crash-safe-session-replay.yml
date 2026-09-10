@@ -41,7 +41,7 @@ jobs:
           set -euo pipefail
           tarball="$(npm view @oh-my-pi/pi-natives-linux-x64@latest dist.tarball)"
           echo "Fetching $tarball"
-          curl -fsSL --retry 3 "$tarball" | tar -xz -C "$RUNNER_TEMP"
+          mkdir -p packages/natives/native
           cp "$RUNNER_TEMP/package/pi_natives.linux-x64-baseline.node" packages/natives/native/
           cp "$RUNNER_TEMP/package/pi_natives.linux-x64-modern.node" packages/natives/native/
       - name: Check TypeScript types
