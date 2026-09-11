@@ -31,6 +31,17 @@ export interface ServiceTierChangeEntry extends SessionEntryBase {
 	serviceTier: ServiceTierByFamily | null;
 }
 
+/**
+ * EF2-R5 capability epoch: the effort capability strategy of the active
+ * endpoint/API/model changed. Mirrored from the coding-agent session entries
+ * so compaction consumers can type the journal.
+ */
+export interface CapabilityEpochChangeEntry extends SessionEntryBase {
+	type: "capability_epoch_change";
+	strategy: string;
+	reason: string;
+}
+
 export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	type: "compaction";
 	summary: string;
@@ -134,6 +145,7 @@ export type SessionEntry =
 	| ThinkingLevelChangeEntry
 	| ModelChangeEntry
 	| ServiceTierChangeEntry
+	| CapabilityEpochChangeEntry
 	| CompactionEntry
 	| BranchSummaryEntry
 	| CustomEntry
