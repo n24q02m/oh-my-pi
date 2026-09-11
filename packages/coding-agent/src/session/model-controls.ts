@@ -7,13 +7,25 @@ import {
 	realizesPriorityServiceTier,
 	resolveModelServiceTier,
 	serviceTierFamily,
+	THINKING_EFFORTS,
 } from "@oh-my-pi/pi-ai";
 import { isFireworksFastModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { modelsAreEqual } from "@oh-my-pi/pi-catalog/models";
 import { logger } from "@oh-my-pi/pi-utils";
+import { type EffortCapabilityStrategy, resolveEffortCapabilityStrategy } from "../auto-thinking/capability-strategy";
 import { classifyDifficulty, singletonAutoOutcome } from "../auto-thinking/classifier";
-import { type AutoThinkingDecisionSource, autoThinkingDecisionReceipt } from "../auto-thinking/decision-receipt";
+import {
+	type AutoThinkingDecisionSource,
+	autoThinkingDecisionReceipt,
+	type RequestOverrideOrigin,
+} from "../auto-thinking/decision-receipt";
+import {
+	type ReassessmentReason,
+	type ReassessmentSignal,
+	ReassessmentTracker,
+	type ReassessmentVerdict,
+} from "../auto-thinking/reassessment";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	filterAvailableModelsByEnabledPatterns,
@@ -45,11 +57,19 @@ import type { SessionManager } from "./session-manager";
 import { sideRequestIdentity } from "./side-request-identity";
 
 /**
- * Outcome of an EF2-R3 next-request effort proposal. `clampedToCeiling` marks
- * an accepted proposal the hard session ceiling pulled down.
+ * Outcome of an EF2-R3/R5 next-request effort proposal. `clampedToCeiling`
+ * marks an accepted proposal the hard session ceiling pulled down;
+ * `strategy`/`cacheRisk` carry the capability verdict that gated it.
  */
 export type RequestOverrideProposalResult =
-	| { accepted: true; effort: Effort; clampedToCeiling: boolean }
+	| {
+			accepted: true;
+			effort: Effort;
+			clampedToCeiling: boolean;
+			origin: RequestOverrideOrigin;
+			strategy: EffortCapabilityStrategy;
+			cacheRisk: string;
+	  }
 	| { accepted: false; reason: string };
 
 /** Capabilities borrowed from the owning AgentSession. */
@@ -72,6 +92,25 @@ export interface ModelControlsHost {
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
 }
+/** Ordinal of an effort on the global ladder; unrankable levels rank last. */
+function clampRank(level: ThinkingLevel | Effort | undefined): number {
+	if (level === undefined || level === "inherit" || level === "off") return -1;
+	return THINKING_EFFORTS.indexOf(level);
+}
+
+/**
+ * EF2-R4/R5 pending override: an accepted first-party proposal awaiting
+ * actual dispatch, enriched with its origin, the capability verdict that
+ * gated it, and the cache-risk note for prefix-sensitive routes.
+ */
+interface PendingRequestOverride {
+	effort: Effort;
+	generation: number;
+	requestedEffort: Effort;
+	origin: RequestOverrideOrigin;
+	strategy: EffortCapabilityStrategy;
+	cacheRisk: string;
+}
 
 /** Owns model selection, thinking effort, role cycling, and service tiers. */
 export class ModelControls {
@@ -91,10 +130,21 @@ export class ModelControls {
 	 * holding the auto baseline to restore on expiry. Never persisted: the
 	 * configured selector stays `auto` throughout.
 	 */
-	#pendingOverride: { effort: Effort; generation: number } | undefined;
+	#pendingOverride: PendingRequestOverride | undefined;
 	#overrideArmed = false;
 	#preOverrideLevel: Effort | undefined;
-
+	/**
+	 * EF2-R4: controller-originated effective transitions (override apply +
+	 * automatic return) allowed per interval between user-dispatched batches.
+	 * The return slot is reserved at application time, retries never re-spend
+	 * it, and exhaustion declines further applies without stranding state.
+	 */
+	static readonly #MAX_OVERRIDE_TRANSITIONS_PER_INTERVAL = 2;
+	#overrideTransitions: { spent: number } = { spent: 0 };
+	/** EF2-R4: folds reassessment signals into qualifying escalation events. */
+	readonly #reassessment = new ReassessmentTracker();
+	/** EF2-R5: effort capability strategy of the active endpoint/model. */
+	#capabilityEpoch: EffortCapabilityStrategy | undefined;
 	#serviceTierByFamily: ServiceTierByFamily;
 
 	/**
@@ -137,6 +187,7 @@ export class ModelControls {
 			);
 		}
 		this.#applyThinkingLevelToAgent(this.#thinkingLevel);
+		this.#noteCapabilityEpoch();
 	}
 
 	get #model(): Model | undefined {
@@ -156,16 +207,6 @@ export class ModelControls {
 	/** Configured selector, preserving `auto` while classification is active. */
 	configuredThinkingLevel(): ConfiguredThinkingLevel | undefined {
 		return this.#autoThinking ? AUTO_THINKING : this.#thinkingLevel;
-	}
-
-	/** True when a pending or armed EF2-R3 next-request override exists. */
-	get hasRequestOverride(): boolean {
-		return this.#pendingOverride !== undefined || this.#overrideArmed;
-	}
-
-	/** The accepted-but-not-yet-dispatched override, if any. */
-	get pendingRequestOverride(): { effort: Effort; generation: number } | undefined {
-		return this.#pendingOverride;
 	}
 
 	/** Whether per-turn automatic thinking classification is enabled. */
@@ -217,6 +258,7 @@ export class ModelControls {
 						clampThinkingLevelToCeiling(this.#model, level, this.#thinkingLevelCeiling),
 					);
 		this.#applyThinkingLevelToAgent(this.#thinkingLevel);
+		this.#noteCapabilityEpoch();
 	}
 
 	/** Restores an exact thinking snapshot after a failed session switch. */
@@ -299,6 +341,7 @@ export class ModelControls {
 		// Re-apply thinking for the newly selected model. Prefer the model's
 		// configured defaultLevel; otherwise preserve the current level (or auto).
 		this.#reapplyThinkingLevel(targetModel.thinking?.defaultLevel);
+		this.#noteCapabilityEpoch();
 		await this.#host.syncAfterModelChange(previousEditMode);
 		return { switched: true };
 	}
@@ -339,6 +382,7 @@ export class ModelControls {
 			this.#reapplyThinkingLevel(targetModel.thinking?.defaultLevel);
 		}
 		await this.#host.syncAfterModelChange(previousEditMode);
+		this.#noteCapabilityEpoch();
 	}
 
 	/**
@@ -489,6 +533,7 @@ export class ModelControls {
 		this.#host.settings.getStorage()?.recordModelUsage(`${next.model.provider}/${next.model.id}`);
 
 		// Apply the scoped model's configured thinking level, preserving auto.
+		this.#noteCapabilityEpoch();
 		this.setThinkingLevel(this.#autoThinking ? AUTO_THINKING : next.thinkingLevel);
 		await this.#host.syncAfterModelChange(previousEditMode);
 
@@ -520,6 +565,7 @@ export class ModelControls {
 		this.#host.settings.getStorage()?.recordModelUsage(`${nextModel.provider}/${nextModel.id}`);
 		// Re-apply the current thinking level (or auto) for the newly selected model
 		this.#reapplyThinkingLevel();
+		this.#noteCapabilityEpoch();
 		await this.#host.syncAfterModelChange(previousEditMode);
 
 		return { model: nextModel, thinkingLevel: this.thinkingLevel, isScoped: false };
@@ -775,13 +821,15 @@ export class ModelControls {
 	}
 
 	/**
-	 * EF2-R3: accept a first-party proposal (from the `thinking_effort` tool)
-	 * for the NEXT main logical request's thinking effort. Gated to opt-in
-	 * adaptive mode; a manual concrete pin (auto off) stays authoritative and
-	 * rejects proposals. Stale, unsupported, and no-op proposals are rejected;
-	 * a request above the hard session ceiling is accepted clamped to it.
-	 * Concurrent proposals arbitrate last-wins (the most recent accepted
-	 * proposal replaces any earlier pending one).
+	 * EF2-R3/R5: accept a first-party proposal (from the `thinking_effort`
+	 * tool) for the NEXT main logical request's thinking effort. Gated to
+	 * opt-in adaptive mode; a manual concrete pin (auto off) stays
+	 * authoritative and rejects proposals. Stale, unsupported, and no-op
+	 * proposals are rejected; a request above the hard session ceiling is
+	 * accepted clamped to it. Capability gating per endpoint/API/model:
+	 * unknown-conservative endpoints never enter the native override path;
+	 * prefix-sensitive routes hold the baseline against low-value downgrades
+	 * (an escalation is accepted with its cache risk recorded).
 	 */
 	proposeRequestOverride(requested: string, generation: number): RequestOverrideProposalResult {
 		if (!this.#host.settings.get("providers.autoThinkingAdaptive")) {
@@ -808,8 +856,39 @@ export class ModelControls {
 		if (clamped === this.#thinkingLevel) {
 			return { accepted: false, reason: `effort "${clamped}" is already the effective level` };
 		}
-		this.#pendingOverride = { effort: clamped, generation };
-		return { accepted: true, effort: clamped, clampedToCeiling: clamped !== requestedEffort };
+		const capability = resolveEffortCapabilityStrategy(model);
+		if (capability.strategy === "unknown-conservative") {
+			return { accepted: false, reason: `effort override unavailable: ${capability.reason}` };
+		}
+		let cacheRisk = "";
+		if (capability.strategy === "prefix-sensitive" && clampRank(clamped) < clampRank(this.#thinkingLevel)) {
+			// Prefix-sensitive: hold the baseline against low-value downgrades.
+			// An escalation rewrites the wire payload prefix twice per request.
+			return {
+				accepted: false,
+				reason: "prefix-sensitive route holds the baseline: low-value downgrade declined",
+			};
+		}
+		if (capability.strategy === "prefix-sensitive") {
+			cacheRisk = `baseline→${clamped}→baseline rewrite on a prefix-sensitive route invalidates the prompt-cache prefix twice for one request`;
+		}
+		const pending: PendingRequestOverride = {
+			effort: clamped,
+			generation,
+			requestedEffort,
+			origin: "tool",
+			strategy: capability.strategy,
+			cacheRisk,
+		};
+		this.#pendingOverride = pending;
+		return {
+			accepted: true,
+			effort: clamped,
+			clampedToCeiling: clamped !== requestedEffort,
+			origin: pending.origin,
+			strategy: capability.strategy,
+			cacheRisk,
+		};
 	}
 
 	/**
@@ -819,7 +898,10 @@ export class ModelControls {
 	 * runs the normal classification path. Revalidates against the live
 	 * generation, model capability, and hard ceiling — a fallback/model switch
 	 * never forwards an incompatible wire value — and explicit ultrathink in
-	 * the dispatched text outranks the proposal.
+	 * the dispatched text outranks the proposal. EF2-R4: an apply beyond the
+	 * interval's two-transition budget is declined with a receipt instead of
+	 * spending a third transition; the pending proposal is dropped, never
+	 * stranded.
 	 */
 	consumeRequestOverride(promptText: string | undefined): Effort | undefined {
 		// A dispatch while an override is still armed means the armed request
@@ -846,20 +928,46 @@ export class ModelControls {
 			this.#pendingOverride = undefined;
 			return undefined;
 		}
+		// EF2-R5: a capability epoch change since the proposal was accepted
+		// (model/endpoint switch mid-interval) invalidates an unproven override.
+		if (resolveEffortCapabilityStrategy(model).strategy !== pending.strategy) {
+			this.#pendingOverride = undefined;
+			return undefined;
+		}
+		if (this.#overrideTransitions.spent >= ModelControls.#MAX_OVERRIDE_TRANSITIONS_PER_INTERVAL) {
+			this.#pendingOverride = undefined;
+			this.#host.emit({
+				type: "auto_thinking_decision",
+				receipt: autoThinkingDecisionReceipt({
+					generation: this.#host.promptGeneration(),
+					provider: model.provider,
+					modelId: model.id,
+					source: "override-declined",
+					previous: this.#thinkingLevel === "inherit" ? undefined : this.#thinkingLevel,
+					candidate: pending.requestedEffort,
+					applied: undefined,
+					capabilityStrategy: pending.strategy,
+					durationMs: 0,
+					classifierRequests: 0,
+					origin: pending.origin,
+					declineReason: "the controller transition budget for this interval is exhausted",
+				}),
+			});
+			return undefined;
+		}
 		const effort = clampThinkingLevelToCeiling(model, pending.effort, this.#thinkingLevelCeiling);
 		this.#pendingOverride = undefined;
 		if (effort === undefined || effort === this.#thinkingLevel) return undefined;
-		this.#armOverride(effort, pending.effort);
+		this.#armOverride(pending, effort);
 		return effort;
 	}
-
 	/**
 	 * EF2-R3: settle-time expiry for the consumed override. A retryable
 	 * failure keeps the override armed so the auto-retry of the SAME logical
 	 * request still dispatches at the override; anything else (success, local
 	 * bail, abort) restores the auto baseline. An abort also drops any
 	 * unconsumed pending proposal — a cancelled request cannot leave a
-	 * Floating proposal behind.
+	 * floating proposal behind.
 	 */
 	expireRequestOverride(options: { aborted?: boolean; retryableFailure?: boolean } = {}): void {
 		if (options.aborted) this.#pendingOverride = undefined;
@@ -867,48 +975,114 @@ export class ModelControls {
 		if (options.retryableFailure && !options.aborted) return;
 		this.#restoreOverrideBaseline();
 	}
+	/**
+	 * EF2-R4: mark the boundary of a user-dispatched batch. The controller
+	 * transition budget restarts: at most two controller-originated effective
+	 * transitions (override apply + automatic return) may happen per interval.
+	 */
+	beginUserControllerInterval(): void {
+		this.#overrideTransitions = { spent: 0 };
+	}
+
+	/**
+	 * EF2-R4: record a reassessment observation. Comparable repeated failures,
+	 * sustained no-progress, and phase changes open a qualifying event; TDD
+	 * red steps, tool cancellations, harmless output churn, isolated failures,
+	 * and real progress are negative controls that never qualify.
+	 */
+	recordReassessmentSignal(signal: ReassessmentSignal): ReassessmentVerdict {
+		return this.#reassessment.observe(signal);
+	}
+
+	/** The open qualifying reassessment event, if any (not yet assessed). */
+	get openReassessment(): ReassessmentReason | undefined {
+		return this.#reassessment.peekOpen();
+	}
+
+	/**
+	 * EF2-R5: the effort capability strategy of the active endpoint/API/model.
+	 * Persisted via capability-epoch session entries so a resume reconstructs
+	 * it; a strategy change at any model-change path drops unproven overrides.
+	 */
+	get capabilityEpoch(): EffortCapabilityStrategy | undefined {
+		return this.#capabilityEpoch;
+	}
+
+	/** The pending (not yet dispatched) override proposal, if any. */
+	get pendingRequestOverride(): Readonly<PendingRequestOverride> | undefined {
+		return this.#pendingOverride;
+	}
+
+	/** True while a proposal is pending or a dispatch is running under one. */
+	get hasRequestOverride(): boolean {
+		return this.#pendingOverride !== undefined || this.#overrideArmed;
+	}
+
+	/**
+	 * EF2-R4: the controller's own escalation, proposed only against an open
+	 * qualifying reassessment event (comparable repeated failures, sustained
+	 * no-progress, phase change). One event funds one assessment; the target is
+	 * the smallest supported effort strictly above the current effective level,
+	 * still clamped to the hard session ceiling. Native-verified capability is
+	 * required — unverified endpoints never escalate.
+	 */
+	proposeControllerEscalation(): RequestOverrideProposalResult {
+		const event = this.#reassessment.consumeOpen();
+		if (event === undefined) {
+			return { accepted: false, reason: "no qualifying reassessment event" };
+		}
+		const model = this.#model;
+		if (!model?.reasoning || getSupportedEfforts(model).length === 0) {
+			return { accepted: false, reason: "the active model has no controllable effort surface" };
+		}
+		const capability = resolveEffortCapabilityStrategy(model);
+		if (capability.strategy !== "native-verified") {
+			return {
+				accepted: false,
+				reason: `controller escalation unavailable: ${capability.reason}`,
+			};
+		}
+		const current =
+			this.#thinkingLevel === "inherit" || this.#thinkingLevel === "off" ? undefined : this.#thinkingLevel;
+		const ladder = [...getSupportedEfforts(model)].sort(
+			(a, b) => THINKING_EFFORTS.indexOf(a) - THINKING_EFFORTS.indexOf(b),
+		);
+		let target: Effort | undefined;
+		for (const candidate of ladder) {
+			if (current !== undefined && clampRank(candidate) <= clampRank(current)) continue;
+			const clamped = clampThinkingLevelToCeiling(model, candidate, this.#thinkingLevelCeiling);
+			if (clamped !== undefined) {
+				target = clamped;
+				break;
+			}
+		}
+		if (target === undefined || target === current) {
+			return { accepted: false, reason: "the effective level is already at the top of the supported ladder" };
+		}
+		const pending: PendingRequestOverride = {
+			effort: target,
+			generation: this.#host.promptGeneration(),
+			requestedEffort: target,
+			origin: "controller",
+			strategy: capability.strategy,
+			cacheRisk: "",
+		};
+		this.#pendingOverride = pending;
+		return {
+			accepted: true,
+			effort: target,
+			clampedToCeiling: false,
+			origin: pending.origin,
+			strategy: capability.strategy,
+			cacheRisk: "",
+		};
+	}
 
 	/** Drops all override state without touching levels (resume/branch/manual pin). */
 	#clearRequestOverrideState(): void {
 		this.#pendingOverride = undefined;
 		this.#overrideArmed = false;
 		this.#preOverrideLevel = undefined;
-	}
-
-	#armOverride(effort: Effort, requested: Effort): void {
-		const decisionStartMs = Date.now();
-		const model = this.#model;
-		if (!model) return;
-		const previousLevel = this.#thinkingLevel;
-		this.#preOverrideLevel =
-			previousLevel === "inherit" || previousLevel === "off" || previousLevel === undefined
-				? undefined
-				: previousLevel;
-		this.#overrideArmed = true;
-		this.#thinkingLevel = effort;
-		this.#lastAutoThinkingChangeAtMs = Date.now();
-		this.#applyThinkingLevelToAgent(effort);
-		this.#host.emit({
-			type: "thinking_level_changed",
-			thinkingLevel: effort,
-			configured: AUTO_THINKING,
-			resolved: effort,
-		});
-		this.#host.emit({
-			type: "auto_thinking_decision",
-			receipt: autoThinkingDecisionReceipt({
-				generation: this.#host.promptGeneration(),
-				provider: model.provider,
-				modelId: model.id,
-				source: "override",
-				previous: previousLevel === "inherit" ? undefined : previousLevel,
-				candidate: requested,
-				applied: effort,
-				capabilityStrategy: "inferred",
-				durationMs: Date.now() - decisionStartMs,
-				classifierRequests: 0,
-			}),
-		});
 	}
 
 	/**
@@ -926,6 +1100,9 @@ export class ModelControls {
 		const baseline = this.#preOverrideLevel;
 		this.#preOverrideLevel = undefined;
 		if (!this.#autoThinking) return;
+		// The reserved return slot: the automatic return always executes, even
+		// when the interval budget is otherwise exhausted.
+		this.#overrideTransitions.spent += 1;
 		this.#thinkingLevel = baseline;
 		this.#applyThinkingLevelToAgent(baseline);
 		if (baseline === overrideLevel) return;
@@ -948,9 +1125,69 @@ export class ModelControls {
 				previous: overrideLevel === "inherit" ? undefined : overrideLevel,
 				candidate: undefined,
 				applied: baseline,
-				capabilityStrategy: "inferred",
+				capabilityStrategy: this.#capabilityEpoch ?? "native-verified",
 				durationMs: 0,
 				classifierRequests: 0,
+			}),
+		});
+	}
+
+	/**
+	 * EF2-R5: re-derive the effort capability strategy for the active model.
+	 * A strategy change is a genuine capability epoch: unproven overrides do
+	 * not carry over, the transition budget restarts, and the change is
+	 * persisted as a capability-epoch session entry so a resume reconstructs
+	 * the epoch instead of resurrecting overrides. The initial seeding is
+	 * silent (no entry, nothing to invalidate).
+	 */
+	#noteCapabilityEpoch(): void {
+		const capability = resolveEffortCapabilityStrategy(this.#model);
+		if (this.#capabilityEpoch === capability.strategy) return;
+		const previous = this.#capabilityEpoch;
+		this.#capabilityEpoch = capability.strategy;
+		if (previous === undefined) return;
+		this.#clearRequestOverrideState();
+		this.#overrideTransitions = { spent: 0 };
+		this.#host.sessionManager.appendCapabilityEpochChange(capability.strategy, capability.reason);
+	}
+
+	#armOverride(pending: PendingRequestOverride, effort: Effort): void {
+		const decisionStartMs = Date.now();
+		const model = this.#model;
+		if (!model) return;
+		const previousLevel = this.#thinkingLevel;
+		this.#preOverrideLevel =
+			previousLevel === "inherit" || previousLevel === "off" || previousLevel === undefined
+				? undefined
+				: previousLevel;
+		this.#overrideArmed = true;
+		this.#thinkingLevel = effort;
+		this.#lastAutoThinkingChangeAtMs = Date.now();
+		// The application spends the interval's first transition; the return
+		// slot stays reserved so an armed override can always come home.
+		this.#overrideTransitions.spent += 1;
+		this.#applyThinkingLevelToAgent(effort);
+		this.#host.emit({
+			type: "thinking_level_changed",
+			thinkingLevel: effort,
+			configured: AUTO_THINKING,
+			resolved: effort,
+		});
+		this.#host.emit({
+			type: "auto_thinking_decision",
+			receipt: autoThinkingDecisionReceipt({
+				generation: this.#host.promptGeneration(),
+				provider: model.provider,
+				modelId: model.id,
+				source: "override",
+				previous: previousLevel === "inherit" ? undefined : previousLevel,
+				candidate: pending.requestedEffort,
+				applied: effort,
+				capabilityStrategy: pending.strategy,
+				durationMs: Date.now() - decisionStartMs,
+				classifierRequests: 0,
+				origin: pending.origin,
+				cacheRisk: pending.cacheRisk === "" ? undefined : pending.cacheRisk,
 			}),
 		});
 	}

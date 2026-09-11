@@ -3559,6 +3559,8 @@ export class AgentSession {
 		// EF2-R3: a pending next-request override outranks per-batch
 		// classification; consuming it applies the temporary effort and skips
 		// the classifier for this dispatch.
+		// EF2-R4: each user-dispatched batch starts a fresh controller transition interval.
+		this.#models.beginUserControllerInterval();
 		if (this.#models.consumeRequestOverride(batchText) !== undefined) return;
 		if (!this.settings.get("providers.autoThinkingAdaptive")) return;
 		await this.#models.applyAutoThinkingLevel(
@@ -6273,6 +6275,8 @@ export class AgentSession {
 				// EF2-R3: a pending next-request override outranks per-turn
 				// classification; consuming it applies the temporary effort and
 				// skips the classifier for this dispatch.
+				// EF2-R4: a user-dispatched turn starts a fresh controller transition interval.
+				this.#models.beginUserControllerInterval();
 				if (this.#models.consumeRequestOverride(expandedText) === undefined) {
 					await this.#models.applyAutoThinkingLevel(
 						this.#classifyAutoThinkingInput(expandedText, "new-prompt"),
