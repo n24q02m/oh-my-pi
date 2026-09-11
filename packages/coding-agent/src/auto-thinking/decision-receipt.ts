@@ -26,14 +26,31 @@ export type AutoThinkingDecisionSource =
 	/** EF2-R3: a pending next-request override was consumed at actual dispatch. */
 	| "override"
 	/** EF2-R3: the consumed override expired and the auto baseline was restored. */
-	| "override-expired";
+	| "override-expired"
+	/** EF2-R4: a pending override was declined at consume (budget/capability). */
+	| "override-declined";
+/**
+ * EF2-R4: who originated a next-request override decision — the model's
+ * `thinking_effort` tool or the controller's reassessment escalation.
+ */
+export type RequestOverrideOrigin = "tool" | "controller";
 
 /**
  * How the decided model's thinking capability was established. Only catalog
  * inference exists today; EF1-R2's endpoint capability override adds the
  * `override` member when it lands.
  */
-export type AutoThinkingCapabilityStrategy = "inferred" | "override";
+export type AutoThinkingCapabilityStrategy =
+	/** Catalog-only inference (the EF1 classifier path). */
+	| "inferred"
+	/** EF1-R2's explicit endpoint capability override (config-declared). */
+	| "override"
+	/** EF2-R5: catalog-verified endpoint/API/model — native wire updates. */
+	| "native-verified"
+	/** EF2-R5: effort encoded in the request identity; changes rewrite the prefix. */
+	| "prefix-sensitive"
+	/** EF2-R5: unverified endpoint (e.g. nominal family alias) — no native path. */
+	| "unknown-conservative";
 
 /**
  * One auto-thinking decision, recorded per prompt generation.
@@ -64,6 +81,12 @@ export interface AutoThinkingDecisionReceipt {
 	classifierRequests: 0 | 1;
 	/** Bounded error message when the classifier failed; never a stack/payload. */
 	failure?: string | undefined;
+	/** EF2-R4: who originated an override decision (tool call or controller escalation). */
+	origin?: RequestOverrideOrigin | undefined;
+	/** EF2-R5: recorded baseline→override→baseline cost on prefix-sensitive escalations. */
+	cacheRisk?: string | undefined;
+	/** EF2-R4: why a pending override was declined at consume time. */
+	declineReason?: string | undefined;
 }
 
 /** Hard cap for `failure` — enough for any thrown `Error.message`, never a body. */
