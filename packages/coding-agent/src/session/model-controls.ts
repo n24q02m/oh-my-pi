@@ -30,6 +30,7 @@ import {
 	type ConfiguredThinkingLevel,
 	clampAutoThinkingEffort,
 	clampThinkingLevelToCeiling,
+	parseEffort,
 	resolveProvisionalAutoLevel,
 	resolveThinkingLevelForModel,
 	shouldDisableReasoning,
@@ -42,6 +43,14 @@ import { formatRoleModelValue, resolveRoleModelFull } from "./role-models";
 import { EPHEMERAL_MODEL_CHANGE_ROLE } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 import { sideRequestIdentity } from "./side-request-identity";
+
+/**
+ * Outcome of an EF2-R3 next-request effort proposal. `clampedToCeiling` marks
+ * an accepted proposal the hard session ceiling pulled down.
+ */
+export type RequestOverrideProposalResult =
+	| { accepted: true; effort: Effort; clampedToCeiling: boolean }
+	| { accepted: false; reason: string };
 
 /** Capabilities borrowed from the owning AgentSession. */
 export interface ModelControlsHost {
@@ -75,6 +84,16 @@ export class ModelControls {
 	#autoResolvedLevel: Effort | undefined;
 	/** When the auto path last CHANGED the effective level (ms epoch); correlates prompt-cache drops. */
 	#lastAutoThinkingChangeAtMs: number | undefined;
+	/**
+	 * EF2-R3 temporary next-request override. `#pendingOverride` is an accepted
+	 * first-party proposal awaiting actual dispatch; `#overrideArmed` marks the
+	 * request currently dispatching under the override, with `#preOverrideLevel`
+	 * holding the auto baseline to restore on expiry. Never persisted: the
+	 * configured selector stays `auto` throughout.
+	 */
+	#pendingOverride: { effort: Effort; generation: number } | undefined;
+	#overrideArmed = false;
+	#preOverrideLevel: Effort | undefined;
 
 	#serviceTierByFamily: ServiceTierByFamily;
 
@@ -139,6 +158,16 @@ export class ModelControls {
 		return this.#autoThinking ? AUTO_THINKING : this.#thinkingLevel;
 	}
 
+	/** True when a pending or armed EF2-R3 next-request override exists. */
+	get hasRequestOverride(): boolean {
+		return this.#pendingOverride !== undefined || this.#overrideArmed;
+	}
+
+	/** The accepted-but-not-yet-dispatched override, if any. */
+	get pendingRequestOverride(): { effort: Effort; generation: number } | undefined {
+		return this.#pendingOverride;
+	}
+
 	/** Whether per-turn automatic thinking classification is enabled. */
 	get isAutoThinking(): boolean {
 		return this.#autoThinking;
@@ -171,6 +200,9 @@ export class ModelControls {
 
 	/** Restores thinking state from a transcript without persisting a new entry. */
 	restoreThinkingLevel(level: ConfiguredThinkingLevel | undefined): void {
+		// A transcript restore (resume/branch) drops transient override state: a
+		// pending proposal never survives a session boundary.
+		this.#clearRequestOverrideState();
 		this.#autoThinking = level === AUTO_THINKING;
 		this.#autoResolvedLevel = undefined;
 		this.#thinkingLevel =
@@ -190,6 +222,7 @@ export class ModelControls {
 	/** Restores an exact thinking snapshot after a failed session switch. */
 	restoreThinkingSnapshot(level: ThinkingLevel | undefined, auto: boolean, resolved: Effort | undefined): void {
 		this.#thinkingLevel = level;
+		this.#clearRequestOverrideState();
 		this.#autoThinking = auto;
 		this.#autoResolvedLevel = resolved;
 		this.#applyThinkingLevelToAgent(level);
@@ -545,7 +578,10 @@ export class ModelControls {
 			return;
 		}
 
+		// A manual concrete pin is authoritative: it cancels any pending or
+		// armed EF2-R3 override and disables auto (existing behavior).
 		const wasAuto = this.#autoThinking;
+		this.#clearRequestOverrideState();
 		this.#autoThinking = false;
 		this.#autoResolvedLevel = undefined;
 		const effectiveLevel = resolveThinkingLevelForModel(
@@ -734,6 +770,187 @@ export class ModelControls {
 				durationMs: Date.now() - decisionStartMs,
 				classifierRequests,
 				failure,
+			}),
+		});
+	}
+
+	/**
+	 * EF2-R3: accept a first-party proposal (from the `thinking_effort` tool)
+	 * for the NEXT main logical request's thinking effort. Gated to opt-in
+	 * adaptive mode; a manual concrete pin (auto off) stays authoritative and
+	 * rejects proposals. Stale, unsupported, and no-op proposals are rejected;
+	 * a request above the hard session ceiling is accepted clamped to it.
+	 * Concurrent proposals arbitrate last-wins (the most recent accepted
+	 * proposal replaces any earlier pending one).
+	 */
+	proposeRequestOverride(requested: string, generation: number): RequestOverrideProposalResult {
+		if (!this.#host.settings.get("providers.autoThinkingAdaptive")) {
+			return { accepted: false, reason: "adaptive effort mode is off" };
+		}
+		if (!this.#autoThinking) {
+			return { accepted: false, reason: "a manual effort level is active" };
+		}
+		const requestedEffort = parseEffort(requested);
+		if (requestedEffort === undefined) {
+			return { accepted: false, reason: `unknown effort "${requested}"` };
+		}
+		const model = this.#model;
+		if (!model?.reasoning || getSupportedEfforts(model).length === 0) {
+			return { accepted: false, reason: "the active model has no controllable effort surface" };
+		}
+		if (!getSupportedEfforts(model).includes(requestedEffort)) {
+			return { accepted: false, reason: `the active model does not support effort "${requestedEffort}"` };
+		}
+		const clamped = clampThinkingLevelToCeiling(model, requestedEffort, this.#thinkingLevelCeiling);
+		if (clamped === undefined) {
+			return { accepted: false, reason: "the active model has no effort at or below the session ceiling" };
+		}
+		if (clamped === this.#thinkingLevel) {
+			return { accepted: false, reason: `effort "${clamped}" is already the effective level` };
+		}
+		this.#pendingOverride = { effort: clamped, generation };
+		return { accepted: true, effort: clamped, clampedToCeiling: clamped !== requestedEffort };
+	}
+
+	/**
+	 * EF2-R3: consume the pending override at actual dispatch of a main logical
+	 * request. Returns the applied effort when the override governs this
+	 * dispatch (the caller must then skip per-turn classification); `undefined`
+	 * runs the normal classification path. Revalidates against the live
+	 * generation, model capability, and hard ceiling — a fallback/model switch
+	 * never forwards an incompatible wire value — and explicit ultrathink in
+	 * the dispatched text outranks the proposal.
+	 */
+	consumeRequestOverride(promptText: string | undefined): Effort | undefined {
+		// A dispatch while an override is still armed means the armed request
+		// ended without its settle running (superseded): close it out first so
+		// a stale temporary level can never leak into the new logical request.
+		if (this.#overrideArmed) this.#restoreOverrideBaseline();
+		if (!this.#autoThinking) return undefined;
+		const pending = this.#pendingOverride;
+		if (!pending) return undefined;
+		if (this.#host.promptGeneration() !== pending.generation) {
+			this.#pendingOverride = undefined;
+			return undefined;
+		}
+		if (promptText !== undefined && this.#host.magicKeywordEnabled("ultrathink") && containsUltrathink(promptText)) {
+			this.#pendingOverride = undefined;
+			return undefined;
+		}
+		const model = this.#model;
+		if (!model?.reasoning || getSupportedEfforts(model).length === 0) {
+			this.#pendingOverride = undefined;
+			return undefined;
+		}
+		if (!getSupportedEfforts(model).includes(pending.effort)) {
+			this.#pendingOverride = undefined;
+			return undefined;
+		}
+		const effort = clampThinkingLevelToCeiling(model, pending.effort, this.#thinkingLevelCeiling);
+		this.#pendingOverride = undefined;
+		if (effort === undefined || effort === this.#thinkingLevel) return undefined;
+		this.#armOverride(effort, pending.effort);
+		return effort;
+	}
+
+	/**
+	 * EF2-R3: settle-time expiry for the consumed override. A retryable
+	 * failure keeps the override armed so the auto-retry of the SAME logical
+	 * request still dispatches at the override; anything else (success, local
+	 * bail, abort) restores the auto baseline. An abort also drops any
+	 * unconsumed pending proposal — a cancelled request cannot leave a
+	 * Floating proposal behind.
+	 */
+	expireRequestOverride(options: { aborted?: boolean; retryableFailure?: boolean } = {}): void {
+		if (options.aborted) this.#pendingOverride = undefined;
+		if (!this.#overrideArmed) return;
+		if (options.retryableFailure && !options.aborted) return;
+		this.#restoreOverrideBaseline();
+	}
+
+	/** Drops all override state without touching levels (resume/branch/manual pin). */
+	#clearRequestOverrideState(): void {
+		this.#pendingOverride = undefined;
+		this.#overrideArmed = false;
+		this.#preOverrideLevel = undefined;
+	}
+
+	#armOverride(effort: Effort, requested: Effort): void {
+		const decisionStartMs = Date.now();
+		const model = this.#model;
+		if (!model) return;
+		const previousLevel = this.#thinkingLevel;
+		this.#preOverrideLevel =
+			previousLevel === "inherit" || previousLevel === "off" || previousLevel === undefined
+				? undefined
+				: previousLevel;
+		this.#overrideArmed = true;
+		this.#thinkingLevel = effort;
+		this.#lastAutoThinkingChangeAtMs = Date.now();
+		this.#applyThinkingLevelToAgent(effort);
+		this.#host.emit({
+			type: "thinking_level_changed",
+			thinkingLevel: effort,
+			configured: AUTO_THINKING,
+			resolved: effort,
+		});
+		this.#host.emit({
+			type: "auto_thinking_decision",
+			receipt: autoThinkingDecisionReceipt({
+				generation: this.#host.promptGeneration(),
+				provider: model.provider,
+				modelId: model.id,
+				source: "override",
+				previous: previousLevel === "inherit" ? undefined : previousLevel,
+				candidate: requested,
+				applied: effort,
+				capabilityStrategy: "inferred",
+				durationMs: Date.now() - decisionStartMs,
+				classifierRequests: 0,
+			}),
+		});
+	}
+
+	/**
+	 * Restore the auto baseline after an armed override expires. Clears the
+	 * armed state unconditionally, but leaves the level untouched when a
+	 * manual concrete pin took over mid-request (the pin is authoritative).
+	 * Transient by design: no session entry is appended, so a crash/resume
+	 * reconstructs the baseline, never the override.
+	 */
+	#restoreOverrideBaseline(): void {
+		const armed = this.#overrideArmed;
+		this.#overrideArmed = false;
+		if (!armed) return;
+		const overrideLevel = this.#thinkingLevel;
+		const baseline = this.#preOverrideLevel;
+		this.#preOverrideLevel = undefined;
+		if (!this.#autoThinking) return;
+		this.#thinkingLevel = baseline;
+		this.#applyThinkingLevelToAgent(baseline);
+		if (baseline === overrideLevel) return;
+		this.#lastAutoThinkingChangeAtMs = Date.now();
+		this.#host.emit({
+			type: "thinking_level_changed",
+			thinkingLevel: baseline,
+			configured: AUTO_THINKING,
+			resolved: baseline,
+		});
+		const model = this.#model;
+		if (!model) return;
+		this.#host.emit({
+			type: "auto_thinking_decision",
+			receipt: autoThinkingDecisionReceipt({
+				generation: this.#host.promptGeneration(),
+				provider: model.provider,
+				modelId: model.id,
+				source: "override-expired",
+				previous: overrideLevel === "inherit" ? undefined : overrideLevel,
+				candidate: undefined,
+				applied: baseline,
+				capabilityStrategy: "inferred",
+				durationMs: 0,
+				classifierRequests: 0,
 			}),
 		});
 	}
