@@ -26,6 +26,12 @@ export interface AdvisorConfig {
 	 *  stays in the roster but its runtime is never built — it shows `○` in
 	 *  the status line and `/advisor status` rather than disappearing. */
 	enabled?: boolean;
+	/** Max `severity="blocker"` cards this advisor may deliver per primary turn
+	 *  (default 1). Blockers past the budget are downgraded to `concern` instead
+	 *  of steering the primary — a flash-tier advisor mislabeling most notes as
+	 *  blockers can no longer trigger-interrupt the run every update. `null`
+	 *  disables the cap (every blocker delivered verbatim). */
+	maxBlockersPerTurn?: number | null;
 }
 
 /**
@@ -55,6 +61,7 @@ const advisorEntrySchema = type({
 	"tools?": "string[]",
 	"instructions?": "string",
 	"enabled?": "boolean",
+	"maxBlockersPerTurn?": "number | null",
 });
 
 const watchdogYamlSchema = type({
@@ -173,6 +180,7 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
 				tools: filterAdvisorTools(entry.tools, item.path),
 				instructions,
 				enabled: entry.enabled,
+				maxBlockersPerTurn: entry.maxBlockersPerTurn,
 			});
 		}
 	}
@@ -259,6 +267,7 @@ export async function loadWatchdogConfigFile(filePath: string): Promise<Watchdog
 		if (a.tools !== undefined) advisor.tools = [...a.tools];
 		if (a.instructions?.trim()) advisor.instructions = a.instructions;
 		if (a.enabled !== undefined) advisor.enabled = a.enabled;
+		if (a.maxBlockersPerTurn !== undefined) advisor.maxBlockersPerTurn = a.maxBlockersPerTurn;
 		return advisor;
 	});
 	const doc: WatchdogConfigDoc = { advisors };
@@ -317,6 +326,8 @@ export function serializeWatchdogConfig(doc: WatchdogConfigDoc): string {
 				appendYamlString(lines, "    ", "instructions", advisor.instructions);
 			}
 			if (advisor.enabled !== undefined) lines.push(`    enabled: ${advisor.enabled}`);
+			if (advisor.maxBlockersPerTurn !== undefined)
+				lines.push(`    maxBlockersPerTurn: ${advisor.maxBlockersPerTurn}`);
 		}
 	}
 	return lines.length === 0 ? "" : `${lines.join("\n")}\n`;

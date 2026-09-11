@@ -350,3 +350,41 @@ describe("per-advisor enabled field", () => {
 		expect(text.match(/enabled:/g)).toHaveLength(2);
 	});
 });
+
+describe("per-advisor maxBlockersPerTurn field", () => {
+	it("preserves explicit budget, uncapped null, and absence through save and discovery", async () => {
+		const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-advisor-blockercap-"));
+		await fsp.mkdir(path.join(tmp, ".git"));
+		try {
+			const doc: WatchdogConfigDoc = {
+				advisors: [
+					{ name: "Capped", model: "test/model-a", maxBlockersPerTurn: 2 },
+					{ name: "Uncapped", model: "test/model-b", maxBlockersPerTurn: null },
+					{ name: "Default", model: "test/model-c" },
+				],
+			};
+			const file = path.join(tmp, "WATCHDOG.yml");
+			await saveWatchdogConfigFile(file, doc);
+
+			const loaded = await loadWatchdogConfigFile(file);
+			expect(loaded.advisors.map(advisor => advisor.maxBlockersPerTurn)).toEqual([2, null, undefined]);
+
+			const { advisors } = await discoverAdvisorConfigs(tmp, tmp);
+			expect(advisors.map(advisor => advisor.maxBlockersPerTurn)).toEqual([2, null, undefined]);
+		} finally {
+			await fsp.rm(tmp, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a non-numeric budget at the schema level so the file is skipped with a warning", async () => {
+		const tmp = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-advisor-blockercap-bad-"));
+		await fsp.mkdir(path.join(tmp, ".git"));
+		try {
+			await Bun.write(path.join(tmp, "WATCHDOG.yml"), "advisors:\n  - name: Broken\n    maxBlockersPerTurn: lots\n");
+			const { advisors } = await discoverAdvisorConfigs(tmp, tmp);
+			expect(advisors).toEqual([]);
+		} finally {
+			await fsp.rm(tmp, { recursive: true, force: true });
+		}
+	});
+});
