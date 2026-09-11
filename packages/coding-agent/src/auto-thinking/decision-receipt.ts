@@ -22,7 +22,11 @@ export type AutoThinkingDecisionSource =
 	| "classifier"
 	| "fallback"
 	| "aborted"
-	| "stale-batch";
+	| "stale-batch"
+	/** EF2-R3: a pending next-request override was consumed at actual dispatch. */
+	| "override"
+	/** EF2-R3: the consumed override expired and the auto baseline was restored. */
+	| "override-expired";
 
 /**
  * How the decided model's thinking capability was established. Only catalog
