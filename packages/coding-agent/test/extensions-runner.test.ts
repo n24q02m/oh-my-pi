@@ -2,9 +2,11 @@
  * Tests for ExtensionRunner - conflict detection, error handling, tool wrapping.
  */
 
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { AuthCredentialStore } from "@oh-my-pi/pi-ai";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { discoverAndLoadExtensions } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
@@ -18,17 +20,20 @@ describe("ExtensionRunner", () => {
 	let extensionsDir: string;
 	let sessionManager: SessionManager;
 	let modelRegistry: ModelRegistry;
+	let authStore: AuthCredentialStore;
 
-	beforeEach(async () => {
+	beforeEach(() => {
 		tempDir = TempDir.createSync("@pi-runner-test-");
 		extensionsDir = path.join(getProjectAgentDir(tempDir.path()), "extensions");
 		fs.mkdirSync(extensionsDir, { recursive: true });
 		sessionManager = SessionManager.inMemory();
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
+		authStore = new AuthCredentialStore(new Database(":memory:"));
+		const authStorage = new AuthStorage(authStore);
 		modelRegistry = new ModelRegistry(authStorage);
 	});
 
 	afterEach(() => {
+		authStore.close();
 		tempDir.removeSync();
 	});
 

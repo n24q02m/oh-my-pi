@@ -26,8 +26,6 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 		private registeredTool: RegisteredTool,
 		private runner: ExtensionRunner,
 	) {
-		applyToolProxy(registeredTool.definition, this);
-
 		// Only define render methods when the underlying definition provides them.
 		// If these exist unconditionally on the prototype, ToolExecutionComponent
 		// enters the custom-renderer path, gets undefined back, and silently
@@ -45,6 +43,7 @@ export class RegisteredToolAdapter implements AgentTool<any, any, any> {
 					args,
 				);
 		}
+		applyToolProxy(registeredTool.definition, this);
 	}
 
 	async execute(

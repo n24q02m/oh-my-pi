@@ -123,7 +123,8 @@ impl PtySession {
 		let ct = task::CancelToken::new(options.timeout_ms, options.signal);
 		let core = Arc::clone(&self.core);
 
-		// Register control channel synchronously so write()/kill() work immediately.
+		// Register control channel synchronously so write()/kill() work
+		// immediately.
 		let (control_tx, control_rx) = mpsc::channel::<ControlMessage>();
 		{
 			let mut guard = core
@@ -283,7 +284,8 @@ fn run_pty_sync(
 							Err(err) => {
 								let valid_up_to = err.valid_up_to();
 								if valid_up_to > 0 {
-									// SAFETY: [..valid_up_to] is guaranteed valid UTF-8 by valid_up_to().
+									// SAFETY: [..valid_up_to] is guaranteed valid UTF-8
+									// by valid_up_to().
 									let text = unsafe { str::from_utf8_unchecked(&pending[..valid_up_to]) };
 									let _ = reader_tx.send(ReaderEvent::Chunk(text.to_string()));
 									buf.copy_within(valid_up_to..it, 0);

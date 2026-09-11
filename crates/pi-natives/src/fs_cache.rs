@@ -180,7 +180,8 @@ pub fn should_skip_path(path: &Path, mentions_node_modules: bool) -> bool {
 		return true;
 	}
 	if !mentions_node_modules && contains_component(path, "node_modules") {
-		// Skip node_modules by default unless explicitly requested/pattern-matched.
+		// Skip node_modules by default unless explicitly
+		// requested/pattern-matched.
 		return true;
 	}
 	false
@@ -257,7 +258,8 @@ fn collect_entries(
 		let Ok(entry) = entry else { continue };
 		let path = entry.path();
 		if should_skip_path(path, true) {
-			// The cache always stores node_modules; caller-side filtering is applied later.
+			// The cache always stores node_modules; caller-side filtering is
+			// applied later.
 			continue;
 		}
 

@@ -1165,8 +1165,8 @@ export class SessionManager {
 	}
 
 	/** Initialize with a specific session file (used by factory methods) */
-	async #initSessionFile(sessionFile: string): Promise<void> {
-		await this.setSessionFile(sessionFile);
+	async #initSessionFile(sessionFile: string, suppressBreadcrumb?: boolean): Promise<void> {
+		await this.setSessionFile(sessionFile, suppressBreadcrumb === true ? { suppressBreadcrumb } : undefined);
 	}
 
 	/** Initialize with a new session (used by factory methods) */
@@ -1175,12 +1175,12 @@ export class SessionManager {
 	}
 
 	/** Switch to a different session file (used for resume and branching) */
-	async setSessionFile(sessionFile: string): Promise<void> {
+	async setSessionFile(sessionFile: string, options?: { suppressBreadcrumb?: boolean }): Promise<void> {
 		await this.#closePersistWriter();
 		this.#persistError = undefined;
 		this.#persistErrorReported = false;
 		this.#sessionFile = path.resolve(sessionFile);
-		writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
+		if (!options?.suppressBreadcrumb) writeTerminalBreadcrumb(this.cwd, this.#sessionFile);
 		this.#fileEntries = await loadEntriesFromFile(this.#sessionFile, this.storage);
 		if (this.#fileEntries.length > 0) {
 			const header = this.#fileEntries.find(e => e.type === "session") as SessionHeader | undefined;
@@ -2237,6 +2237,7 @@ export class SessionManager {
 		filePath: string,
 		sessionDir?: string,
 		storage: SessionStorage = new FileSessionStorage(),
+		options?: { suppressBreadcrumb?: boolean },
 	): Promise<SessionManager> {
 		// Extract cwd from session header if possible, otherwise use getProjectDir()
 		const entries = await loadEntriesFromFile(filePath, storage);
@@ -2245,7 +2246,7 @@ export class SessionManager {
 		// If no sessionDir provided, derive from file's parent directory
 		const dir = sessionDir ?? path.resolve(filePath, "..");
 		const manager = new SessionManager(cwd, dir, true, storage);
-		await manager.#initSessionFile(filePath);
+		await manager.#initSessionFile(filePath, options?.suppressBreadcrumb);
 		return manager;
 	}
 

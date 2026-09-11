@@ -5,6 +5,8 @@ import { APP_NAME, VERSION } from "@oh-my-pi/pi-utils";
  * lightweight CLI runner from pi-utils.
  */
 import { type CommandEntry, run } from "@oh-my-pi/pi-utils/cli";
+import { runSessionExitSentinelFromEnvironment } from "./session/session-sentinel";
+import { SESSION_SENTINEL_WORKER_ARG } from "./session/session-sentinel-protocol";
 
 // Detect known Bun errata that cause TUI crashes (e.g. Bun.stringWidth mishandling OSC sequences).
 if (Bun.stringWidth("\x1b[0m\x1b]8;;\x07") !== 0) {
@@ -49,7 +51,11 @@ function isSubcommand(first: string | undefined): boolean {
 }
 
 /** Run the CLI with the given argv (no `process.argv` prefix). */
-export function runCli(argv: string[]): Promise<void> {
+export async function runCli(argv: string[]): Promise<void> {
+	if (argv[0] === SESSION_SENTINEL_WORKER_ARG) {
+		await runSessionExitSentinelFromEnvironment();
+		return;
+	}
 	// --help and --version are handled by run() directly, don't rewrite those.
 	// Everything else that isn't a known subcommand routes to "launch".
 	const first = argv[0];

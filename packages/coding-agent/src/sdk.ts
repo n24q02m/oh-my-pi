@@ -67,6 +67,7 @@ import asyncResultTemplate from "./prompts/tools/async-result.md" with { type: "
 import { collectEnvSecrets, loadSecrets, obfuscateMessages, SecretObfuscator } from "./secrets";
 import { AgentSession } from "./session/agent-session";
 import { AuthStorage } from "./session/auth-storage";
+import { createInterruptedTurnAbortMessage } from "./session/exit-diagnostics";
 import { convertToLlm } from "./session/messages";
 import { SessionManager } from "./session/session-manager";
 import { closeAllConnections } from "./ssh/connection-manager";
@@ -596,8 +597,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	};
 
 	// Check if session has existing data to restore
-	const existingSession = logger.time("loadSession", () => sessionManager.buildSessionContext());
-	const hasExistingSession = existingSession.messages.length > 0;
+	let existingSession = logger.time("loadSession", () => sessionManager.buildSessionContext());
+	let hasExistingSession = existingSession.messages.length > 0;
 	const hasThinkingEntry = sessionManager.getBranch().some(entry => entry.type === "thinking_level_change");
 
 	const hasExplicitModel = options.model !== undefined || options.modelPattern !== undefined;
@@ -1033,6 +1034,20 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			modelFallbackMessage =
 				"No models available. Use /login or set an API key environment variable. Then use /model to select a model.";
 		}
+	}
+
+	// Close an unobservable interrupted turn before restoring the session into the
+	// live agent. The synthetic terminal record is appended after the sentinel
+	// marker, so a second resume sees a completed tail and cannot duplicate it.
+	const interruptedTurn = createInterruptedTurnAbortMessage(
+		sessionManager.getBranch(),
+		model ? { api: model.api, provider: model.provider, model: model.id } : undefined,
+	);
+	if (interruptedTurn) {
+		sessionManager.appendMessage(interruptedTurn);
+		await sessionManager.flush();
+		existingSession = sessionManager.buildSessionContext();
+		hasExistingSession = existingSession.messages.length > 0;
 	}
 
 	// Discover custom commands (TypeScript slash commands)

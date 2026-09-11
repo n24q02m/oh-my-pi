@@ -75,8 +75,8 @@ mod platform {
 	/// Skips branches when libproc returns no children.
 	pub fn collect_descendants(pid: i32, pids: &mut Vec<i32>) {
 		// First call to get count
-		// SAFETY: passing null buffer with size 0 to query child count is valid per
-		// libproc API.
+		// SAFETY: passing null buffer with size 0 to query child count is valid
+		// per libproc API.
 		let count = unsafe { proc_listchildpids(pid, ptr::null_mut(), 0) };
 		if count <= 0 {
 			return;

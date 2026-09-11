@@ -1,0 +1,59 @@
+name: Fork crash-safe-session-replay
+
+on:
+  push:
+    branches: [fix/crash-safe-session-replay]
+
+permissions:
+  contents: read
+
+jobs:
+  replay_contract:
+    name: Crash-safe session replay contract
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      # Inline shared bun-install composite (this branch predates
+      # .github/actions/): install the pinned bun, then frozen install with
+      # the same clean-cache retry as the composite.
+      - name: Install bun when missing
+        shell: bash
+        run: |
+          if ! command -v bun >/dev/null 2>&1; then
+            export BUN_INSTALL="${HOME}/.bun"
+            curl -fsSL https://bun.sh/install | bash
+            echo "${BUN_INSTALL}/bin" >> "$GITHUB_PATH"
+          else
+            echo "bun present: $(bun --version)"
+          fi
+      - name: Install dependencies
+        shell: bash
+        run: |
+          if bun install --frozen-lockfile; then
+            exit 0
+          fi
+          echo "::warning title=bun install retry::install failed; retrying with a clean job-local cache"
+          retry_cache="$(mktemp -d "${RUNNER_TEMP:-/tmp}/bun-cache-retry.XXXXXX")"
+          bun install --frozen-lockfile --cache-dir="$retry_cache"
+      - name: Install release native addons
+        shell: bash
+        run: |
+          set -euo pipefail
+          natives_version="$(bun -p "require('./packages/natives/package.json').version")"
+          echo "Installing @oh-my-pi/pi-natives@${natives_version} bundled natives"
+          tarball="$(npm view @oh-my-pi/pi-natives@${natives_version} dist.tarball)"
+          addons_dir="$RUNNER_TEMP/natives-addons"
+          rm -rf "$addons_dir" && mkdir -p "$addons_dir" packages/natives/native
+          curl -fsSL --retry 3 "$tarball" | tar -xz -C "$addons_dir"
+          find "$addons_dir" -name "pi_natives.linux-x64*.node" -exec cp {} packages/natives/native/ \;
+          ls packages/natives/native/
+      - name: Check TypeScript types
+        working-directory: packages/coding-agent
+        run: bun run check
+      - name: Run session replay tests
+        working-directory: packages/coding-agent
+        env:
+          PI_TEST_RUNTIME: "1"
+          BUN_JSC_useConcurrentGC: "0"
+          BUN_JSC_numberOfGCMarkers: "1"
+        run: bun test test/sdk-model-selection.test.ts test/extensions-runner.test.ts

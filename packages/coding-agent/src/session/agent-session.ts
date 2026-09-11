@@ -39,7 +39,7 @@ import type {
 	UsageReport,
 } from "@oh-my-pi/pi-ai";
 import { isContextOverflow, modelsAreEqual, supportsXhigh } from "@oh-my-pi/pi-ai";
-import { abortableSleep, getAgentDbPath, isEnoent, logger } from "@oh-my-pi/pi-utils";
+import { abortableSleep, getAgentDbPath, isEnoent, logger, Snowflake } from "@oh-my-pi/pi-utils";
 import type { AsyncJob, AsyncJobManager } from "../async";
 import type { Rule } from "../capability/rule";
 import { MODEL_ROLE_IDS, type ModelRegistry, type ModelRole } from "../config/model-registry";
@@ -104,6 +104,13 @@ import {
 } from "./compaction";
 import { DEFAULT_PRUNE_CONFIG, pruneToolOutputs } from "./compaction/pruning";
 import {
+	collectPendingToolCalls,
+	SESSION_EXIT_CUSTOM_TYPE,
+	SESSION_LIVENESS_CUSTOM_TYPE,
+	type SessionExitData,
+	type SessionLivenessData,
+} from "./exit-diagnostics";
+import {
 	type BashExecutionMessage,
 	type BranchSummaryMessage,
 	bashExecutionToText,
@@ -116,6 +123,7 @@ import {
 } from "./messages";
 import type { BranchSummaryEntry, CompactionEntry, NewSessionOptions, SessionManager } from "./session-manager";
 import { getLatestCompactionEntry } from "./session-manager";
+import { startSessionExitSentinel } from "./session-sentinel";
 
 /** Session-specific events that extend the core AgentEvent */
 export type AgentSessionEvent =
@@ -181,6 +189,11 @@ export interface AgentSessionConfig {
 	obfuscator?: SecretObfuscator;
 	/** Pending action store for preview/apply workflows */
 	pendingActionStore?: PendingActionStore;
+	/**
+	 * Starts the detached crash-safety sentinel for the session file.
+	 * Defaults to the real sentinel spawner; tests inject a stub or undefined to suppress spawning.
+	 */
+	startSessionExitSentinel?: (sessionFile: string) => (() => void) | undefined;
 }
 
 /** Options for AgentSession.prompt() */
@@ -246,6 +259,14 @@ const THINKING_LEVELS: ThinkingLevel[] = ["off", "minimal", "low", "medium", "hi
 
 /** Thinking levels including xhigh (for supported models) */
 const THINKING_LEVELS_WITH_XHIGH: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
+const SESSION_LIVENESS_PROGRESS_INTERVAL_MS = 15_000;
+
+function configuredWatchdogMs(timeoutSeconds: number): number | undefined {
+	if (!Number.isFinite(timeoutSeconds) || timeoutSeconds < 0) return undefined;
+	if (timeoutSeconds === 0) return 0;
+	return Math.max(1, Math.trunc(timeoutSeconds * 1000));
+}
 
 const noOpUIContext: ExtensionUIContext = {
 	select: async (_title, _options, _dialogOptions) => undefined,
@@ -372,12 +393,17 @@ export class AgentSession {
 	#streamingEditCheckedLineCounts = new Map<string, number>();
 	#streamingEditFileCache = new Map<string, string>();
 	#promptInFlight = false;
-	#obfuscator: SecretObfuscator | undefined;
-	#pendingActionStore: PendingActionStore | undefined;
-	#checkpointState: CheckpointState | undefined = undefined;
-	#pendingRewindReport: string | undefined = undefined;
 	#promptGeneration = 0;
 	#providerSessionState = new Map<string, ProviderSessionState>();
+	#obfuscator: SecretObfuscator | undefined;
+	#pendingActionStore: PendingActionStore | undefined;
+	// Crash-safety liveness tracking (session_exit / session_liveness markers + exit sentinel)
+	#startSentinel: ((sessionFile: string) => (() => void) | undefined) | undefined;
+	#stopSessionExitSentinel?: () => void;
+	#providerLivenessOperationId?: string;
+	#lastProviderLivenessAt = 0;
+	#checkpointState: CheckpointState | undefined = undefined;
+	#pendingRewindReport: string | undefined = undefined;
 
 	constructor(config: AgentSessionConfig) {
 		this.agent = config.agent;
@@ -397,10 +423,11 @@ export class AgentSession {
 		this.#rebuildSystemPrompt = config.rebuildSystemPrompt;
 		this.#baseSystemPrompt = this.agent.state.systemPrompt;
 		this.#ttsrManager = config.ttsrManager;
+		this.#pendingActionStore = config.pendingActionStore;
+		this.#startSentinel = config.startSessionExitSentinel ?? startSessionExitSentinel;
 		this.#forceCopilotAgentInitiator = config.forceCopilotAgentInitiator ?? false;
 		this.#obfuscator = config.obfuscator;
 		this.agent.providerSessionState = this.#providerSessionState;
-		this.#pendingActionStore = config.pendingActionStore;
 		this.#unsubscribePendingActionPush = this.#pendingActionStore?.subscribePush(action => {
 			const reminderText = [
 				"<system-reminder>",
@@ -476,10 +503,14 @@ export class AgentSession {
 	}
 
 	async #emitSessionEvent(event: AgentSessionEvent): Promise<void> {
+		if (event.type === "auto_retry_start") {
+			await this.#recordRetryWaitLiveness(event.attempt, "wait", event.delayMs);
+		} else if (event.type === "auto_retry_end") {
+			await this.#recordRetryWaitLiveness(event.attempt, "end");
+		}
 		await this.#emitExtensionEvent(event);
 		this.#emit(event);
 	}
-
 	// Track last assistant message for auto-compaction check
 	#lastAssistantMessage: AssistantMessage | undefined = undefined;
 
@@ -510,6 +541,19 @@ export class AgentSession {
 			this.#resetStreamingEditState();
 			// TTSR: Reset buffer on turn start
 			this.#ttsrManager?.resetBuffer();
+		}
+		if (event.type === "message_start" && event.message.role === "assistant") {
+			await this.#startProviderStreamLiveness();
+		} else if (event.type === "message_update") {
+			await this.#recordProviderStreamProgress();
+		} else if (event.type === "message_end" && event.message.role === "assistant") {
+			await this.#finishProviderStreamLiveness();
+		} else if (event.type === "tool_execution_start") {
+			await this.#recordToolLivenessStart(event.toolCallId, event.toolName);
+		} else if (event.type === "tool_execution_end") {
+			await this.#recordToolLivenessEnd(event.toolCallId, event.toolName);
+		} else if (event.type === "turn_end") {
+			await this.#finishProviderStreamLiveness();
 		}
 
 		// TTSR: Increment message count on turn end (for repeat-after-gap tracking)
@@ -1479,6 +1523,151 @@ export class AgentSession {
 		this.#unsubscribePendingActionPush = undefined;
 		this.#disconnectFromAgent();
 		this.#eventListeners = [];
+		this.#stopSessionExitSentinel?.();
+		this.#stopSessionExitSentinel = undefined;
+		await this.#recordSessionExit();
+	}
+
+	// =========================================================================
+	// Crash-safety liveness (session_liveness markers + exit sentinel)
+	// =========================================================================
+
+	async #recordSessionLiveness(data: Omit<SessionLivenessData, "recordedAt">): Promise<void> {
+		const marker: SessionLivenessData = { ...data, recordedAt: new Date().toISOString() };
+		try {
+			this.sessionManager.appendCustomEntry(SESSION_LIVENESS_CUSTOM_TYPE, marker);
+			await this.sessionManager.flush();
+			if (marker.phase !== "end") this.#ensureSessionExitSentinel();
+		} catch (error) {
+			logger.warn("Failed to persist session liveness", {
+				sessionId: this.sessionManager.getSessionId(),
+				operation: data.operation,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	#ensureSessionExitSentinel(): void {
+		if (Bun.env.BUN_ENV === "test" || Bun.env.NODE_ENV === "test") return;
+		if (this.#stopSessionExitSentinel) return;
+		const sessionFile = this.sessionManager.getSessionFile();
+		if (!sessionFile || !this.#startSentinel) return;
+		try {
+			this.#stopSessionExitSentinel = this.#startSentinel(sessionFile);
+		} catch (error) {
+			logger.warn("Failed to start session-exit sentinel", {
+				sessionId: this.sessionManager.getSessionId(),
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	#livenessModelFields(): Pick<SessionLivenessData, "provider" | "model"> {
+		const model = this.model;
+		if (!model) return {};
+		return { provider: model.provider, model: model.id };
+	}
+
+	async #startProviderStreamLiveness(): Promise<void> {
+		await this.#finishProviderStreamLiveness();
+		const operationId = Snowflake.next();
+		this.#providerLivenessOperationId = operationId;
+		this.#lastProviderLivenessAt = Date.now();
+		await this.#recordSessionLiveness({
+			operation: "provider_stream",
+			operationId,
+			phase: "start",
+			...this.#livenessModelFields(),
+		});
+	}
+
+	async #recordProviderStreamProgress(): Promise<void> {
+		const operationId = this.#providerLivenessOperationId;
+		if (!operationId) {
+			await this.#startProviderStreamLiveness();
+			return;
+		}
+		const now = Date.now();
+		if (now - this.#lastProviderLivenessAt < SESSION_LIVENESS_PROGRESS_INTERVAL_MS) return;
+		this.#lastProviderLivenessAt = now;
+		await this.#recordSessionLiveness({
+			operation: "provider_stream",
+			operationId,
+			phase: "progress",
+			...this.#livenessModelFields(),
+		});
+	}
+
+	async #finishProviderStreamLiveness(): Promise<void> {
+		const operationId = this.#providerLivenessOperationId;
+		if (!operationId) return;
+		this.#providerLivenessOperationId = undefined;
+		this.#lastProviderLivenessAt = 0;
+		await this.#recordSessionLiveness({
+			operation: "provider_stream",
+			operationId,
+			phase: "end",
+			...this.#livenessModelFields(),
+		});
+	}
+
+	async #recordToolLivenessStart(toolCallId: string, toolName: string): Promise<void> {
+		const data: Omit<SessionLivenessData, "recordedAt"> = {
+			operation: "tool_execution",
+			operationId: toolCallId,
+			phase: "start",
+			toolName,
+		};
+		const watchdogMs = configuredWatchdogMs(this.settings.get("tools.maxTimeout"));
+		if (watchdogMs !== undefined) data.watchdogMs = watchdogMs;
+		await this.#recordSessionLiveness(data);
+	}
+
+	async #recordToolLivenessEnd(toolCallId: string, toolName: string): Promise<void> {
+		await this.#recordSessionLiveness({
+			operation: "tool_execution",
+			operationId: toolCallId,
+			phase: "end",
+			toolName,
+		});
+	}
+
+	async #recordRetryWaitLiveness(attempt: number, phase: "wait" | "end", delayMs?: number): Promise<void> {
+		const data: Omit<SessionLivenessData, "recordedAt"> = {
+			operation: "retry_wait",
+			operationId: `retry-${attempt}`,
+			phase,
+			...this.#livenessModelFields(),
+		};
+		if (phase === "wait" && Number.isSafeInteger(delayMs) && (delayMs as number) >= 0) {
+			data.watchdogMs = delayMs as number;
+		}
+		await this.#recordSessionLiveness(data);
+	}
+
+	async #recordSessionExit(): Promise<void> {
+		const branch = this.sessionManager.getBranch();
+		const hasActivity = branch.some(
+			entry =>
+				entry.type === "message" || (entry.type === "custom" && entry.customType === SESSION_LIVENESS_CUSTOM_TYPE),
+		);
+		if (!hasActivity) return;
+		const pendingToolCalls = collectPendingToolCalls(branch);
+		const data: SessionExitData = {
+			reason: "dispose",
+			kind: "normal",
+			recordedAt: new Date().toISOString(),
+		};
+		if (pendingToolCalls.length > 0) data.pendingToolCalls = pendingToolCalls;
+		try {
+			this.sessionManager.appendCustomEntry(SESSION_EXIT_CUSTOM_TYPE, data);
+			await this.sessionManager.flush();
+		} catch (error) {
+			logger.warn("Failed to persist session exit", {
+				sessionId: this.sessionManager.getSessionId(),
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
 	}
 
 	// =========================================================================
