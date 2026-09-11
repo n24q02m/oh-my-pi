@@ -2,7 +2,7 @@ import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 
-export type { PairingApprovalResult, PairingBeginResult, PairingClaimResult } from "./protocol";
+export type { PairingApprovalResult, PairingBeginResult, PairingClaimResult, PairingPendingMetadata } from "./protocol";
 
 import type {
 	DaemonCapability,
@@ -11,6 +11,7 @@ import type {
 	PairingApprovalResult,
 	PairingBeginResult,
 	PairingClaimResult,
+	PairingPendingMetadata,
 } from "./protocol";
 
 const PERSISTENCE_VERSION = 1;
@@ -93,6 +94,15 @@ function metadata(record: PairedDeviceRecord): PairedDeviceMetadata {
 		createdAt: record.createdAt,
 		rotatedAt: record.rotatedAt,
 		lastSeenAt: record.lastSeenAt,
+	};
+}
+
+function pendingMetadata(pending: PendingPairing): PairingPendingMetadata {
+	return {
+		name: pending.name,
+		capabilities: cloneCapabilities(pending.capabilities),
+		createdAt: pending.createdAt,
+		expiresAt: pending.expiresAt,
 	};
 }
 
@@ -302,6 +312,31 @@ export class PairingStore {
 				expiresAt: pending.expiresAt,
 				approvedAt,
 			};
+		});
+	}
+
+	/** Preview pending enrollment metadata without exposing the one-time code. */
+	preview(code: string): Promise<PairingPendingMetadata> {
+		return this.#enqueue(async () => {
+			this.#ensureReady();
+			this.#pruneExpired();
+			const pending = this.#pending.get(this.#hash(code));
+			if (!pending) throw new Error("Pairing code is unknown or expired");
+			return pendingMetadata(pending);
+		});
+	}
+
+	/** Remove only one pending enrollment; enrolled devices remain untouched. */
+	deny(code: string): Promise<PairingPendingMetadata> {
+		return this.#enqueue(async () => {
+			this.#ensureReady();
+			this.#pruneExpired();
+			const hash = this.#hash(code);
+			const pending = this.#pending.get(hash);
+			if (!pending) throw new Error("Pairing code is unknown or expired");
+			const result = pendingMetadata(pending);
+			this.#pending.delete(hash);
+			return result;
 		});
 	}
 
