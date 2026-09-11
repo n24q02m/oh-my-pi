@@ -18,6 +18,7 @@ import {
 	daemonClientForGlobal,
 	daemonClientForProject,
 } from "../launch/client";
+import { readDaemonGitStatus } from "../launch/git-status";
 import type { DaemonSnapshot } from "../launch/protocol";
 import {
 	collectReports,
@@ -25,6 +26,8 @@ import {
 	formatCommand,
 	KILL_GRACE_MS,
 	type PsDaemonRow,
+	type PsScopeReport,
+	scopeClient,
 	scopeHeader,
 	TABLE_HEADER,
 	TERMINAL_STATES,
@@ -44,6 +47,8 @@ export interface PsCommandArgs {
 		json: boolean;
 		/** list: force the static listing instead of the interactive monitor. */
 		plain: boolean;
+		/** list: include repository/worktree state for every daemon. */
+		git?: boolean;
 		/** Target another project directory instead of the current one. */
 		dir?: string;
 		/** Target a machine-global service scope (e.g. browser-relay). */
@@ -65,7 +70,11 @@ export async function runPsCommand(cmd: PsCommandArgs): Promise<void> {
 	try {
 		if (cmd.action === "list") {
 			const interactive =
-				!cmd.flags.json && !cmd.flags.plain && process.stdout.isTTY === true && process.stdin.isTTY === true;
+				!cmd.flags.json &&
+				!cmd.flags.plain &&
+				!cmd.flags.git &&
+				process.stdout.isTTY === true &&
+				process.stdin.isTTY === true;
 			if (interactive) await runPsTop(cmd.flags);
 			else await runList(cmd);
 			return;
@@ -87,6 +96,7 @@ export async function runPsCommand(cmd: PsCommandArgs): Promise<void> {
 
 async function runList(cmd: PsCommandArgs): Promise<void> {
 	const reports = await collectReports(cmd.flags.all, cmd.flags);
+	if (cmd.flags.git) await hydrateGitStatus(reports);
 	if (cmd.flags.json) {
 		console.log(
 			JSON.stringify(
@@ -100,6 +110,7 @@ async function runList(cmd: PsCommandArgs): Promise<void> {
 						...row.snapshot,
 						command: row.command,
 						cwd: row.cwd,
+						git: row.git,
 						supervised: row.supervised,
 					})),
 				})),
@@ -123,9 +134,70 @@ async function runList(cmd: PsCommandArgs): Promise<void> {
 			continue;
 		}
 		printTable(report.daemons);
+		if (cmd.flags.git) printGitStatuses(report.daemons);
 	}
 	if (!cmd.flags.all) {
 		console.log(chalk.dim("\nUse --all to include other projects and global services."));
+	}
+}
+async function hydrateGitStatus(reports: PsScopeReport[]): Promise<void> {
+	await Promise.all(
+		reports.map(async report => {
+			let client: DaemonBrokerClient | undefined;
+			if (report.scope.brokerPid !== undefined) {
+				try {
+					client = await scopeClient(report.scope);
+				} catch {
+					client = undefined;
+				}
+			}
+			try {
+				await Promise.all(
+					report.daemons.map(async row => {
+						if (row.cwd === undefined) return;
+						if (client) {
+							try {
+								const result = await client.request({
+									op: "git-status",
+									name: row.snapshot.name,
+									refresh: true,
+								});
+								if (result.op === "git-status") {
+									row.git = result.status;
+									return;
+								}
+							} catch {
+								// The broker may have exited between scope discovery and the git query.
+							}
+						}
+						row.git = await readDaemonGitStatus(row.snapshot.name, row.cwd, { refresh: true });
+					}),
+				);
+			} finally {
+				client?.close();
+			}
+		}),
+	);
+}
+
+function printGitStatuses(rows: PsDaemonRow[]): void {
+	for (const row of rows) {
+		const status = row.git;
+		if (!status) continue;
+		if (status.error) {
+			console.log(`  git ${row.snapshot.name}: error ${status.error.message}`);
+			continue;
+		}
+		const branch = status.detached ? "HEAD (detached)" : (status.branch ?? "no branch");
+		const dirty = status.dirty ? "dirty" : "clean";
+		const aheadBehind =
+			status.ahead !== undefined || status.behind !== undefined
+				? ` ahead ${status.ahead ?? 0} / behind ${status.behind ?? 0}`
+				: "";
+		const diff = status.diffStat
+			? ` diff ${status.diffStat.files} files +${status.diffStat.insertions}/-${status.diffStat.deletions}`
+			: "";
+		console.log(`  git ${row.snapshot.name}: ${branch} ${dirty}${aheadBehind}${diff}`);
 	}
 }
 

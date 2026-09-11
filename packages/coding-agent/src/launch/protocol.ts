@@ -24,6 +24,73 @@ export function validateDaemonBrokerToken(value: unknown): string {
 	return value;
 }
 
+/** Capabilities assigned to a paired native device. */
+export type DaemonCapability = "observe" | "control-session" | "approve" | "manage-devices" | "git-read";
+
+/** Hash-only paired device record retained by the broker. */
+export interface PairedDeviceRecord {
+	id: string;
+	name: string;
+	tokenHash: string;
+	capabilities: DaemonCapability[];
+	createdAt: number;
+	rotatedAt?: number;
+	lastSeenAt?: number;
+}
+
+/** Public paired-device metadata; credential hashes are deliberately omitted. */
+export interface PairedDeviceMetadata {
+	id: string;
+	name: string;
+	capabilities: DaemonCapability[];
+	createdAt: number;
+	rotatedAt?: number;
+	lastSeenAt?: number;
+}
+
+export interface PairingBeginResult {
+	code: string;
+	name: string;
+	capabilities: DaemonCapability[];
+	createdAt: number;
+	expiresAt: number;
+}
+
+export interface PairingApprovalResult {
+	name: string;
+	capabilities: DaemonCapability[];
+	createdAt: number;
+	expiresAt: number;
+	approvedAt: number;
+}
+/** Redacted metadata for a pending enrollment; codes and credentials never cross this boundary. */
+export interface PairingPendingMetadata {
+	name: string;
+	capabilities: DaemonCapability[];
+	createdAt: number;
+	expiresAt: number;
+}
+
+/** Validate a non-empty, duplicate-free capability list for CLI and wire consumers. */
+export function parseDaemonCapabilities(value: unknown, label: string): DaemonCapability[] {
+	return daemonCapabilities(value, label);
+}
+
+function pairingPendingMetadata(value: unknown, label: string): PairingPendingMetadata {
+	const source = record(value, label);
+	return {
+		name: stringValue(source.name, `${label}.name`),
+		capabilities: daemonCapabilities(source.capabilities, `${label}.capabilities`),
+		createdAt: numberValue(source.createdAt, `${label}.createdAt`),
+		expiresAt: numberValue(source.expiresAt, `${label}.expiresAt`),
+	};
+}
+
+export interface PairingClaimResult {
+	device: PairedDeviceMetadata;
+	token: string;
+}
+
 /** Optional environment key overriding last-client shutdown grace. */
 export const DAEMON_IDLE_GRACE_ENV = "OMP_DAEMON_IDLE_GRACE_MS";
 
@@ -67,6 +134,33 @@ export interface DaemonSpec {
 	detached: boolean;
 }
 
+/** Bounded diff summary returned by the broker's read-only git inspection. */
+export interface DaemonGitDiffStat {
+	files: number;
+	insertions: number;
+	deletions: number;
+}
+
+/** Read-only repository/worktree state associated with one supervised daemon. */
+export interface DaemonGitStatus {
+	daemonName: string;
+	repositoryRoot?: string;
+	worktreePath: string;
+	gitDir?: string;
+	commonDir?: string;
+	branch?: string;
+	detached: boolean;
+	head?: string;
+	upstream?: string;
+	dirty: boolean;
+	ahead?: number;
+	behind?: number;
+	diffStat?: DaemonGitDiffStat;
+	refreshedAt: number;
+	cached: boolean;
+	error?: { code: string; message: string };
+}
+
 /** Serializable daemon state visible to every client in one broker scope. */
 export interface DaemonSnapshot {
 	name: string;
@@ -95,8 +189,17 @@ export type DaemonSignal = "SIGINT" | "SIGTERM" | "SIGHUP" | "SIGQUIT" | "SIGKIL
 /** Typed broker operation sent over the authenticated socket. */
 export type DaemonOperation =
 	| { op: "ping" }
+	| { op: "pair-begin"; name: string; capabilities: DaemonCapability[]; ttlMs?: number }
+	| { op: "pair-preview"; code: string }
+	| { op: "pair-deny"; code: string }
+	| { op: "pair-approve"; code: string }
+	| { op: "pair-claim"; code: string }
+	| { op: "pair-list" }
+	| { op: "pair-revoke"; id: string }
+	| { op: "pair-rotate"; id: string }
 	| { op: "start"; spec: DaemonSpec; owner?: string }
 	| { op: "list" }
+	| { op: "git-status"; name: string; refresh?: boolean }
 	| {
 			op: "logs";
 			name: string;
@@ -113,14 +216,38 @@ export type DaemonOperation =
 	| { op: "send"; name: string; data?: string; signal?: DaemonSignal }
 	| { op: "stop"; name: string; timeoutMs: number }
 	| { op: "restart"; name: string }
+	| { op: "resume"; name: string; session?: string; timeoutMs?: number }
 	| { op: "describe"; name: string }
 	| { op: "shutdown" };
 
 /** Typed broker result decoded before it reaches tool code. */
 export type DaemonRpcResult =
-	| { op: "ping"; projectDir: string }
+	| { op: "ping"; projectDir: string; capabilities?: DaemonCapability[] }
+	| {
+			op: "pair-begin";
+			code: string;
+			name: string;
+			capabilities: DaemonCapability[];
+			createdAt: number;
+			expiresAt: number;
+	  }
+	| (PairingPendingMetadata & { op: "pair-preview" })
+	| (PairingPendingMetadata & { op: "pair-deny" })
+	| {
+			op: "pair-approve";
+			name: string;
+			capabilities: DaemonCapability[];
+			createdAt: number;
+			expiresAt: number;
+			approvedAt: number;
+	  }
+	| { op: "pair-claim"; device: PairedDeviceMetadata; token: string }
+	| { op: "pair-list"; devices: PairedDeviceMetadata[] }
+	| { op: "pair-revoke"; id: string }
+	| { op: "pair-rotate"; device: PairedDeviceMetadata; token: string }
 	| { op: "start"; daemon: DaemonSnapshot; readyTimedOut: boolean }
 	| { op: "list"; daemons: DaemonSnapshot[] }
+	| { op: "git-status"; status: DaemonGitStatus }
 	| {
 			op: "logs";
 			name: string;
@@ -137,6 +264,7 @@ export type DaemonRpcResult =
 	| { op: "send"; daemon: DaemonSnapshot }
 	| { op: "stop"; daemon: DaemonSnapshot }
 	| { op: "restart"; daemon: DaemonSnapshot }
+	| { op: "resume"; daemon: DaemonSnapshot }
 	| { op: "describe"; daemon: DaemonSnapshot; spec: DaemonSpec }
 	| { op: "shutdown" };
 
@@ -166,6 +294,7 @@ export interface DaemonCompletionNotification {
 }
 
 export type DaemonWireMessage = DaemonWireResponse | DaemonCompletionNotification;
+
 
 function isRecord(value: unknown): value is Record<string, unknown> {
 	return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -222,6 +351,35 @@ function stringRecord(value: unknown, label: string): Record<string, string> {
 	const result: Record<string, string> = {};
 	for (const key in source) result[key] = rawString(source[key], `${label}.${key}`);
 	return result;
+}
+
+function daemonCapability(value: unknown): DaemonCapability {
+	const capability = stringValue(value, "daemon capability");
+	if (capability === "observe" || capability === "control-session" || capability === "approve") return capability;
+	if (capability === "manage-devices" || capability === "git-read") return capability;
+	throw new Error(`Unknown daemon capability: ${capability}`);
+}
+
+function daemonCapabilities(value: unknown, label: string): DaemonCapability[] {
+	if (!Array.isArray(value) || value.length === 0) throw new Error(`${label} must be a non-empty array`);
+	const result: DaemonCapability[] = [];
+	for (const item of value) {
+		const capability = daemonCapability(item);
+		if (!result.includes(capability)) result.push(capability);
+	}
+	return result;
+}
+
+function pairingDeviceMetadata(value: unknown, label: string): PairedDeviceMetadata {
+	const source = record(value, label);
+	return {
+		id: stringValue(source.id, `${label}.id`),
+		name: stringValue(source.name, `${label}.name`),
+		capabilities: daemonCapabilities(source.capabilities, `${label}.capabilities`),
+		createdAt: numberValue(source.createdAt, `${label}.createdAt`),
+		rotatedAt: optionalNumber(source.rotatedAt, `${label}.rotatedAt`),
+		lastSeenAt: optionalNumber(source.lastSeenAt, `${label}.lastSeenAt`),
+	};
 }
 
 function daemonState(value: unknown): DaemonState {
@@ -391,8 +549,46 @@ export function parseDaemonSnapshot(value: unknown): DaemonSnapshot {
 		detached: source.detached === undefined ? false : booleanValue(source.detached, "daemon.detached"),
 	};
 }
+function gitDiffStat(value: unknown, label: string): DaemonGitDiffStat {
+	const source = record(value, label);
+	return {
+		files: numberValue(source.files, `${label}.files`),
+		insertions: numberValue(source.insertions, `${label}.insertions`),
+		deletions: numberValue(source.deletions, `${label}.deletions`),
+	};
+}
 
-/** Decode a socket request before the broker acts on it. */
+function daemonGitStatus(value: unknown): DaemonGitStatus {
+	const source = record(value, "result.status");
+	const rawError = source.error;
+	let error: DaemonGitStatus["error"];
+	if (rawError !== undefined) {
+		const errorSource = record(rawError, "result.status.error");
+		error = {
+			code: stringValue(errorSource.code, "result.status.error.code"),
+			message: stringValue(errorSource.message, "result.status.error.message"),
+		};
+	}
+	return {
+		daemonName: stringValue(source.daemonName, "result.status.daemonName"),
+		repositoryRoot: optionalString(source.repositoryRoot, "result.status.repositoryRoot"),
+		worktreePath: stringValue(source.worktreePath, "result.status.worktreePath"),
+		gitDir: optionalString(source.gitDir, "result.status.gitDir"),
+		commonDir: optionalString(source.commonDir, "result.status.commonDir"),
+		branch: optionalString(source.branch, "result.status.branch"),
+		detached: booleanValue(source.detached, "result.status.detached"),
+		head: optionalString(source.head, "result.status.head"),
+		upstream: optionalString(source.upstream, "result.status.upstream"),
+		dirty: booleanValue(source.dirty, "result.status.dirty"),
+		ahead: optionalNumber(source.ahead, "result.status.ahead"),
+		behind: optionalNumber(source.behind, "result.status.behind"),
+		diffStat: source.diffStat === undefined ? undefined : gitDiffStat(source.diffStat, "result.status.diffStat"),
+		refreshedAt: numberValue(source.refreshedAt, "result.status.refreshedAt"),
+		cached: booleanValue(source.cached, "result.status.cached"),
+		error,
+	};
+}
+
 export function parseDaemonWireRequest(value: unknown): DaemonWireRequest {
 	const source = record(value, "daemon request");
 	return {
@@ -452,8 +648,30 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 	switch (op) {
 		case "ping":
 		case "list":
+		case "pair-list":
 		case "shutdown":
 			return { op };
+		case "git-status":
+			return {
+				op,
+				name: stringValue(source.name, "operation.name"),
+				refresh: source.refresh === undefined ? undefined : booleanValue(source.refresh, "operation.refresh"),
+			};
+		case "pair-begin":
+			return {
+				op,
+				name: stringValue(source.name, "operation.name"),
+				capabilities: daemonCapabilities(source.capabilities, "operation.capabilities"),
+				ttlMs: optionalNumber(source.ttlMs, "operation.ttlMs"),
+			};
+		case "pair-preview":
+		case "pair-deny":
+		case "pair-approve":
+		case "pair-claim":
+			return { op, code: stringValue(source.code, "operation.code") };
+		case "pair-revoke":
+		case "pair-rotate":
+			return { op, id: stringValue(source.id, "operation.id") };
 		case "start":
 			return {
 				op,
@@ -511,8 +729,52 @@ function parseDaemonOperation(value: unknown): DaemonOperation {
 export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown): DaemonRpcResult {
 	const source = record(value, `${operation.op} result`);
 	switch (operation.op) {
-		case "ping":
-			return { op: "ping", projectDir: stringValue(source.projectDir, "result.projectDir") };
+		case "ping": {
+			const capabilities =
+				source.capabilities === undefined ? undefined : daemonCapabilities(source.capabilities, "result.capabilities");
+			return { op: "ping", projectDir: stringValue(source.projectDir, "result.projectDir"), capabilities };
+		}
+		case "pair-begin":
+			return {
+				op: "pair-begin",
+				code: stringValue(source.code, "result.code"),
+				name: stringValue(source.name, "result.name"),
+				capabilities: daemonCapabilities(source.capabilities, "result.capabilities"),
+				createdAt: numberValue(source.createdAt, "result.createdAt"),
+				expiresAt: numberValue(source.expiresAt, "result.expiresAt"),
+			};
+		case "pair-preview":
+		case "pair-deny":
+			return { op: operation.op, ...pairingPendingMetadata(value, "result") };
+		case "pair-approve":
+			return {
+				op: "pair-approve",
+				name: stringValue(source.name, "result.name"),
+				capabilities: daemonCapabilities(source.capabilities, "result.capabilities"),
+				createdAt: numberValue(source.createdAt, "result.createdAt"),
+				expiresAt: numberValue(source.expiresAt, "result.expiresAt"),
+				approvedAt: numberValue(source.approvedAt, "result.approvedAt"),
+			};
+		case "pair-claim":
+			return {
+				op: "pair-claim",
+				device: pairingDeviceMetadata(source.device, "result.device"),
+				token: stringValue(source.token, "result.token"),
+			};
+		case "pair-list":
+			if (!Array.isArray(source.devices)) throw new Error("result.devices must be an array");
+			return {
+				op: "pair-list",
+				devices: source.devices.map(value => pairingDeviceMetadata(value, "result.device")),
+			};
+		case "pair-revoke":
+			return { op: "pair-revoke", id: stringValue(source.id, "result.id") };
+		case "pair-rotate":
+			return {
+				op: "pair-rotate",
+				device: pairingDeviceMetadata(source.device, "result.device"),
+				token: stringValue(source.token, "result.token"),
+			};
 		case "start":
 			return {
 				op: "start",
@@ -523,6 +785,8 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 			if (!Array.isArray(source.daemons)) throw new Error("result.daemons must be an array");
 			return { op: "list", daemons: source.daemons.map(parseDaemonSnapshot) };
 		}
+		case "git-status":
+			return { op: "git-status", status: daemonGitStatus(source.status) };
 		case "logs":
 			return {
 				op: "logs",
@@ -549,6 +813,8 @@ export function parseDaemonRpcResult(operation: DaemonOperation, value: unknown)
 			return { op: "stop", daemon: parseDaemonSnapshot(source.daemon) };
 		case "restart":
 			return { op: "restart", daemon: parseDaemonSnapshot(source.daemon) };
+		case "resume":
+			return { op: "resume", daemon: parseDaemonSnapshot(source.daemon) };
 		case "describe":
 			return {
 				op: "describe",

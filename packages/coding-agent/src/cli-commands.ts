@@ -18,6 +18,7 @@ import {
 	VALUELESS_FLAGS,
 } from "./cli/flag-tables";
 import { launchHelp } from "./commands/launch-help";
+import Pair from "./commands/pair";
 
 export const commands: CommandEntry[] = [
 	{ name: "launch", load: () => import("./commands/launch").then(m => m.default), help: launchHelp },
@@ -138,6 +139,11 @@ export const commands: CommandEntry[] = [
 		help: commandHelp.modelsHelp,
 	},
 	{
+		name: "pair",
+		load: async () => Pair,
+		help: commandHelp.pairHelp,
+	},
+	{
 		name: "plugin",
 		load: () => import("./commands/plugin").then(m => m.default),
 		help: commandHelp.pluginHelp,
@@ -211,6 +217,11 @@ export const commands: CommandEntry[] = [
 		name: "ttsr",
 		load: () => import("./commands/ttsr").then(m => m.default),
 		help: commandHelp.ttsrHelp,
+	},
+	{
+		name: "web",
+		load: () => import("./commands/web").then(m => m.default),
+		help: commandHelp.webHelp,
 	},
 	{
 		name: "worktree",

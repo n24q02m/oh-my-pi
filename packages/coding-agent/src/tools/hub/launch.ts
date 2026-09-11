@@ -296,6 +296,14 @@ function toolContent(result: DaemonRpcResult, params: LaunchParams): string {
 	switch (result.op) {
 		case "ping":
 		case "shutdown":
+		case "pair-begin":
+		case "pair-approve":
+		case "pair-claim":
+		case "pair-list":
+		case "pair-revoke":
+		case "pair-rotate":
+		case "git-status":
+		case "resume":
 			throw new ToolError(`Internal daemon result ${result.op} is not tool-visible`);
 		case "start": {
 			const daemon = result.daemon;
@@ -385,6 +393,14 @@ async function toolDetails(result: DaemonRpcResult, params: LaunchParams): Promi
 			return { op: "describe", daemon: result.daemon, spec: result.spec };
 		case "ping":
 		case "shutdown":
+		case "pair-begin":
+		case "pair-approve":
+		case "pair-claim":
+		case "pair-list":
+		case "pair-revoke":
+		case "pair-rotate":
+		case "git-status":
+		case "resume":
 			throw new ToolError(`Internal daemon result ${result.op} is not tool-visible`);
 	}
 }

@@ -9,6 +9,7 @@ import { HeaderBar } from "./components/shell/HeaderBar";
 import { Toasts } from "./components/shell/Toasts";
 import { Transcript } from "./components/transcript/Transcript";
 import { GuestClient } from "./lib/client";
+import { RemoteApp } from "./remote/RemoteApp";
 import { useGuestSnapshot } from "./lib/use-guest";
 import type { ToolRenderHost } from "./tool-render";
 import "./components/shell/shell.css";
@@ -37,6 +38,12 @@ function hashLink(): string | null {
 }
 
 export function App(): ReactNode {
+	if (typeof window === "undefined") return <RemoteApp />;
+	const legacyCollab = window.location.pathname === "/collab" || hashLink() !== null;
+	return legacyCollab ? <CollabApp /> : <RemoteApp />;
+}
+
+function CollabApp(): ReactNode {
 	const [client, setClient] = useState<GuestClient | null>(null);
 	const [connectError, setConnectError] = useState<string | null>(null);
 	const credsRef = useRef<Creds | null>(null);
