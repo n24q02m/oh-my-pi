@@ -610,8 +610,13 @@ export class ModelControls {
 	 * Bounded by a timeout + abort; on failure it preserves the last classified
 	 * level, or uses the provisional concrete level before the first resolution.
 	 * Never throws into the turn, and never clears `#autoThinking`.
+	 *
+	 * `revalidate` (EF2.1 shared dispatch) runs together with the generation
+	 * check after the classification await: when it returns false the reserved
+	 * batch changed (queue edit, cancel, concurrent enqueue, model switch) and
+	 * the decision is discarded unapplied with a `stale-batch` receipt.
 	 */
-	async applyAutoThinkingLevel(promptText: string, generation: number): Promise<void> {
+	async applyAutoThinkingLevel(promptText: string, generation: number, revalidate?: () => boolean): Promise<void> {
 		const decisionStartMs = Date.now();
 		const model = this.#model;
 		if (!model?.reasoning) return;
@@ -671,15 +676,18 @@ export class ModelControls {
 			}
 		}
 
-		// Drop the result if the turn was aborted/superseded while classifying.
-		if (this.#host.promptGeneration() !== generation || !this.#autoThinking) {
+		// Drop the result if the turn was aborted/superseded while classifying,
+		// or when the EF2.1 reserved dispatch batch failed revalidation.
+		const generationValid = this.#host.promptGeneration() === generation && this.#autoThinking;
+		const revalidationValid = revalidate === undefined || revalidate();
+		if (!generationValid || !revalidationValid) {
 			this.#host.emit({
 				type: "auto_thinking_decision",
 				receipt: autoThinkingDecisionReceipt({
 					generation,
 					provider: model.provider,
 					modelId: model.id,
-					source: "aborted",
+					source: generationValid ? "stale-batch" : "aborted",
 					previous: previousLevel === "inherit" ? undefined : previousLevel,
 					candidate: resolved,
 					applied: undefined,

@@ -31,6 +31,7 @@ import {
 	ONLINE_AUTO_THINKING_MODEL_KEY,
 } from "../tiny/models";
 import { tinyModelClient } from "../tiny/title-client";
+import { isPreformattedTaskContext } from "./task-context";
 
 /**
  * Rendered classifier prompts, keyed by whether `max` is offered as a label.
@@ -100,7 +101,11 @@ export async function classifyDifficulty(
 	deps: ClassifyDifficultyDeps,
 ): Promise<Effort | undefined> {
 	const backend = deps.settings.get("providers.autoThinkingModel");
-	const input = preprocessTinyMessage(promptText);
+	// EF2-R2: a whole task-context envelope is already bounded by construction
+	// and its section tags plus verbatim diagnostics must survive, so it bypasses
+	// the title-oriented tiny-message cleanup exactly like preformatted title
+	// contexts do. Raw prompts keep the shared cleanup policy.
+	const input = isPreformattedTaskContext(promptText) ? promptText : preprocessTinyMessage(promptText);
 	const online = backend === ONLINE_AUTO_THINKING_MODEL_KEY;
 	// The 3-bucket local classifier cannot select `max`, so its ceiling stays at
 	// XHigh whatever the setting says — otherwise a sparse ladder would snap its

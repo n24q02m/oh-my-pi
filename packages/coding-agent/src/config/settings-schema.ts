@@ -5589,6 +5589,18 @@ export const SETTINGS_SCHEMA = {
 			options: AUTO_THINKING_MODEL_OPTIONS,
 		},
 	},
+	"providers.autoThinkingAdaptive": {
+		type: "boolean",
+		default: false,
+		ui: {
+			tab: "model",
+			group: "Thinking",
+			label: "Adaptive Auto Thinking",
+			description:
+				"Opt-in: classify the actual dispatched batch for queued steer/follow-up continuations, and give the classifier a bounded task-context envelope (4,000 chars: task objective, recent result, current input). Default off keeps legacy auto, whose known limitation is that queued continuations dispatch with the prompt-time classification while the classifier only ever sees the latest prompt text.",
+			condition: "autoThinkingActive",
+		},
+	},
 	"providers.autoThinkingMaxEffort": {
 		type: "enum",
 		values: ["xhigh", "max"] as const,
