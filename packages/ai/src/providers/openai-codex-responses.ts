@@ -1691,7 +1691,6 @@ export async function openCodexCompactionEventStream(
 	return streamCodexCompactionEvents(model, options, requestSetup, requestContext, initial);
 }
 
-
 async function* streamCodexCompactionEvents(
 	model: Model<"openai-codex-responses">,
 	options: OpenAICodexCompactionStreamOptions,

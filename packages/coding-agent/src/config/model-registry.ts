@@ -884,12 +884,15 @@ export class ModelRegistry {
 		return mergeByModelKey(baseModels, replacementModels, (existing, replacementModel) => {
 			if (!existing) return replacementModel;
 			const supportsTools = replacementModel.supportsTools ?? existing.supportsTools;
+			const supportsConfigurationUpdate =
+				replacementModel.supportsConfigurationUpdate ?? existing.supportsConfigurationUpdate;
 			return {
 				...replacementModel,
 				contextWindow: replacementModel.contextWindow ?? existing.contextWindow,
 				maxTokens: replacementModel.maxTokens ?? existing.maxTokens,
 				omitMaxOutputTokens: replacementModel.omitMaxOutputTokens ?? existing.omitMaxOutputTokens,
 				...(supportsTools !== undefined ? { supportsTools } : {}),
+				...(supportsConfigurationUpdate !== undefined ? { supportsConfigurationUpdate } : {}),
 			};
 		});
 	}
@@ -2838,6 +2841,8 @@ export interface ProviderConfigInput {
 		thinking?: ThinkingConfig;
 		input: ("text" | "image")[];
 		supportsTools?: boolean;
+		/** Configuration-update capability (spec EF1-R2); false is the only unsupported signal. */
+		supportsConfigurationUpdate?: boolean;
 		cost: { input: number; output: number; cacheRead: number; cacheWrite: number };
 		contextWindow: number;
 		maxTokens: number;

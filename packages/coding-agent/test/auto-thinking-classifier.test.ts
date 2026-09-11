@@ -8,6 +8,7 @@ import {
 	classifyDifficulty,
 	parseDifficultyBucket,
 	parseDifficultyLevel,
+	singletonAutoOutcome,
 } from "@oh-my-pi/pi-coding-agent/auto-thinking/classifier";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
@@ -452,5 +453,64 @@ describe("auto thinking classifier helpers", () => {
 			expect(parseThinkingLevel(selector)).toBeUndefined();
 			expect(parseConfiguredThinkingLevel(selector)).toBeUndefined();
 		}
+	});
+	it("resolves a singleton outcome on a single-tier ladder without a classifier call", () => {
+		const settings = Settings.isolated();
+		const model = buildLadderModel("mock-xhigh-only", [Effort.XHigh]);
+		expect(singletonAutoOutcome(model, settings, undefined)).toBe(Effort.XHigh);
+	});
+
+	it("resolves the opted-in max singleton on a max-only ladder", () => {
+		const settings = Settings.isolated({ "providers.autoThinkingMaxEffort": "max" });
+		expect(singletonAutoOutcome(buildLadderModel("mock-max-only", [Effort.Max]), settings, undefined)).toBe(
+			Effort.Max,
+		);
+	});
+
+	it("keeps a max-only ladder non-singleton without the max opt-in", () => {
+		// Zero eligible outcomes: the existing unsupported/fallback behavior must
+		// stay in charge — no synthesized level, no skipped classifier.
+		const settings = Settings.isolated();
+		expect(
+			singletonAutoOutcome(buildLadderModel("mock-max-only", [Effort.Max]), settings, undefined),
+		).toBeUndefined();
+	});
+
+	it("resolves a singleton on a sparse single-tier ladder regardless of label count", () => {
+		const settings = Settings.isolated();
+		expect(singletonAutoOutcome(buildLadderModel("mock-high-only", [Effort.High]), settings, undefined)).toBe(
+			Effort.High,
+		);
+	});
+
+	it("keeps ordinary ladders non-singleton for both backends", () => {
+		const onlineSettings = Settings.isolated();
+		expect(
+			singletonAutoOutcome(buildLadderModel("mock-xhigh", XHIGH_LADDER), onlineSettings, undefined),
+		).toBeUndefined();
+		expect(singletonAutoOutcome(buildLadderModel("mock-max", MAX_LADDER), onlineSettings, undefined)).toBeUndefined();
+		const localSettings = Settings.isolated({ "providers.autoThinkingModel": "qwen3-1.7b" });
+		expect(
+			singletonAutoOutcome(buildLadderModel("mock-xhigh", XHIGH_LADDER), localSettings, undefined),
+		).toBeUndefined();
+	});
+
+	it("resolves the local backend's singleton on a single-tier ladder", () => {
+		// Local labels are {low, high, xhigh}; a high-only ladder collapses all of
+		// them to high even though `medium` never appears in the label domain.
+		const localSettings = Settings.isolated({ "providers.autoThinkingModel": "qwen3-1.7b" });
+		expect(singletonAutoOutcome(buildLadderModel("mock-high-only", [Effort.High]), localSettings, undefined)).toBe(
+			Effort.High,
+		);
+	});
+
+	it("composes the session effort ceiling into the singleton decision", () => {
+		// A session ceiling below the ladder top changes which outcomes exist.
+		const settings = Settings.isolated({ "providers.autoThinkingMaxEffort": "max" });
+		const model = buildLadderModel("mock-hm", [Effort.High, Effort.Max]);
+		// Unbounded: labels collapse to {high, max} — two candidates, classify.
+		expect(singletonAutoOutcome(model, settings, undefined)).toBeUndefined();
+		// Hard session ceiling at xhigh snaps max down, so every label lands on high.
+		expect(singletonAutoOutcome(model, settings, Effort.XHigh)).toBe(Effort.High);
 	});
 });

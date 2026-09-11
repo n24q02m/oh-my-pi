@@ -88,6 +88,7 @@ export function buildCustomModelOverlay(
 		imageInputDecoder: modelDef.imageInputDecoder,
 		tokenizer: modelDef.tokenizer,
 		supportsTools: modelDef.supportsTools,
+		supportsConfigurationUpdate: modelDef.supportsConfigurationUpdate,
 		cost: modelDef.cost,
 		contextWindow: modelDef.contextWindow,
 		maxTokens: modelDef.maxTokens,
@@ -121,6 +122,8 @@ export function finalizeCustomModel(model: CustomModelOverlay, options: CustomMo
 		(options.useDefaults ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } : undefined);
 	const input = resolvedModel.input ?? reference?.input ?? (options.useDefaults ? ["text"] : undefined);
 	const supportsTools = resolvedModel.supportsTools ?? reference?.supportsTools;
+	const supportsConfigurationUpdate =
+		resolvedModel.supportsConfigurationUpdate ?? reference?.supportsConfigurationUpdate;
 	return buildModel({
 		id: resolvedModel.id,
 		name: resolvedModel.name ?? (options.useDefaults ? resolvedModel.id : undefined),
@@ -132,6 +135,7 @@ export function finalizeCustomModel(model: CustomModelOverlay, options: CustomMo
 		input: input as ("text" | "image")[],
 		imageInputDecoder: resolvedModel.imageInputDecoder,
 		...(supportsTools !== undefined ? { supportsTools } : {}),
+		...(supportsConfigurationUpdate !== undefined ? { supportsConfigurationUpdate } : {}),
 		cost,
 		contextWindow: resolvedModel.contextWindow ?? reference?.contextWindow ?? (options.useDefaults ? 128000 : null),
 		maxTokens: resolvedModel.maxTokens ?? reference?.maxTokens ?? (options.useDefaults ? 16384 : null),

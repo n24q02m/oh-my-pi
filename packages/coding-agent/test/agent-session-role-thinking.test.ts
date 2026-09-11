@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } 
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { Effort } from "@oh-my-pi/pi-ai";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import * as autoThinkingClassifier from "@oh-my-pi/pi-coding-agent/auto-thinking/classifier";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -709,6 +710,58 @@ describe("AgentSession role model thinking behavior", () => {
 		expect(session.thinkingLevel).toBeUndefined();
 		expect(session.agent.state.thinkingLevel).toBeUndefined();
 		expect(session.autoResolvedThinkingLevel()).toBeUndefined();
+	});
+
+	it("resolves a singleton auto outcome without invoking the classifier", async () => {
+		// EF1-R3: a model whose whole label domain clamps to one effort gets its
+		// auto resolution through the ordinary receipt/event path — zero
+		// classifier calls, same persistence and event behavior as a classified
+		// turn.
+		const model = buildModel({
+			id: "mock-xhigh-only",
+			name: "mock-xhigh-only",
+			api: "openai-completions",
+			provider: "mock",
+			baseUrl: "https://example.com",
+			reasoning: true,
+			thinking: { mode: "effort", efforts: [Effort.XHigh] },
+			input: ["text"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 128_000,
+			maxTokens: 4096,
+		});
+		// createSession resolves bundled catalog models; the singleton fixture is
+		// synthetic, so build the session inline with it directly.
+		const agent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+				thinkingLevel: Effort.High,
+			},
+		});
+		authStorage.setRuntimeApiKey("mock", "test-key");
+		sessionSettings = Settings.isolated();
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings: sessionSettings,
+			modelRegistry,
+		});
+		vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+		const classifierSpy = vi.spyOn(autoThinkingClassifier, "classifyDifficulty").mockResolvedValue(Effort.Low);
+
+		session.setThinkingLevel(AUTO_THINKING);
+		await session.prompt("Handle a straightforward update");
+
+		expect(classifierSpy).not.toHaveBeenCalled();
+		expect(session.configuredThinkingLevel()).toBe(AUTO_THINKING);
+		expect(session.thinkingLevel).toBe(Effort.XHigh);
+		expect(session.autoResolvedThinkingLevel()).toBe(Effort.XHigh);
+		expect(session.agent.state.thinkingLevel).toBe(Effort.XHigh);
+		const receipts = session.sessionManager.getEntries().filter(entry => entry.type === "thinking_level_change");
+		expect(receipts).toHaveLength(1);
 	});
 
 	it("applies matching role thinking to temporary model picks", async () => {
