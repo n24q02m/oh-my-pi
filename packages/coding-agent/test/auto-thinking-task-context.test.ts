@@ -15,7 +15,23 @@ function userMessage(text: string): AgentMessage {
 }
 
 function assistantMessage(text: string): AgentMessage {
-	return { role: "assistant", content: [{ type: "text", text }], timestamp: 0 };
+	return {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: "anthropic-messages",
+		provider: "anthropic",
+		model: "test-model",
+		usage: {
+			input: 0,
+			output: 0,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 0,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: 0,
+	};
 }
 
 function toolResultMessage(text: string, isError = false): AgentMessage {
@@ -179,7 +195,25 @@ describe("deterministic transcript extraction", () => {
 		expect(extractTextContent(userMessage("hello world"))).toBe("hello world");
 		expect(extractTextContent(assistantMessage("done"))).toBe("done");
 		expect(extractTextContent(toolResultMessage("exit 1"))).toBe("exit 1");
-		expect(extractTextContent({ role: "assistant", content: [], timestamp: 0 })).toBe("");
+		expect(
+			extractTextContent({
+				role: "assistant",
+				content: [],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "test-model",
+				usage: {
+					input: 0,
+					output: 0,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 0,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "stop",
+				timestamp: 0,
+			}),
+		).toBe("");
 	});
 
 	it("picks the first user message as the founding objective", () => {
@@ -212,10 +246,7 @@ describe("deterministic transcript extraction", () => {
 	});
 
 	it("joins a reserved batch in dispatch order", () => {
-		const text = buildDispatchBatchText([
-			userMessage("first steer"),
-			userMessage("second steer"),
-		]);
+		const text = buildDispatchBatchText([userMessage("first steer"), userMessage("second steer")]);
 		expect(text).toBe("first steer\nsecond steer");
 	});
 });

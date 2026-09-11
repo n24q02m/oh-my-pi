@@ -1,16 +1,16 @@
 import { describe, expect, it } from "bun:test";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { SKILL_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
 import {
 	DispatchReviser,
 	isReservationCurrent,
+	type QueuedMessageSource,
 	reservationHasUserWork,
 	reserveDispatchBatch,
 	resolveDispatchTarget,
 	sameReservedBatch,
 	snapshotQueues,
-	type QueuedMessageSource,
 } from "@oh-my-pi/pi-coding-agent/session/dispatch-reservation";
+import { SKILL_PROMPT_MESSAGE_TYPE } from "@oh-my-pi/pi-coding-agent/session/messages";
 
 function userMessage(text: string): AgentMessage {
 	return { role: "user", content: [{ type: "text", text }], timestamp: 0 };
@@ -25,13 +25,17 @@ function skillMessage(text: string): AgentMessage {
 		role: "custom",
 		customType: SKILL_PROMPT_MESSAGE_TYPE,
 		content: [{ type: "text", text }],
+		display: true,
 		attribution: "user",
 		timestamp: 0,
 	};
 }
 
 /** Minimal structural queue source — Agent satisfies this surface. */
-function fakeQueueSource(steering: AgentMessage[], followUp: AgentMessage[]): QueuedMessageSource & {
+function fakeQueueSource(
+	steering: AgentMessage[],
+	followUp: AgentMessage[],
+): QueuedMessageSource & {
 	steering: AgentMessage[];
 	followUp: AgentMessage[];
 } {
@@ -111,9 +115,7 @@ describe("dispatch reservation lifecycle", () => {
 		const reviser = new DispatchReviser();
 		const source = fakeQueueSource([userMessage("s")], []);
 		const reservation = reserveDispatchBatch(source, reviser, 3, "m/x");
-		expect(
-			isReservationCurrent(source, reviser, reservation!, { generation: 3, modelKey: "m/x" }),
-		).toBe(true);
+		expect(isReservationCurrent(source, reviser, reservation!, { generation: 3, modelKey: "m/x" })).toBe(true);
 	});
 
 	it("invalidates when a concurrent enqueue lands after reservation", () => {
@@ -122,9 +124,7 @@ describe("dispatch reservation lifecycle", () => {
 		const source = fakeQueueSource(steering, []);
 		const reservation = reserveDispatchBatch(source, reviser, 3, "m/x");
 		steering.push(userMessage("late steer"));
-		expect(
-			isReservationCurrent(source, reviser, reservation!, { generation: 3, modelKey: "m/x" }),
-		).toBe(false);
+		expect(isReservationCurrent(source, reviser, reservation!, { generation: 3, modelKey: "m/x" })).toBe(false);
 	});
 
 	it("invalidates on queue edit (message removed) and reorder", () => {
