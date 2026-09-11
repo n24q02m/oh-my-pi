@@ -65,6 +65,7 @@ import { ReadTool } from "./read";
 import type { PlanProposalHandler } from "./resolve";
 import { SecurityScanTool } from "./security-scan";
 import { supportsExternalThinking, ThinkTool } from "./think";
+import { ThinkingEffortTool } from "./thinking-effort";
 import { type TodoPhase, TodoTool } from "./todo";
 import { WriteTool } from "./write";
 import { isMountableUnderXdev, type XdevState } from "./xdev";
@@ -107,6 +108,7 @@ export * from "./resolve";
 export * from "./review";
 export * from "./security-scan";
 export * from "./think";
+export * from "./thinking-effort";
 export * from "./todo";
 export * from "./tts";
 export * from "./vibe";
@@ -360,6 +362,8 @@ export interface ToolSession {
 	getPlanReferencePath?: () => string;
 	/** Goal mode state (if active or paused) */
 	getGoalModeState?: () => GoalModeState | undefined;
+	/** EF2-R3: propose a temporary next-request thinking effort (the `thinking_effort` tool). */
+	proposeThinkingEffort?(requested: string): { accepted: boolean; effort?: string; reason?: string } | undefined;
 	/** Goal runtime for the active agent session. */
 	getGoalRuntime?: () => GoalRuntime | undefined;
 	/** Get cumulative session usage statistics (input/output tokens, cost). */
@@ -493,6 +497,7 @@ export const BUILTIN_TOOLS: Record<BuiltinToolName, ToolFactory> = {
 
 export const HIDDEN_TOOLS: Record<HiddenToolName, ToolFactory> = {
 	think: () => new ThinkTool(),
+	thinking_effort: s => new ThinkingEffortTool(s),
 	yield: s => new YieldTool(s),
 	goal: s => new GoalTool(s),
 };
@@ -522,6 +527,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 	const goalModeActive = !restrictToolNames && goalEnabled && session.getGoalModeState?.()?.enabled === true;
 	const externalThinkingActive =
 		session.settings.get("externalThinking") && supportsExternalThinking(session.getActiveModel?.());
+	const adaptiveEffortActive = session.settings.get("providers.autoThinkingAdaptive") === true;
 	if (goalModeActive && requestedTools && !requestedTools.includes("goal")) {
 		requestedTools.push("goal");
 	}
@@ -666,6 +672,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (name === "web_search") return session.settings.get("web_search.enabled");
 		if (name === "security_scan") return session.settings.get("security.enabled");
 		if (name === "think") return externalThinkingActive;
+		if (name === "thinking_effort") return session.settings.get("providers.autoThinkingAdaptive") === true;
 		if (name === "ask") return session.settings.get("ask.enabled");
 		if (name === "browser") return session.settings.get("browser.enabled");
 		if (name === "computer") return session.settings.get("computer.enabled");
@@ -713,6 +720,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 						.filter(([name]) => isToolAllowed(name))
 						.map(([name, factory]) => [name, factory] as const),
 					...(externalThinkingActive ? ([["think", HIDDEN_TOOLS.think]] as const) : []),
+					...(adaptiveEffortActive ? ([["thinking_effort", HIDDEN_TOOLS.thinking_effort]] as const) : []),
 					...(includeYield ? ([["yield", HIDDEN_TOOLS.yield]] as const) : []),
 					...(goalModeActive ? ([["goal", HIDDEN_TOOLS.goal]] as const) : []),
 				];

@@ -429,7 +429,7 @@ describe("createTools", () => {
 		expect(names).toContain("rewind");
 	});
 
-	it("HIDDEN_TOOLS contains yield, goal, and think", () => {
-		expect(Object.keys(HIDDEN_TOOLS).sort()).toEqual(["goal", "think", "yield"]);
+	it("HIDDEN_TOOLS contains yield, goal, think, and thinking_effort", () => {
+		expect(Object.keys(HIDDEN_TOOLS).sort()).toEqual(["goal", "think", "thinking_effort", "yield"]);
 	});
 });
