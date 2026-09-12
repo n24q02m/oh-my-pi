@@ -40,7 +40,7 @@ class GitLabDuoOAuthFlow extends OAuthCallbackFlow {
 	#pkce: PKCEPair;
 
 	constructor(ctrl: OAuthLoginCallbacks, pkce: PKCEPair) {
-		super(ctrl, CALLBACK_PORT, CALLBACK_PATH);
+		super(ctrl, { preferredPort: CALLBACK_PORT, callbackPath: CALLBACK_PATH, allowPortFallback: false });
 		this.#pkce = pkce;
 	}
 

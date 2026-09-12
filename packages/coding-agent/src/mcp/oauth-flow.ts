@@ -6,6 +6,7 @@
  */
 
 import type { OAuthController, OAuthCredentials } from "@oh-my-pi/pi-ai";
+import type { OAuthCallbackFlowOptions } from "@oh-my-pi/pi-ai/utils/oauth/callback-server";
 import { OAuthCallbackFlow } from "@oh-my-pi/pi-ai/utils/oauth/callback-server";
 
 const DEFAULT_PORT = 3000;
@@ -24,6 +25,39 @@ export interface MCPOAuthConfig {
 	scopes?: string;
 	/** Custom callback port (default: 3000) */
 	callbackPort?: number;
+	/** Pinned redirect URI (optional; its port seeds callback-port resolution) */
+	redirectUri?: string;
+}
+function staticClientIdFromConfig(config: MCPOAuthConfig): string | undefined {
+	const fromConfig = config.clientId?.trim();
+	if (fromConfig) return fromConfig;
+
+	try {
+		return new URL(config.authorizationUrl).searchParams.get("client_id") ?? undefined;
+	} catch {
+		return undefined;
+	}
+}
+
+function resolveCallbackPort(config: MCPOAuthConfig): number {
+	if (config.callbackPort !== undefined) return config.callbackPort;
+	if (config.redirectUri) {
+		try {
+			const port = Number(new URL(config.redirectUri).port);
+			if (port > 0) return port;
+		} catch {}
+	}
+	return DEFAULT_PORT;
+}
+
+function resolveCallbackOptions(config: MCPOAuthConfig): OAuthCallbackFlowOptions {
+	const staticClientId = staticClientIdFromConfig(config);
+	return {
+		preferredPort: resolveCallbackPort(config),
+		callbackPath: CALLBACK_PATH,
+		allowPortFallback: staticClientId === undefined && config.redirectUri === undefined,
+		redirectUri: config.redirectUri,
+	};
 }
 
 /**
@@ -34,12 +68,11 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 	#resolvedClientId?: string;
 	#registeredClientSecret?: string;
 	#codeVerifier?: string;
-
 	constructor(
 		private config: MCPOAuthConfig,
 		ctrl: OAuthController,
 	) {
-		super(ctrl, config.callbackPort ?? DEFAULT_PORT, CALLBACK_PATH);
+		super(ctrl, resolveCallbackOptions(config));
 		this.#resolvedClientId = this.#resolveClientId(config);
 	}
 
@@ -156,14 +189,7 @@ export class MCPOAuthFlow extends OAuthCallbackFlow {
 	}
 
 	#resolveClientId(config: MCPOAuthConfig): string | undefined {
-		const fromConfig = config.clientId?.trim();
-		if (fromConfig) return fromConfig;
-
-		try {
-			return new URL(config.authorizationUrl).searchParams.get("client_id") ?? undefined;
-		} catch {
-			return undefined;
-		}
+		return staticClientIdFromConfig(config);
 	}
 
 	/**

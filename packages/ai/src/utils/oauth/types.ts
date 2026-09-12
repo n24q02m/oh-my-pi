@@ -49,6 +49,7 @@ export type OAuthPrompt = {
 
 export type OAuthAuthInfo = {
 	url: string;
+	launchUrl?: string;
 	instructions?: string;
 };
 

@@ -170,7 +170,7 @@ async function getUserEmail(accessToken: string): Promise<string | undefined> {
 
 class AntigravityOAuthFlow extends OAuthCallbackFlow {
 	constructor(ctrl: OAuthController) {
-		super(ctrl, CALLBACK_PORT, CALLBACK_PATH);
+		super(ctrl, { preferredPort: CALLBACK_PORT, callbackPath: CALLBACK_PATH, allowPortFallback: false });
 	}
 
 	async generateAuthUrl(state: string, redirectUri: string): Promise<{ url: string; instructions?: string }> {
