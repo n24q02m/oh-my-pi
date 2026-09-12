@@ -221,17 +221,17 @@ export {
 	BashTool,
 	// Tool classes and factories
 	BUILTIN_TOOLS,
-	HIDDEN_TOOLS,
 	createTools,
 	EditTool,
 	FindTool,
 	GrepTool,
+	HIDDEN_TOOLS,
 	loadSshTool,
 	PythonTool,
 	ReadTool,
 	ResolveTool,
-	WriteTool,
 	type ToolSession,
+	WriteTool,
 };
 
 // Helper Functions
@@ -664,7 +664,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	}
 
 	// Clamp to model capabilities
-	if (!model || !model.reasoning) {
+	if (!model?.reasoning) {
 		thinkingLevel = "off";
 	} else if (thinkingLevel === "xhigh" && !supportsXhigh(model)) {
 		thinkingLevel = "high";
@@ -1302,9 +1302,8 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					return extensionRunner.emitContext(messages);
 				}
 			: undefined,
-		steeringMode: settings.get("steeringMode") ?? "one-at-a-time",
-		followUpMode: settings.get("followUpMode") ?? "one-at-a-time",
 		interruptMode: settings.get("interruptMode") ?? "immediate",
+		maxRetryDelayMs: settings.get("retry.maxDelayMs") ?? undefined,
 		thinkingBudgets: settings.getGroup("thinkingBudgets"),
 		temperature: settings.get("temperature") >= 0 ? settings.get("temperature") : undefined,
 		topP: settings.get("topP") >= 0 ? settings.get("topP") : undefined,

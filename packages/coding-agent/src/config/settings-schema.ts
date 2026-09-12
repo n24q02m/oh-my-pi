@@ -388,6 +388,16 @@ export const SETTINGS_SCHEMA = {
 		},
 	},
 	"retry.baseDelayMs": { type: "number", default: 2000 },
+	"retry.maxDelayMs": {
+		type: "number",
+		default: 30_000,
+		ui: {
+			tab: "agent",
+			label: "Retry max delay (ms)",
+			description: "Maximum retry delay before parking to provider switching",
+			submenu: true,
+		},
+	},
 
 	// ─────────────────────────────────────────────────────────────────────────
 	// Todo completion settings
@@ -1235,8 +1245,8 @@ export interface RetrySettings {
 	enabled: boolean;
 	maxRetries: number;
 	baseDelayMs: number;
+	maxDelayMs: number;
 }
-
 export interface MemoriesSettings {
 	enabled: boolean;
 	maxRolloutsPerStartup: number;
