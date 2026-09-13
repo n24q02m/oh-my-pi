@@ -12,8 +12,17 @@ import type { Effort } from "@oh-my-pi/pi-ai";
  *   level was kept.
  * - `aborted` — the turn was superseded/aborted before the decision applied;
  *   nothing was persisted or emitted downstream.
+ * - `stale-batch` — EF2.1 shared dispatch: the reserved batch changed (queue
+ *   edit, cancel, concurrent enqueue, model switch) between classification
+ *   and application; the decision was discarded, nothing applied.
  */
-export type AutoThinkingDecisionSource = "ultrathink" | "singleton" | "classifier" | "fallback" | "aborted";
+export type AutoThinkingDecisionSource =
+	| "ultrathink"
+	| "singleton"
+	| "classifier"
+	| "fallback"
+	| "aborted"
+	| "stale-batch";
 
 /**
  * How the decided model's thinking capability was established. Only catalog

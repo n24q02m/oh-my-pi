@@ -101,6 +101,12 @@ import {
 import { type AdvisorConfig, type AdvisorRuntimeStatus, loadAdvisorTranscriptCosts } from "../advisor";
 import { ASYNC_JOB_MANAGER_SHUTDOWN_REASON, type AsyncJob, AsyncJobManager } from "../async";
 import { detectPromptCacheDrop, type PromptCacheSample } from "../auto-thinking/decision-receipt";
+import {
+	buildDispatchBatchText,
+	buildTaskContext,
+	extractRecentResult,
+	extractTaskObjective,
+} from "../auto-thinking/task-context";
 import { reset as resetCapabilities } from "../capability";
 import type { EffectiveExtensionRoots } from "../capability/types";
 import { shouldEnableAppendOnlyContext } from "../config/append-only-context-mode";
@@ -280,6 +286,12 @@ import {
 	shouldPromptCodexAutoRedeem,
 } from "./codex-auto-reset";
 import { recordCredentialPin, seedCredentialPins } from "./credential-pin";
+import {
+	DispatchReviser,
+	isReservationCurrent,
+	reservationHasUserWork,
+	reserveDispatchBatch,
+} from "./dispatch-reservation";
 import { EvalRunner, type EvalRunnerHost } from "./eval-runner";
 import {
 	collectPendingToolCalls,
@@ -711,6 +723,7 @@ export class AgentSession {
 	// on `agent_end` can fire its next `prompt` before #promptWithMessage's finally
 	#promptGeneration = 0;
 	#promptSequence = 0;
+	#dispatchReviser = new DispatchReviser();
 	#skippedPostTurnSpeculationCompletion: Promise<void> | undefined;
 	#pendingAgentEndEmit: AgentSessionEvent | undefined;
 	#inFlightSettledCallbacks: Array<() => void | Promise<void>> = [];
@@ -3470,6 +3483,7 @@ export class AgentSession {
 					return { status: "skipped", reason: "session-unavailable" };
 				}
 			}
+			await this.#applyQueuedBatchAutoThinking();
 			await this.agent.continue(signal);
 			return { status: "completed" };
 		} catch (error) {
@@ -3482,6 +3496,66 @@ export class AgentSession {
 			});
 			return { status: "failed", error };
 		}
+	}
+
+	/**
+	 * EF2.1 shared dispatch: the classifier input for the text the next request
+	 * will actually carry. Opt-in via `providers.autoThinkingAdaptive`: the text
+	 * is wrapped in the bounded task-context envelope (founding objective, recent
+	 * visible result, previous effort, current input) so a short continuation is
+	 * classified in task context instead of isolation. Legacy mode keeps the raw
+	 * text, matching the pre-EF2 classifier input exactly.
+	 */
+	#classifyAutoThinkingInput(batchText: string, reassessmentReason: "new-prompt" | "queued-batch"): string {
+		if (!this.settings.get("providers.autoThinkingAdaptive")) return batchText;
+		const level = this.#models.thinkingLevel;
+		return buildTaskContext({
+			currentInput: batchText,
+			objective: extractTaskObjective(this.messages),
+			recentResult: extractRecentResult(this.messages),
+			previousEffort: level === undefined || level === "inherit" || level === "off" ? undefined : level,
+			reassessmentReason,
+		}).text;
+	}
+
+	/**
+	 * Classify a reserved queued batch right before `agent.continue()` dispatches
+	 * it — the shared seam every queued drain (idle steer, settle-boundary steer,
+	 * follow-up, compaction resume) flows through. Only auto-thinking sessions
+	 * with adaptive dispatch on pay a classifier call, and only for batches with
+	 * real user work; synthetic/developer continuations and advisor cards dispatch
+	 * on the current level. The decision binds to the reserved batch: queue edit,
+	 * concurrent enqueue, model switch, abort, or session replacement during
+	 * classification discards it unapplied (`stale-batch`) while the live batch
+	 * still dispatches.
+	 */
+	async #applyQueuedBatchAutoThinking(): Promise<void> {
+		if (!this.isAutoThinking || !this.settings.get("providers.autoThinkingAdaptive")) return;
+		const generation = this.#promptGeneration;
+		const model = this.model;
+		if (!model) return;
+		const reservation = reserveDispatchBatch(
+			this.agent,
+			this.#dispatchReviser,
+			generation,
+			`${model.provider}/${model.id}`,
+		);
+		if (!reservation || !reservationHasUserWork(reservation)) return;
+		const batchText = buildDispatchBatchText(reservation.target.map(ref => ref.message));
+		await this.#models.applyAutoThinkingLevel(
+			this.#classifyAutoThinkingInput(batchText, "queued-batch"),
+			generation,
+			() => {
+				const current = this.model;
+				return (
+					current !== undefined &&
+					isReservationCurrent(this.agent, this.#dispatchReviser, reservation, {
+						generation: this.#promptGeneration,
+						modelKey: `${current.provider}/${current.id}`,
+					})
+				);
+			},
+		);
 	}
 
 	#scheduleAgentContinue(options: ScheduledAgentContinueOptions): void {
@@ -6152,7 +6226,10 @@ export class AgentSession {
 			// back to a concrete level inside the helper.
 			const isUserTurn = message.role === "user" || (message.role === "custom" && isUserInvokedSkillPrompt(message));
 			if (this.isAutoThinking && isUserTurn) {
-				await this.#models.applyAutoThinkingLevel(expandedText, generation);
+				await this.#models.applyAutoThinkingLevel(
+					this.#classifyAutoThinkingInput(expandedText, "new-prompt"),
+					generation,
+				);
 				if (this.#promptGeneration !== generation) {
 					return false;
 				}
