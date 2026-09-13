@@ -93,6 +93,16 @@ export interface ServiceTierChangeEntry extends SessionEntryBase {
 	type: "service_tier_change";
 	serviceTier: ServiceTierByFamily | null;
 }
+/**
+ * EF2-R5 capability epoch: the effort capability strategy of the active
+ * endpoint/API/model changed (model/endpoint switch). Persisted so resume can
+ * reconstruct the capability context and detect drift; never carries secrets.
+ */
+export interface CapabilityEpochChangeEntry extends SessionEntryBase {
+	type: "capability_epoch_change";
+	strategy: string;
+	reason: string;
+}
 
 export interface CompactionEntry<T = unknown> extends SessionEntryBase {
 	type: "compaction";
@@ -275,8 +285,9 @@ export type SessionEntry =
 	| ModelChangeEntry
 	| ServiceTierChangeEntry
 	| CompactionEntry
-	| BranchSummaryEntry
 	| CustomEntry
+	| BranchSummaryEntry
+	| CapabilityEpochChangeEntry
 	| CustomMessageEntry
 	| LabelEntry
 	| TitleChangeEntry

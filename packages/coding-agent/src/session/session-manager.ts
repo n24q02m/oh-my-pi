@@ -35,6 +35,7 @@ import {
 import { type BuildSessionContextOptions, buildSessionContext, type SessionContext } from "./session-context";
 import {
 	type BranchSummaryEntry,
+	type CapabilityEpochChangeEntry,
 	type CompactionEntry,
 	type CredentialPinEntry,
 	CURRENT_SESSION_VERSION,
@@ -212,8 +213,8 @@ function isDraftOnlyMetadataEntry(entry: SessionEntry): boolean {
 	// reach this branch and always keep the file resumable.
 	switch (entry.type) {
 		case "model_change":
-		case "thinking_level_change":
 		case "service_tier_change":
+		case "capability_epoch_change":
 		case "mode_change":
 		case "credential_pin":
 			return true;
@@ -2314,6 +2315,27 @@ export class SessionManager {
 		const entry: ServiceTierChangeEntry = { type: "service_tier_change", ...this.#freshEntryFields(), serviceTier };
 		this.#recordEntry(entry);
 		return entry.id;
+	}
+	/** Append a capability epoch change (EF2-R5) as child of current leaf. */
+	appendCapabilityEpochChange(strategy: string, reason: string): string {
+		const entry: CapabilityEpochChangeEntry = {
+			type: "capability_epoch_change",
+			...this.#freshEntryFields(),
+			strategy,
+			reason,
+		};
+		this.#recordEntry(entry);
+		return entry.id;
+	}
+
+	/** The most recent capability epoch strategy on the current branch, if any. */
+	getLastCapabilityEpoch(): string | undefined {
+		const branch = this.getBranch();
+		for (let index = branch.length - 1; index >= 0; index--) {
+			const entry = branch[index];
+			if (entry.type === "capability_epoch_change") return entry.strategy;
+		}
+		return undefined;
 	}
 
 	appendModeChange(mode: string, data?: Record<string, unknown>): string {
