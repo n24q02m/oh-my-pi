@@ -317,6 +317,7 @@ function additionalLimitSlug(args: { limitName?: string; meteredFeature?: string
 
 function additionalDisplayName(slug: string, limitName?: string): string {
 	if (slug === "spark") return "Spark";
+	if (slug === "base-model-inference" || slug === "gpt-reserve") return "Luna Reserve";
 	if (limitName) return limitName;
 	return slug.replace(
 		/(^|-)([a-z])/g,

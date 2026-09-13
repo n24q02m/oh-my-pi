@@ -2324,7 +2324,40 @@ export class ModelRegistry {
 	 * Find a model by provider and ID.
 	 */
 	find(provider: string, modelId: string): Model<Api> | undefined {
-		return resolveProviderModelReference(provider, modelId, this.#modelsForProviderLookup(provider));
+		const found = resolveProviderModelReference(provider, modelId, this.#modelsForProviderLookup(provider));
+		if (found) return found;
+		if (provider === "openai-codex" && modelId.toLowerCase() === "gpt-reserve") {
+			return this.#resolveCodexReserveModel();
+		}
+		return undefined;
+	}
+
+	#resolveCodexReserveModel(): Model<Api> {
+		const lookup = this.#modelsForProviderLookup("openai-codex");
+		const base =
+			resolveProviderModelReference("openai-codex", "gpt-5.6-luna", lookup) ??
+			resolveProviderModelReference("openai-codex", "gpt-5.6-sol", lookup);
+		if (base) {
+			return {
+				...base,
+				id: "gpt-reserve",
+				name: "GPT Reserve (Luna Reserve)",
+				requestModelId: "gpt-reserve",
+			};
+		}
+		return buildModel({
+			provider: "openai-codex",
+			api: "openai-codex-responses",
+			baseUrl: "https://chatgpt.com/backend-api",
+			reasoning: false,
+			input: ["text", "image"],
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+			contextWindow: 256_000,
+			maxTokens: 32_768,
+			id: "gpt-reserve",
+			name: "GPT Reserve (Luna Reserve)",
+			requestModelId: "gpt-reserve",
+		});
 	}
 
 	/**
