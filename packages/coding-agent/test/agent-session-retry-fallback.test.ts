@@ -6755,6 +6755,7 @@ describe("AgentSession retry fallback", () => {
 		}
 		const geminiSelector = `${gemini.provider}/${gemini.id}`;
 		const sonnetSelector = `${sonnet.provider}/${sonnet.id}`;
+		authStorage.setRuntimeApiKey("google-antigravity", "antigravity-test-key");
 
 		const requested: string[] = [];
 		const applied: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
@@ -6831,6 +6832,7 @@ describe("AgentSession retry fallback", () => {
 		const gemini = getBundledModel("google-antigravity", "gemini-3.7-flash");
 		if (!gemini) throw new Error("Expected gemini model");
 		const geminiSelector = `${gemini.provider}/${gemini.id}`;
+		authStorage.setRuntimeApiKey("google-antigravity", "antigravity-test-key");
 
 		const requested: string[] = [];
 		const notices: string[] = [];
