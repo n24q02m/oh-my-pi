@@ -209,6 +209,16 @@ export class ModelControls {
 		return this.#autoThinking ? AUTO_THINKING : this.#thinkingLevel;
 	}
 
+	/** True when a pending or armed EF2-R3 next-request override exists. */
+	get hasRequestOverride(): boolean {
+		return this.#pendingOverride !== undefined || this.#overrideArmed;
+	}
+
+	/** The accepted-but-not-yet-dispatched override, if any. */
+	get pendingRequestOverride(): { effort: Effort; generation: number } | undefined {
+		return this.#pendingOverride;
+	}
+
 	/** Whether per-turn automatic thinking classification is enabled. */
 	get isAutoThinking(): boolean {
 		return this.#autoThinking;
