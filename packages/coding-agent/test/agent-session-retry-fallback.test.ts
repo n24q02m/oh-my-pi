@@ -6755,6 +6755,7 @@ describe("AgentSession retry fallback", () => {
 		}
 		const geminiSelector = `${gemini.provider}/${gemini.id}`;
 		const sonnetSelector = `${sonnet.provider}/${sonnet.id}`;
+		authStorage.setRuntimeApiKey("google-antigravity", "antigravity-test-key");
 
 		const requested: string[] = [];
 		const applied: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
@@ -6831,6 +6832,7 @@ describe("AgentSession retry fallback", () => {
 		const gemini = getBundledModel("google-antigravity", "gemini-3.7-flash");
 		if (!gemini) throw new Error("Expected gemini model");
 		const geminiSelector = `${gemini.provider}/${gemini.id}`;
+		authStorage.setRuntimeApiKey("google-antigravity", "antigravity-test-key");
 
 		const requested: string[] = [];
 		const notices: string[] = [];
@@ -6973,7 +6975,8 @@ describe("AgentSession retry fallback", () => {
 			throw new Error("Expected test models to resolve");
 		}
 
-		const fixedUntil = Date.parse("2026-09-04T15:49:00.000Z");
+		const fixedUntil = Math.floor((Date.now() + 10 * 60 * 1000) / 60000) * 60000;
+		const parkedUntilMinute = `${new Date(fixedUntil).toISOString().slice(0, 16)}Z`;
 		const parkedSelector = `${parked.provider}/${parked.id}`;
 		modelRegistry.suppressSelector(parkedSelector, fixedUntil);
 
@@ -7036,9 +7039,60 @@ describe("AgentSession retry fallback", () => {
 		expect(lastMessage.stopReason).toBe("error");
 		expect(lastMessage.errorMessage).toContain("Fallback chain exhausted:");
 		expect(lastMessage.errorMessage).toContain(`${credLessSelector} (no-credentials)`);
-		expect(lastMessage.errorMessage).toContain(`${parkedSelector} (quota-exhausted-until 2026-09-04T15:49Z)`);
+		expect(lastMessage.errorMessage).toContain(`${parkedSelector} (quota-exhausted-until ${parkedUntilMinute})`);
 		expect(lastMessage.errorMessage).toContain("fatal unrecoverable primary fault");
 	});
+	it("labels previously attempted candidates in exhausted fallback summaries", async () => {
+		const primary = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		const intermediate = modelRegistry.find("openai", "gpt-4o-mini");
+		if (!primary || !intermediate) {
+			throw new Error("Expected test models to resolve");
+		}
+
+		const primarySelector = `${primary.provider}/${primary.id}`;
+		const intermediateSelector = `${intermediate.provider}/${intermediate.id}`;
+		const requested: string[] = [];
+		const notices: string[] = [];
+		const mock = createMockModel();
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				mock.push({ throw: "fatal unrecoverable fallback fault" });
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.maxRetries": 0,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				[primarySelector]: [intermediateSelector],
+				[intermediateSelector]: [primarySelector],
+			},
+		});
+		settings.setModelRole("default", primarySelector);
+
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "notice" && event.source === "retry-fallback") notices.push(event.message);
+		});
+
+		await session.prompt("Exhaust a cycle without mislabeling skipped candidates");
+		await session.waitForIdle();
+
+		expect(requested).toEqual([primarySelector, intermediateSelector]);
+		expect(notices).toContain(
+			`Retry fallback skipped [already-attempted]: selector=${primarySelector} from=${intermediateSelector} role=${intermediateSelector}`,
+		);
+		const lastMessage = getLastAssistantMessage(session);
+		expect(lastMessage.stopReason).toBe("error");
+		expect(lastMessage.errorMessage).toContain(`${primarySelector} (already-attempted)`);
+	});
+
 
 	it("hops from chat-exhausted Luna to gpt-reserve when reserve meter is available", async () => {
 		const luna =
@@ -7049,6 +7103,10 @@ describe("AgentSession retry fallback", () => {
 		}
 
 		vi.spyOn(modelRegistry.authStorage, "hasCodexLunaReserveCapacity").mockResolvedValue(true);
+		vi.spyOn(modelRegistry.authStorage, "getModelUsageHealth").mockImplementation(async () => ({
+			state: "healthy",
+			accounts: [],
+		}));
 		vi.spyOn(modelRegistry.authStorage, "markUsageLimitReached").mockResolvedValue({ switched: false });
 		vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
@@ -7116,6 +7174,10 @@ describe("AgentSession retry fallback", () => {
 
 		// Reserve absent or exhausted
 		vi.spyOn(modelRegistry.authStorage, "hasCodexLunaReserveCapacity").mockResolvedValue(false);
+		vi.spyOn(modelRegistry.authStorage, "getModelUsageHealth").mockImplementation(async () => ({
+			state: "healthy",
+			accounts: [],
+		}));
 		vi.spyOn(modelRegistry.authStorage, "markUsageLimitReached").mockResolvedValue({ switched: false });
 		vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");
 		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);

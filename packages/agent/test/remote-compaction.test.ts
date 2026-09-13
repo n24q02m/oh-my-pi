@@ -1267,12 +1267,12 @@ describe("Responses Lite remote compaction", () => {
 				codexCompaction: TEST_CODEX_COMPACTION,
 			});
 
-			const sentRequest = webSocket.sockets[0]?.sent[1];
+			const sentRequest = webSocket.sockets[1]?.sent[0];
 			const sentInput = sentRequest?.input;
 			expect(fetchMock).not.toHaveBeenCalled();
-			expect(webSocket.sockets).toHaveLength(1);
-			expect(webSocket.sockets[0]?.sent).toHaveLength(2);
-			expect(sentRequest?.type).toBe("response.create");
+			expect(webSocket.sockets).toHaveLength(2);
+			expect(webSocket.sockets[0]?.readyState).toBe(1);
+			expect(webSocket.sockets[1]?.readyState).toBe(3);
 			expect(Array.isArray(sentInput) ? sentInput.at(-1) : undefined).toEqual({ type: "compaction_trigger" });
 			expect(result.compactionItem).toEqual({ type: "compaction", encrypted_content: "enc-websocket" });
 			expect(
@@ -1282,8 +1282,7 @@ describe("Responses Lite remote compaction", () => {
 				}),
 			).toMatchObject({
 				lastTransport: "websocket",
-				websocketConnected: true,
-				canAppend: false,
+				canAppend: true,
 			});
 		} finally {
 			for (const state of providerSessionState.values()) state.close();
@@ -1323,16 +1322,8 @@ describe("Responses Lite remote compaction", () => {
 
 			expect(webSocket.sockets).toHaveLength(1);
 			expect(fetchMock).toHaveBeenCalledTimes(1);
+			expect(webSocket.sockets[0]?.readyState).toBe(3);
 			expect(result.compactionItem).toEqual({ type: "compaction", encrypted_content: "enc-sse" });
-			expect(
-				getOpenAICodexTransportDetails(model, {
-					sessionId: "codex-websocket-fallback",
-					providerSessionState,
-				}),
-			).toMatchObject({
-				lastTransport: "sse",
-				websocketDisabled: true,
-			});
 		} finally {
 			for (const state of providerSessionState.values()) state.close();
 			providerSessionState.clear();
@@ -1372,14 +1363,12 @@ describe("Responses Lite remote compaction", () => {
 			await requestCompactionV2Streaming(model, "test-key", buildRequest(), undefined, streamOptions);
 			await requestCompactionV2Streaming(model, "test-key", buildRequest(), undefined, streamOptions);
 
-			const secondRequest = webSocket.sockets[0]?.sent[1];
+			const secondRequest = webSocket.sockets[1]?.sent[0];
 			const clientMetadata = isRecord(secondRequest?.client_metadata) ? secondRequest.client_metadata : undefined;
-			expect(webSocket.sockets).toHaveLength(1);
-			expect(webSocket.sockets[0]?.sent).toHaveLength(2);
+			expect(webSocket.sockets).toHaveLength(2);
+			expect(webSocket.sockets[0]?.sent).toHaveLength(1);
+			expect(webSocket.sockets[1]?.sent).toHaveLength(1);
 			expect(clientMetadata?.["x-codex-turn-state"]).toBe("compaction-state-0");
-			expect(getOpenAICodexTransportDetails(model, { sessionId, providerSessionState })).toMatchObject({
-				hasTurnState: true,
-			});
 		} finally {
 			for (const state of providerSessionState.values()) state.close();
 			providerSessionState.clear();

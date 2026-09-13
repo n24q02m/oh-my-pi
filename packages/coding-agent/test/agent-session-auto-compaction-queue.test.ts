@@ -25,6 +25,69 @@ function getRuntimeSignals(): string[] {
 	}
 	return globalWithSignals[runtimeSignalStoreKey];
 }
+// vi.useFakeTimers() in bun intercepts the timer wheel at runtime level — even
+// a setTimeout reference captured before the fake install never fires, and bun's
+// per-test timeout cannot bound a stalled await in fake-timer tests. Observed on
+// linux CI (run 34184149344): this file printed its group header, then sat
+// silent until the 6h job kill. Every event-gated await below therefore races a
+// deadline kept on a Worker thread (its own unfaked timer wheel) so a stall
+// fails bounded, with the runtime signals showing where the flow stopped.
+let deadlineWorker: Worker | undefined;
+const deadlineWaiters = new Map<number, () => void>();
+let nextDeadlineId = 1;
+
+function ensureDeadlineWorker(): Worker {
+	// The only real-clock timer in this file lives on the worker's own wheel on
+	// purpose: bun's vi.useFakeTimers() intercepts this thread's timer wheel, so
+	// no deterministic advanceTimers path can bound a stalled gate from inside
+	// the test thread. This is a failure deadline, not a sleep guarding a
+	// condition — the awaited conditions are the runtime signals and session
+	// promises themselves.
+	if (deadlineWorker !== undefined) return deadlineWorker;
+	const source = `onmessage = event => { const { id, ms } = event.data; setTimeout(() => postMessage(id), ms); };`;
+	deadlineWorker = new Worker(URL.createObjectURL(new Blob([source], { type: "text/javascript" })));
+	deadlineWorker.onmessage = (event: MessageEvent<number>) => {
+		const fire = deadlineWaiters.get(event.data);
+		if (fire !== undefined) {
+			deadlineWaiters.delete(event.data);
+			fire();
+		}
+	};
+	return deadlineWorker;
+}
+
+function testDeadline<T>(promise: Promise<T>, label: string, ms = 2_000): Promise<T> {
+	const worker = ensureDeadlineWorker();
+	const id = nextDeadlineId++;
+	let fire: ((error: Error) => void) | undefined;
+	const timedOut = new Promise<never>((_, reject) => {
+		fire = reject;
+	});
+	deadlineWaiters.set(id, () => {
+		fire?.(new Error(`Test deadline exceeded after ${ms}ms: ${label}; signals=[${getRuntimeSignals().join(" | ")}]`));
+	});
+	worker.postMessage({ id, ms });
+	return Promise.race([promise, timedOut]).finally(() => {
+		deadlineWaiters.delete(id);
+	});
+}
+
+// Bounded replacement for the raw `while (!signals.includes(...))` microtask
+// spins: same spin mechanics the flow depends on, but a stall now fails at the
+// worker deadline and the poll stops after the deadline fires.
+async function waitForRuntimeSignal(fragment: string, label: string, ms = 2_000): Promise<void> {
+	let timedOut = false;
+	const poll = (async () => {
+		while (!timedOut && !getRuntimeSignals().some(signal => signal.includes(fragment))) {
+			await Promise.resolve();
+		}
+	})();
+	try {
+		await testDeadline(poll, label, ms);
+	} finally {
+		timedOut = true;
+	}
+}
 
 /**
  * Regression test: auto-compaction completion should resume the agent loop when
@@ -203,7 +266,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 
 		// Wait for compaction completion, then verify waitForIdle blocks on queued continuation.
-		await compactionDone;
+		await testDeadline(compactionDone, "auto_compaction_end (first threshold test)");
 		await Promise.resolve();
 		const idlePromise = session.waitForIdle();
 		let idleResolved = false;
@@ -213,7 +276,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		await Promise.resolve();
 		expect(idleResolved).toBe(false);
 		vi.advanceTimersByTime(200);
-		await idlePromise;
+		await testDeadline(idlePromise, "waitForIdle continuation after auto_compaction_end");
 
 		expect(continueSpy).toHaveBeenCalledTimes(1);
 		const runtimeSignals = getRuntimeSignals();
@@ -257,9 +320,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 		});
 
 		const compactPromise = session.compact();
-		await abortEntered.promise;
+		await testDeadline(abortEntered.promise, "abort hook entered");
 		releaseAbort.resolve();
-		await compactPromise;
+		await testDeadline(compactPromise, "compact() settle after abort");
 
 		expect(compactingDuringAbort).toBe(true);
 	});
@@ -303,9 +366,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 			gate.promise;
 
 		const compactPromise = session.compact();
-		while (!getRuntimeSignals().includes("before_compact:enter")) {
-			await Promise.resolve();
-		}
+		await waitForRuntimeSignal("before_compact:enter", "manual compaction parked in hook");
 
 		// A message arrives DURING compaction (post-abort, still disconnected).
 		session.agent.followUp({
@@ -316,8 +377,8 @@ describe("AgentSession auto-compaction queue resume", () => {
 		expect(session.agent.hasQueuedMessages()).toBe(true);
 
 		gate.resolve();
-		await compactPromise;
-		await session.waitForIdle();
+		await testDeadline(compactPromise, "compact() settle after gate release");
+		await testDeadline(session.waitForIdle(), "waitForIdle after stranded-queue drain");
 
 		// compact()'s finally re-drained the stranded queue after reconnecting.
 		expect(continueSpy).toHaveBeenCalledTimes(1);
@@ -364,9 +425,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		});
 
 		const autoPromise = session.runIdleCompaction();
-		while (!getRuntimeSignals().includes("before_compact:enter")) {
-			await Promise.resolve();
-		}
+		await waitForRuntimeSignal("before_compact:enter", "idle auto-compaction parked in hook");
 
 		// Manual /compact startup performs exactly this internal abort while holding
 		// its own freshly installed #compactionAbortController. The auto signal is
@@ -374,9 +433,9 @@ describe("AgentSession auto-compaction queue resume", () => {
 		// the parked pass so it observes the abort and unwinds.
 		const abortPromise = session.abort({ goalReason: "internal", preserveCompaction: true });
 		gate.resolve();
-		await abortPromise;
-		await autoPromise;
-		await autoEnded.promise;
+		await testDeadline(abortPromise, "abort({goalReason}) settle");
+		await testDeadline(autoPromise, "idle auto-compaction settle");
+		await testDeadline(autoEnded.promise, "auto_compaction_end after abort");
 
 		// The in-flight auto pass MUST be cancelled so it cannot race the manual run
 		// and double-rewrite session history.
@@ -437,7 +496,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		});
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 
-		await session.waitForIdle();
+		await testDeadline(session.waitForIdle(), "waitForIdle threshold compaction (yield turn)");
 
 		const runtimeSignals = getRuntimeSignals();
 		expect(runtimeSignals).toContain("compaction:start:threshold");
@@ -517,7 +576,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "message_end", message: trailingEmptyStop });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [yieldMsg, trailingEmptyStop] });
 
-		await session.waitForIdle();
+		await testDeadline(session.waitForIdle(), "waitForIdle threshold (yield + trailing empty stop)");
 
 		const runtimeSignals = getRuntimeSignals();
 		expect(runtimeSignals).toContain("compaction:start:threshold");
@@ -670,7 +729,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "message_end", message: finalAssistant });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [finalAssistant] });
 
-		await session.waitForIdle();
+		await testDeadline(session.waitForIdle(), "waitForIdle threshold (prune savings)");
 
 		const runtimeSignals = getRuntimeSignals();
 		expect(runtimeSignals).toContain("compaction:start:threshold");
@@ -724,7 +783,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 
-		await session.waitForIdle();
+		await testDeadline(session.waitForIdle(), "waitForIdle threshold (unexpected-stop retry)");
 
 		expect(getRuntimeSignals()).toContain("compaction:start:threshold");
 	});
@@ -823,7 +882,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [recoveredOverThreshold] });
 
 		await withTimeout(compactionDone, 1000, "Compaction end timed out");
-		await session.waitForIdle();
+		await testDeadline(session.waitForIdle(), "waitForIdle after retry-then-compaction");
 
 		expect(getRuntimeSignals()).toContain("compaction:start:threshold");
 		expect(session.isRetrying).toBe(false);
@@ -883,7 +942,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "message_end", message: orphanToolUse });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [orphanToolUse] });
 
-		await session.waitForIdle();
+		await testDeadline(session.waitForIdle(), "waitForIdle orphan toolUse cleanup");
 
 		// Empty-stop cleanup short-circuits before any compaction continuation, so
 		// the threshold compaction MUST NOT fire on this turn — the next turn
@@ -951,7 +1010,7 @@ describe("AgentSession auto-compaction queue resume", () => {
 		session.agent.emitExternalEvent({ type: "message_end", message: assistantMsg });
 		session.agent.emitExternalEvent({ type: "agent_end", messages: [assistantMsg] });
 
-		await compactionDone;
+		await testDeadline(compactionDone, "auto_compaction_end (isCompacting capture)");
 
 		expect(capturedIsCompacting).toBe(true);
 	});
@@ -998,6 +1057,6 @@ describe("AgentSession auto-compaction queue resume", () => {
 
 		expect(getRuntimeSignals()).toContain("todo:1/3");
 		expect(continueSpy).toHaveBeenCalledTimes(1);
-		await session.waitForIdle();
+		await testDeadline(session.waitForIdle(), "waitForIdle todo reminder forwarding");
 	});
 });
