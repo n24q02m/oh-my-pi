@@ -49,6 +49,7 @@ import {
 	AdvisorRuntime,
 	type AdvisorRuntimeStatus,
 	type AdvisorSeverity,
+	AdvisorSeverityRateCap,
 	AdvisorTranscriptRecorder,
 	advisorTranscriptFilename,
 	buildAdvisorQuarantineSourceText,
@@ -57,6 +58,7 @@ import {
 	isAdvisorInterruptImmuneTurnActive,
 	isInterruptingSeverity,
 	quarantineAdvisorUnsafeOutput,
+	resolveAdvisorBlockerTurnCap,
 	resolveAdvisorDeliveryChannel,
 	slugifyAdvisorName,
 } from "../advisor";
@@ -153,6 +155,7 @@ interface ActiveAdvisor {
 	runtime: AdvisorRuntime;
 	adviseTool: AdviseTool;
 	emissionGuard: AdvisorEmissionGuard;
+	rateCap: AdvisorSeverityRateCap;
 	recorder: AdvisorTranscriptRecorder;
 	recorderClosed: Promise<void>;
 	agentUnsubscribe?: () => void;
@@ -673,6 +676,7 @@ export class SessionAdvisors {
 			a.runtime.reset("conversation-boundary");
 			a.adviseTool.resetDeliveredNotes();
 			a.emissionGuard.reset();
+			a.rateCap.reset();
 			this.#attachAdvisorRecorderFeed(a);
 		}
 		this.#advisorPrimaryTurnsCompleted = 0;
@@ -822,6 +826,7 @@ export class SessionAdvisors {
 			} = descriptor;
 
 			const emissionGuard = new AdvisorEmissionGuard();
+			const rateCap = new AdvisorSeverityRateCap(resolveAdvisorBlockerTurnCap(config.maxBlockersPerTurn));
 			const adviseTool = new AdviseTool((note, severity) => this.#routeAdvice(advisorRef, note, severity));
 
 			// `#advisorWatchdogPrompt` already carries WATCHDOG.md + YAML shared
@@ -1104,6 +1109,7 @@ export class SessionAdvisors {
 				runtime,
 				adviseTool,
 				emissionGuard,
+				rateCap,
 				recorder,
 				recorderClosed: Promise.resolve(),
 				model: advisorModel,
@@ -1154,7 +1160,9 @@ export class SessionAdvisors {
 	 * steered in directly. A plain nit always rides the non-interrupting YieldQueue
 	 * aside. Suppression by the per-advisor emission guard drops the note silently —
 	 * the model still saw `Recorded.`, so it isn't tempted to rephrase the same note
-	 * past the dedupe.
+	 * past the dedupe. The per-advisor blocker rate cap downgrades blockers past the
+	 * turn's budget to `concern` before channel resolution, so a flood of
+	 * mis-calibrated blockers interrupts the run at most once per turn.
 	 */
 	#hasTerminalTextAnswerWithoutQueuedWork(): boolean {
 		if (this.#host.agent.hasQueuedMessages() || this.#host.hasPendingNextTurnMessages()) return false;
@@ -1169,12 +1177,24 @@ export class SessionAdvisors {
 			logger.debug("advisor advice suppressed by emission guard", { severity, advisor: advisor.name });
 			return;
 		}
+		// Per-advisor per-turn blocker budget: the first blocker of a primary turn
+		// keeps its label and steering semantics; further blockers in the same turn
+		// are downgraded to `concern` (the note still reaches the primary, riding
+		// ordinary channel logic including the immune window, but it can no longer
+		// force a turn trigger at a terminal answer). Non-blockers pass through
+		// without consuming budget.
+		const effectiveSeverity = advisor.rateCap.admit(severity);
+		if (effectiveSeverity !== severity) {
+			logger.debug("advisor blocker downgraded by per-turn severity rate cap", {
+				advisor: advisor.name,
+			});
+		}
 		// The implicit single ("default") advisor stamps no source name, so its
 		// agent-facing `<advisory>` bytes stay identical to the pre-multi-advisor path.
 		const source = advisor.slug ? advisor.name : undefined;
-		const interrupting = isInterruptingSeverity(severity);
+		const interrupting = isInterruptingSeverity(effectiveSeverity);
 		const channel = resolveAdvisorDeliveryChannel({
-			severity,
+			severity: effectiveSeverity,
 			autoResumeSuppressed: this.#advisorAutoResumeSuppressed,
 			preserveOnly: this.#preserveAdvisorAdvice,
 			// Key on the live agent-core loop, not session `isStreaming` (which also
@@ -1186,10 +1206,10 @@ export class SessionAdvisors {
 			interruptImmuneTurnActive: interrupting && this.#isAdvisorInterruptImmuneTurnActive(),
 		});
 		if (channel === "aside") {
-			this.#host.yieldQueue.enqueue("advisor", { note, severity, advisor: source });
+			this.#host.yieldQueue.enqueue("advisor", { note, severity: effectiveSeverity, advisor: source });
 			return;
 		}
-		const notes: AdvisorNote[] = [{ note, severity, advisor: source }];
+		const notes: AdvisorNote[] = [{ note, severity: effectiveSeverity, advisor: source }];
 		const content = formatAdvisorBatchContent(notes);
 		const details = { notes } satisfies AdvisorMessageDetails;
 		if (channel === "preserve") {
@@ -1712,6 +1732,9 @@ export class SessionAdvisors {
 
 	/** Restore normal advisor routing when a kept-alive subagent starts new work. */
 	onPrimaryTurnStart(): void {
+		// Fresh per-turn blocker budget for every live advisor — the rate cap's
+		// turn boundary, fired from the session's `turn_start` handler.
+		for (const advisor of this.#advisors) advisor.rateCap.beginTurn();
 		if (!this.#preserveTerminalYieldAdvice) return;
 		this.#preserveTerminalYieldAdvice = false;
 		this.#preserveAdvisorAdvice = false;
