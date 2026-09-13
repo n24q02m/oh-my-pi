@@ -3484,7 +3484,18 @@ export class AgentSession {
 				}
 			}
 			await this.#applyQueuedBatchAutoThinking();
-			await this.agent.continue(signal);
+			try {
+				await this.agent.continue(signal);
+			} finally {
+				// EF2-R3: the consumed override expires with the logical request.
+				// A retryable failure keeps it armed so the auto-retry of the
+				// SAME request still dispatches at the override; an abort drops
+				// both the armed level and any unconsumed proposal.
+				this.#models.expireRequestOverride({
+					aborted: signal.aborted,
+					retryableFailure: !signal.aborted && (this.#recovery.isRetrying || this.#failedAssistantTail()),
+				});
+			}
 			return { status: "completed" };
 		} catch (error) {
 			logger.warn("agent.continue failed after scheduling", {
@@ -3530,7 +3541,10 @@ export class AgentSession {
 	 * still dispatches.
 	 */
 	async #applyQueuedBatchAutoThinking(): Promise<void> {
-		if (!this.isAutoThinking || !this.settings.get("providers.autoThinkingAdaptive")) return;
+		if (!this.isAutoThinking) return;
+		// Legacy fast path: without a pending/armed override, non-adaptive
+		// sessions dispatch queued batches on the current level unchanged.
+		if (!this.#models.hasRequestOverride && !this.settings.get("providers.autoThinkingAdaptive")) return;
 		const generation = this.#promptGeneration;
 		const model = this.model;
 		if (!model) return;
@@ -3542,6 +3556,11 @@ export class AgentSession {
 		);
 		if (!reservation || !reservationHasUserWork(reservation)) return;
 		const batchText = buildDispatchBatchText(reservation.target.map(ref => ref.message));
+		// EF2-R3: a pending next-request override outranks per-batch
+		// classification; consuming it applies the temporary effort and skips
+		// the classifier for this dispatch.
+		if (this.#models.consumeRequestOverride(batchText) !== undefined) return;
+		if (!this.settings.get("providers.autoThinkingAdaptive")) return;
 		await this.#models.applyAutoThinkingLevel(
 			this.#classifyAutoThinkingInput(batchText, "queued-batch"),
 			generation,
@@ -4833,6 +4852,28 @@ export class AgentSession {
 		return this.#models.autoResolvedThinkingLevel;
 	}
 
+	/**
+	 * EF2-R3: first-party proposal from the `thinking_effort` tool for the NEXT
+	 * main logical request's thinking effort. Gated to opt-in adaptive mode
+	 * with auto thinking active; never disables auto, never touches the
+	 * response currently being generated, and expires after one dispatch.
+	 */
+	proposeThinkingEffort(requested: string): { accepted: boolean; effort?: string; reason?: string } {
+		const result = this.#models.proposeRequestOverride(requested, this.#promptGeneration);
+		return result.accepted ? { accepted: true, effort: result.effort } : { accepted: false, reason: result.reason };
+	}
+
+	/**
+	 * True when the active context ends in a failed/aborted assistant turn —
+	 * the shape turn-recovery auto-retries. Used by the EF2-R3 override settle
+	 * to keep a consumed override armed across the retry of the SAME logical
+	 * request instead of restoring the baseline between attempts.
+	 */
+	#failedAssistantTail(): boolean {
+		const tail = this.agent.state.messages.at(-1);
+		return tail?.role === "assistant" && (tail.stopReason === "error" || tail.stopReason === "aborted");
+	}
+
 	/** Live per-family service tiers (OpenAI / Anthropic / Google). */
 	get serviceTierByFamily(): ServiceTierByFamily {
 		return this.#models.serviceTierByFamily;
@@ -6057,6 +6098,9 @@ export class AgentSession {
 		this.#beginInFlight();
 		const generation = this.#promptGeneration;
 		this.#promptSequence++;
+		// EF2-R3: settle flags for the temporary next-request override, captured
+		// after the run resolves and applied in the finally below.
+		const overrideSettle: { aborted?: boolean; retryableFailure?: boolean } = {};
 		try {
 			this.#resetPromptMaintenanceState();
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
@@ -6226,10 +6270,15 @@ export class AgentSession {
 			// back to a concrete level inside the helper.
 			const isUserTurn = message.role === "user" || (message.role === "custom" && isUserInvokedSkillPrompt(message));
 			if (this.isAutoThinking && isUserTurn) {
-				await this.#models.applyAutoThinkingLevel(
-					this.#classifyAutoThinkingInput(expandedText, "new-prompt"),
-					generation,
-				);
+				// EF2-R3: a pending next-request override outranks per-turn
+				// classification; consuming it applies the temporary effort and
+				// skips the classifier for this dispatch.
+				if (this.#models.consumeRequestOverride(expandedText) === undefined) {
+					await this.#models.applyAutoThinkingLevel(
+						this.#classifyAutoThinkingInput(expandedText, "new-prompt"),
+						generation,
+					);
+				}
 				if (this.#promptGeneration !== generation) {
 					return false;
 				}
@@ -6273,6 +6322,8 @@ export class AgentSession {
 			}
 			try {
 				await this.#recovery.promptAgentWithIdleRetry(messages, agentPromptOptions);
+				overrideSettle.aborted = this.#promptGeneration !== generation;
+				overrideSettle.retryableFailure = !overrideSettle.aborted && this.#failedAssistantTail();
 			} finally {
 				this.#stats.setPendingSnapshot(undefined);
 			}
@@ -6283,6 +6334,7 @@ export class AgentSession {
 		} finally {
 			// The per-turn before_agent_start override lives only for this turn.
 			this.#tools.clearTurnSystemPromptOverride();
+			this.#models.expireRequestOverride(overrideSettle);
 			this.#usagePreflightReadyForNextModelCall = false;
 			this.#endInFlight();
 		}
