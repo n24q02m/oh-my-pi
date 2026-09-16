@@ -1,0 +1,46 @@
+name: Fork oauth-callback
+
+on:
+  push:
+    branches: [ci/zai-oauth-redirect-override]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  oauth_callback_contract:
+    name: OAuth callback listener contract
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install bun when missing
+        shell: bash
+        run: |
+          if ! command -v bun >/dev/null 2>&1; then
+            export BUN_INSTALL="${HOME}/.bun"
+            curl -fsSL https://bun.sh/install | bash
+            echo "${BUN_INSTALL}/bin" >> "$GITHUB_PATH"
+          else
+            echo "bun present: $(bun --version)"
+          fi
+      - name: Install dependencies
+        shell: bash
+        run: |
+          if bun install --frozen-lockfile; then
+            exit 0
+          fi
+          echo "::warning title=bun install retry::install failed; retrying with a clean job-local cache"
+          retry_cache="$(mktemp -d "${RUNNER_TEMP:-/tmp}/bun-cache-retry.XXXXXX")"
+          bun install --frozen-lockfile --cache-dir="$retry_cache"
+      - uses: dtolnay/rust-toolchain@nightly
+      - name: Build native addon
+        run: bun --cwd=packages/natives run build
+      - name: Run OAuth callback tests
+        env:
+          PI_TEST_RUNTIME: "1"
+          BUN_JSC_useConcurrentGC: "0"
+          BUN_JSC_numberOfGCMarkers: "1"
+        run: |
+          bun test packages/ai/test/callback-server-port-fallback.test.ts packages/ai/test/callback-server-dual-stack.test.ts packages/ai/test/callback-server-security.test.ts packages/ai/test/callback-server-launch-route.test.ts packages/ai/test/callback-server-manual-input.test.ts packages/ai/test/anthropic-oauth.test.ts packages/ai/test/zai-oauth.test.ts packages/coding-agent/test/oauth-manual-input.test.ts packages/ai/test/oauth-zai-redirect-override.test.ts
