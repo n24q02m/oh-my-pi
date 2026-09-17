@@ -10,12 +10,14 @@ import {
 	type ToolResultMessage,
 	type Usage,
 } from "@oh-my-pi/pi-ai";
+import { classifyModel } from "@oh-my-pi/pi-catalog/compat/taxonomy";
 import { getSessionsDir, isEnoent, readLines } from "@oh-my-pi/pi-utils";
 import type {
 	AgentType,
-	MessageStats,
+	MessageStatsInput,
 	SessionEntry,
 	SessionMessageEntry,
+	SessionModelUsageEntry,
 	SessionServiceTierChangeEntry,
 	ToolCallStats,
 	ToolResultLink,
@@ -52,7 +54,7 @@ export function classifyAgentType(sessionPath: string): AgentType {
  * Session files are named like: --work--pi--/timestamp_uuid.jsonl
  * The folder part uses -- as path separator.
  */
-function extractFolderFromPath(sessionPath: string): string {
+export function extractFolderFromPath(sessionPath: string): string {
 	const sessionsDir = getSessionsDir();
 	const rel = path.relative(sessionsDir, sessionPath);
 	const projectDir = rel.split(path.sep)[0];
@@ -71,6 +73,12 @@ function isAssistantMessage(entry: SessionEntry): entry is SessionMessageEntry {
 	// constraint, so skip them at the parser boundary.
 	if (typeof msgEntry.id !== "string" || msgEntry.id.length === 0) return false;
 	return msgEntry.message?.role === "assistant";
+}
+
+function isModelUsage(entry: SessionEntry): entry is SessionModelUsageEntry {
+	if (entry.type !== "model_usage") return false;
+	const usageEntry = entry as SessionModelUsageEntry;
+	return typeof usageEntry.id === "string" && usageEntry.id.length > 0;
 }
 
 /**
@@ -143,6 +151,61 @@ function extractUserStats(sessionFile: string, folder: string, entry: SessionMes
 }
 
 /**
+ * Session JSONL is written by older versions and foreign producers, so a token
+ * counter is whatever was persisted, not what `Usage` declares. A non-numeric
+ * bucket (`input: "10"`) must never be parsed and must never be summed: `+`
+ * would concatenate it into the derived total and SQLite would coerce the
+ * resulting string to a different, far larger number. A non-finite one
+ * (`input: 1e999` is legal JSON) must not reach a NOT NULL column either.
+ * Malformed input counts as absent.
+ */
+function isFiniteCount(value: unknown): value is number {
+	return typeof value === "number" && Number.isFinite(value);
+}
+
+function finiteTokenCount(value: unknown): number {
+	return isFiniteCount(value) ? value : 0;
+}
+
+/**
+ * Token-bucket view for total derivation. Persisted session payloads are
+ * outside-controlled (old versions, foreign producers), so every counter is
+ * `unknown` and validated at read time.
+ */
+export interface UsageBucketView {
+	totalTokens?: unknown;
+	input?: unknown;
+	output?: unknown;
+	cacheRead?: unknown;
+	cacheWrite?: unknown;
+	orchestration?: { input?: unknown; output?: unknown; cacheRead?: unknown } | null;
+}
+
+/**
+ * Total tokens for one usage payload, per the documented contract: the
+ * conversation buckets plus provider-reported orchestration tokens. A present
+ * finite provider total stays authoritative; a missing or malformed one
+ * (absent, string, NaN) is derived from the buckets, which would otherwise
+ * persist a zero total next to real token counts. Shared by ingest and the
+ * trace builder so stored and displayed totals cannot disagree.
+ */
+export function resolveUsageTotal(usage: UsageBucketView | null | undefined): number {
+	if (typeof usage?.totalTokens === "number" && Number.isFinite(usage.totalTokens)) return usage.totalTokens;
+	if (!usage || typeof usage !== "object") return 0;
+	const orchestration =
+		usage.orchestration && typeof usage.orchestration === "object" ? usage.orchestration : undefined;
+	return (
+		finiteTokenCount(usage.input) +
+		finiteTokenCount(usage.output) +
+		finiteTokenCount(usage.cacheRead) +
+		finiteTokenCount(usage.cacheWrite) +
+		finiteTokenCount(orchestration?.input) +
+		finiteTokenCount(orchestration?.output) +
+		finiteTokenCount(orchestration?.cacheRead)
+	);
+}
+
+/**
  * Extract stats from an assistant message entry.
  *
  * Session JSONL on disk is not guaranteed to match the current
@@ -159,7 +222,7 @@ function extractStats(
 	entry: SessionMessageEntry,
 	currentServiceTier: ServiceTierByFamily | undefined,
 	agentType: AgentType,
-): MessageStats | null {
+): MessageStatsInput | null {
 	const msg = entry.message as AssistantMessage;
 	if (msg?.role !== "assistant") return null;
 	if (typeof msg.model !== "string" || typeof msg.provider !== "string" || typeof msg.api !== "string") return null;
@@ -173,26 +236,35 @@ function extractStats(
 	// non-zero value already in `usage.premiumRequests` (Copilot multipliers or
 	// the new AI code path) and only synthesise when the field is missing/zero.
 	const recorded = rawUsage.premiumRequests ?? 0;
-	const model = { provider: msg.provider, api: msg.api, id: msg.model };
+	const model = {
+		provider: msg.provider,
+		api: msg.api,
+		identity: classifyModel(msg.provider, msg.model, { lenient: true }),
+	};
 	const tier = resolveModelServiceTier(currentServiceTier, model);
 	const derived = recorded > 0 ? recorded : getPriorityPremiumRequests(tier, model);
 	const wellFormed =
-		typeof rawUsage.input === "number" &&
-		typeof rawUsage.output === "number" &&
-		typeof rawUsage.cacheRead === "number" &&
-		typeof rawUsage.cacheWrite === "number" &&
-		typeof rawUsage.totalTokens === "number";
-	const usage: Usage =
+		isFiniteCount(rawUsage.input) &&
+		isFiniteCount(rawUsage.output) &&
+		isFiniteCount(rawUsage.cacheRead) &&
+		isFiniteCount(rawUsage.cacheWrite) &&
+		isFiniteCount(rawUsage.totalTokens);
+	const usage: MessageStatsInput["usage"] =
 		wellFormed && derived === recorded
 			? (rawUsage as Usage)
 			: {
 					...rawUsage,
-					input: rawUsage.input ?? 0,
-					output: rawUsage.output ?? 0,
-					cacheRead: rawUsage.cacheRead ?? 0,
-					cacheWrite: rawUsage.cacheWrite ?? 0,
-					totalTokens: rawUsage.totalTokens ?? 0,
-					cost: rawUsage.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+					input: finiteTokenCount(rawUsage.input),
+					output: finiteTokenCount(rawUsage.output),
+					cacheRead: finiteTokenCount(rawUsage.cacheRead),
+					cacheWrite: finiteTokenCount(rawUsage.cacheWrite),
+					// A present finite provider total stays authoritative; a missing
+					// or malformed one (absent, string, NaN) is derived from the buckets.
+					totalTokens: resolveUsageTotal(rawUsage),
+					// An omitted `cost` must stay omitted: `resolveStoredCost` reads
+					// absence as "no recorded price" and estimates the request, while
+					// a zero would read as an explicitly free request.
+					cost: rawUsage.cost,
 					premiumRequests: derived,
 				};
 
@@ -215,9 +287,43 @@ function extractStats(
 	};
 }
 
+function extractModelUsageStats(
+	sessionFile: string,
+	folder: string,
+	entry: SessionModelUsageEntry,
+	agentType: AgentType,
+): MessageStatsInput | null {
+	const timestamp = Date.parse(entry.timestamp);
+	return extractStats(
+		sessionFile,
+		folder,
+		{
+			type: "message",
+			id: entry.id,
+			parentId: entry.parentId,
+			timestamp: entry.timestamp,
+			message: {
+				role: "assistant",
+				content: [],
+				api: entry.api,
+				provider: entry.provider,
+				model: entry.model,
+				usage: entry.usage,
+				stopReason: entry.stopReason ?? "stop",
+				errorMessage: entry.errorMessage,
+				timestamp: Number.isFinite(timestamp) ? timestamp : 0,
+			},
+		},
+		undefined,
+		agentType,
+	);
+}
+
 /** Message timestamp, falling back to the entry's ISO timestamp, then 0. */
 function coerceEntryTimestamp(timestamp: number | undefined, entry: SessionMessageEntry): number {
-	if (typeof timestamp === "number" && Number.isFinite(timestamp)) return timestamp;
+	// A stored zero is the "no timestamp" sentinel, not 1970: fall through to
+	// the entry envelope so a recoverable ISO time still selects its tariff.
+	if (typeof timestamp === "number" && Number.isFinite(timestamp) && timestamp > 0) return timestamp;
 	const ts = Date.parse(entry.timestamp);
 	return Number.isFinite(ts) ? ts : 0;
 }
@@ -336,6 +442,10 @@ function parseSessionEntriesLenient(bytes: Uint8Array): { entries: SessionEntry[
 	const read = visitSessionEntriesLenient(bytes, entry => entries.push(entry));
 	return { entries, read };
 }
+/** Parse every well-formed entry in a transcript buffer (malformed lines skipped). */
+export function parseAllSessionEntries(bytes: Uint8Array): SessionEntry[] {
+	return parseSessionEntriesLenient(bytes).entries;
+}
 
 function scanLastServiceTier(bytes: Uint8Array): ServiceTierByFamily | undefined {
 	let currentServiceTier: ServiceTierByFamily | undefined;
@@ -361,7 +471,7 @@ function scanLastServiceTier(bytes: Uint8Array): ServiceTierByFamily | undefined
  * entries, preserving offset-based memory behavior for large sessions.
  */
 export interface ParseSessionResult {
-	stats: MessageStats[];
+	stats: MessageStatsInput[];
 	userStats: UserMessageStats[];
 	userLinks: UserMessageLink[];
 	toolCalls: ToolCallStats[];
@@ -380,7 +490,7 @@ export async function parseSessionFile(sessionPath: string, fromOffset = 0): Pro
 
 	const folder = extractFolderFromPath(sessionPath);
 	const agentType = classifyAgentType(sessionPath);
-	const stats: MessageStats[] = [];
+	const stats: MessageStatsInput[] = [];
 	const userStats: UserMessageStats[] = [];
 	const userLinks: UserMessageLink[] = [];
 	const toolCalls: ToolCallStats[] = [];
@@ -409,6 +519,11 @@ export async function parseSessionFile(sessionPath: string, fromOffset = 0): Pro
 		if (isToolResultMessage(entry)) {
 			const link = extractToolResultLink(sessionPath, entry);
 			if (link) toolResults.push(link);
+			continue;
+		}
+		if (isModelUsage(entry)) {
+			const modelUsageStats = extractModelUsageStats(sessionPath, folder, entry, agentType);
+			if (modelUsageStats) stats.push(modelUsageStats);
 			continue;
 		}
 		if (isAssistantMessage(entry)) {

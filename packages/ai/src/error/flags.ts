@@ -156,8 +156,15 @@ const TIMEOUT_PATTERN = /\b(?:operation\s+)?timed?\s*out\b|\btimeout\b|\bstream 
 const TRANSIENT_ENVELOPE_PATTERN = /anthropic stream envelope error:/i;
 const TRANSIENT_ENVELOPE_TRUNCATION_PATTERN = /before message_(?:start|stop)/i;
 export const STREAM_READ_ERROR_PATTERN = /stream[_ -]?read[_ -]?error/i;
+/** Python h2/httpx diagnostics forwarded through provider or proxy error events. */
+export const PYTHON_HTTP2_STREAM_RESET_PATTERN = /<StreamReset stream_id:\d+, error_code:(?:2|7), remote_reset:True>/;
+/** Python h11/httpx EOF while reading an HTTP/1.1 chunked response body. */
+export const PYTHON_HTTP_INCOMPLETE_CHUNK_PATTERN =
+	/peer closed connection without sending complete message body \(incomplete chunked read\)/;
+/** reqwest body-frame failures forwarded by the Codex HTTP proxy. */
+export const CODEX_HTTP_BODY_READ_ERROR_PATTERN = /\btransport error reading codex response body\b/i;
 export const TRANSIENT_TRANSPORT_PATTERN =
-	/\b(?:no[_ -]?capacity|(?:high|peak)[ _-]?demand|(?:at|over|insufficient)[ _-]?capacity|capacity[ _-]?(?:exceeded|exhausted)|peak[ _-]?load)\b|overloaded|provider.?returned.?error|rate.?limit|too many requests|\b(?:429|500|502|503|504)\b|service.?unavailable|server.?error|internal.?error|retry your request|network.?error|connection.?error|connection.?refused|unable.?to.?connect\.\s*is the computer able to access the url\?|other side closed|fetch failed|upstream.?connect|upstream.?request.?failed|reset before headers|socket hang up|timed? out|timeout|terminated|retry delay|stream stall|no error details in response|HTTP2(?:StreamReset|RefusedStream|EnhanceYourCalm)|nghttp2_(?:internal_error|refused_stream)|stream closed with error code nghttp2_(?:internal_error|refused_stream)|malformed.?function.?call/i;
+	/\b(?:no[_ -]?capacity|(?:high|peak)[ _-]?demand|(?:at|over|insufficient)[ _-]?capacity|capacity[ _-]?(?:exceeded|exhausted)|peak[ _-]?load)\b|overloaded|provider.?returned.?error|rate.?limit|too many requests|auth-gateway\s+5\d{2}(?=[:\s]|$)|\b(?:429|500|502|503|504)\b|service.?unavailable|server.?error|internal.?error|retry your request|network.?error|connection.?error|connection.?refused|unable.?to.?connect\.\s*is the computer able to access the url\?|other side closed|fetch failed|upstream.?connect|upstream.?request.?failed|reset before headers|socket hang up|timed? out|timeout|terminated|retry delay|stream stall|no error details in response|HTTP2(?:StreamReset|RefusedStream|EnhanceYourCalm)|nghttp2_(?:internal_error|refused_stream)|stream closed with error code nghttp2_(?:internal_error|refused_stream)|malformed.?function.?call/i;
 const AUTH_FAILURE_PATTERN =
 	/\b(?:401|403|unauthorized|forbidden|authentication|auth[_ ]?unavailable|no auth available|(?:invalid|no)[_ ]?api[_ ]?key)\b/i;
 const MALFORMED_FUNCTION_CALL_PATTERN = /\bmalformed.?function.?call\b/i;
@@ -212,15 +219,6 @@ const STALE_RESPONSE_ITEM_DETAIL_PATTERN = /not[ _]?found|invalid|expired|stale|
 export const LLAMA_CPP_TOOL_CALL_PARSE_PATTERN =
 	/failed to parse tool call arguments as json|\[json\.exception\.parse_error\.101\]/i;
 
-// Copilot fleet skew: HTTP 400 `model_not_supported` can reject a model that
-// `/models` advertised on the same host when the request lands on a stale
-// replica. `model_not_available_for_integrator` is deliberately excluded:
-// GitHub also uses it for stable per-integrator entitlement denials and includes
-// that integrator's actionable `Available models` list in the response.
-const COPILOT_TRANSIENT_MODEL_CODES: Record<string, true> = {
-	model_not_supported: true,
-};
-const COPILOT_TRANSIENT_MODEL_PATTERN = /model_not_supported/i;
 // Fireworks (and other OpenAI-compat backends) can abort mid-generation with an
 // HTTP 400 `invalid_request_error` whose body reports a model-side numerical
 // fault: "Floating point NaN (not-a-number) is detected in generation". Despite
@@ -405,6 +403,8 @@ function isTransientErrorText(text: string): boolean {
 	return (
 		isUnexpectedSocketCloseMessage(text) ||
 		isStreamReadErrorText(text) ||
+		PYTHON_HTTP2_STREAM_RESET_PATTERN.test(text) ||
+		PYTHON_HTTP_INCOMPLETE_CHUNK_PATTERN.test(text) ||
 		(TRANSIENT_ENVELOPE_PATTERN.test(text) && TRANSIENT_ENVELOPE_TRUNCATION_PATTERN.test(text)) ||
 		TRANSIENT_TRANSPORT_PATTERN.test(text)
 	);
@@ -439,6 +439,17 @@ function isContentBlockedText(text: string): boolean {
 
 function matchesOverflowText(text: string): boolean {
 	return OVERFLOW_PATTERNS.some(p => p.test(text)) || OVERFLOW_NO_BODY_PATTERN.test(text);
+}
+
+/**
+ * A 4xx the provider rejected as a deterministic client error — every 4xx
+ * except 408 (Request Timeout) and 429 (Too Many Requests), the retryable
+ * pair. Mirrors the 4xx policy in {@link isProviderRetryableError}: such a
+ * request replays identically, so a transient signal riding on it (e.g. a
+ * truncation phrase in the body) must not flip it to retryable.
+ */
+function isTerminalClientErrorStatus(status: number | undefined): boolean {
+	return status !== undefined && status >= 400 && status < 500 && status !== 408 && status !== 429;
 }
 
 function classifyText(
@@ -492,6 +503,24 @@ function classifyText(
 		}
 		if (isTimeoutText(errorMessage)) kinds |= Flag.Transient | Flag.Timeout;
 		else if (isTransientErrorText(errorMessage)) kinds |= Flag.Transient;
+		// A stream truncation or forwarded Codex HTTP body-read failure may not
+		// match TRANSIENT_TRANSPORT_PATTERN. Flag it explicitly so AIError.retriable and
+		// the turn-recovery layer treat it as retryable, matching the provider
+		// retry path (isProviderRetryableError). Separate `if` (not chained onto
+		// the else-if) so a timeout whose text also reads as a truncation keeps
+		// Flag.Timeout alongside Flag.Transient. The string arm applies the strict
+		// STREAM_PARSE_DIAGNOSTIC_PATTERN, per the rationale on isTransientStreamParseError.
+		// Skip a truncation phrase that rides on a terminal 4xx (e.g. a malformed
+		// request rejected as "400 unexpected EOF"): that is a deterministic client
+		// error that replays identically, so keep it terminal. classify() carries
+		// the outer terminal status down the cause chain so a wrapped truncation
+		// (ProviderHttpError 400 → cause "unexpected EOF") is caught here too.
+		if (
+			!isTerminalClientErrorStatus(statusClean) &&
+			(isTransientStreamParseError(errorMessage) || CODEX_HTTP_BODY_READ_ERROR_PATTERN.test(errorMessage))
+		) {
+			kinds |= Flag.Transient;
+		}
 		// A concurrency cap (e.g. Vertex "Online prediction concurrent requests
 		// quota exceeded") is transient — shed-and-backoff. The bare wording need
 		// not match TRANSIENT_TRANSPORT_PATTERN, so flag it explicitly to keep
@@ -501,8 +530,6 @@ function classifyText(
 			kinds |= Flag.StaleResponsesItem;
 		}
 
-		// Copilot's `model_not_supported` fleet-skew rejection is transient.
-		if (statusClean === 400 && COPILOT_TRANSIENT_MODEL_PATTERN.test(cleanMessage)) kinds |= Flag.Transient;
 		// Fireworks mid-generation NaN 400 is a model-side decode fault, not a bad
 		// request; a byte-identical replay succeeds, so treat it as transient.
 		if (statusClean === 400 && GENERATION_NAN_PATTERN.test(cleanMessage)) kinds |= Flag.Transient;
@@ -532,6 +559,11 @@ export function classify(error: unknown, api?: Api): number {
 	const seen = new Set<object>();
 	const causeTokenEvidence = hasCauseTokenContextOverflowEvidence(error);
 	let link: unknown = error;
+	// A terminal 4xx on an outer link governs its own cause diagnostics: a
+	// wrapped truncation is describing why the deterministic request failed,
+	// not an independently retryable transport fault. Carry it down so the
+	// stream-parse guard in classifyText sees it on the status-less cause.
+	let governingTerminalStatus: number | undefined;
 	while (link !== undefined && link !== null) {
 		if (typeof link === "object") {
 			if (seen.has(link)) break;
@@ -606,8 +638,10 @@ export function classify(error: unknown, api?: Api): number {
 			linkMessage = (link as { message: string }).message;
 		}
 
-		const textId = classifyText(linkMessage, status(link), causeTokenEvidence, api);
+		const linkStatus = status(link);
+		const textId = classifyText(linkMessage, linkStatus ?? governingTerminalStatus, causeTokenEvidence, api);
 		kinds |= textId & KIND_MASK;
+		if (isTerminalClientErrorStatus(linkStatus)) governingTerminalStatus = linkStatus;
 
 		link = typeof link === "object" && "cause" in link ? (link as { cause: unknown }).cause : undefined;
 	}
@@ -693,24 +727,6 @@ export function isFastModeUnsupported(error: unknown): boolean {
 	return is(classify(error), Flag.FastModeUnsupported);
 }
 
-/**
- * Depth-bounded search for a provider error `code`. SDK error objects keep the
- * parsed response body on `.error`, and Copilot's body is itself
- * `{ error: { code } }`, so the code sits up to two envelopes below the thrown
- * error depending on which SDK produced it.
- */
-function providerErrorCode(error: object): string | undefined {
-	let node: object = error;
-	for (let depth = 0; depth < 3; depth++) {
-		if ("code" in node && typeof node.code === "string") return node.code;
-		if (!("error" in node)) return undefined;
-		const nested: unknown = node.error;
-		if (!nested || typeof nested !== "object") return undefined;
-		node = nested;
-	}
-	return undefined;
-}
-
 const CLINE_PASS_SURFACE_GATE_PATTERN = /only available via cline product surfaces/i;
 
 /**
@@ -723,20 +739,24 @@ export function isClinePassSurfaceGateMessage(errorMessage: string | undefined):
 	return errorMessage !== undefined && CLINE_PASS_SURFACE_GATE_PATTERN.test(errorMessage);
 }
 
+const GITHUB_COPILOT_POLICY_DENIAL_PATTERN = /GitHub Copilot access denied \(HTTP 403\)/;
+
 /**
- * GitHub Copilot 400 `model_not_supported` response for a model advertised by
- * `/models` — transient fleet skew, not a malformed request. Reads the
- * structural `code` through the SDK/body envelopes, then falls back to the
- * stringified body both SDK families put in `message`.
+ * GitHub Copilot 403s are plan/model-policy/org denials against a valid token —
+ * never a revoked credential (those arrive as 401). Wiping stored credentials
+ * on them hides the whole provider from `/model` and forces a pointless
+ * re-login, so credential-lifetime decisions must exempt them even though
+ * they still classify as `Flag.AuthFailed` (issue #11275). Mirrors the 403
+ * contract in `rewriteCopilotError` (`utils/http-inspector.ts`).
  */
-export function isCopilotTransientModelError(error: unknown): boolean {
-	if (!error || typeof error !== "object" || status(error) !== 400) return false;
-	const code = providerErrorCode(error);
-	// `Object.hasOwn`, not a bare index: `code` is provider-controlled, and a
-	// prototype key (`__proto__`, `toString`, …) would otherwise read truthy.
-	if (code !== undefined && Object.hasOwn(COPILOT_TRANSIENT_MODEL_CODES, code)) return true;
-	const message: unknown = "message" in error ? error.message : undefined;
-	return typeof message === "string" && COPILOT_TRANSIENT_MODEL_PATTERN.test(message);
+export function isGitHubCopilotPolicyDenial(
+	provider: string | undefined,
+	status: number | undefined,
+	errorMessage: string | undefined,
+): boolean {
+	if (provider !== "github-copilot") return false;
+	if (status === 403) return true;
+	return errorMessage !== undefined && GITHUB_COPILOT_POLICY_DENIAL_PATTERN.test(errorMessage);
 }
 
 export function classifyMessage(message: {

@@ -2,6 +2,33 @@
 
 ## [Unreleased]
 
+## [18.1.17] - 2026-09-10
+
+### Fixed
+
+- Fixed historical cost estimates after a scheduled price change: usage is estimated at the request's own time, and charges recorded at the time are preserved.
+- Fixed legacy requests that recorded no cost at all being stored as free usage: they are estimated at their request timestamp, and requests without a recoverable timestamp stay unpriced instead of being billed as 1970.
+- Fixed a legacy entry whose malformed token counter was summed into an inflated request total; counters that are not finite numbers now count as absent.
+- Fixed requests whose timestamp could not be recovered being reported as free usage: they now count as unpriced (`N/A`) rather than `$0`, in both the aggregates and the per-request list, and an existing database re-parses its sessions once so rows stored before this change are repaired.
+- Fixed the trace summary showing `$0` instead of `N/A` for legacy scheduled requests that omit their token total: the total is derived from the token buckets before classifying unpriced usage.
+
+## [18.1.3] - 2026-09-02
+
+### Changed
+
+- Provider, tool, and project `<select>` dropdowns are now styled to match the dashboard design, with dark and light theme support.
+
+## [18.1.0] - 2026-09-01
+
+### Added
+
+- Added API for daily activity tracking, including cost, requests, and token usage aggregates
+- Added a Traces dashboard for detailed session analysis, including an interactive timeline, searchable and filterable transcripts, token and cost summaries, and aggregate tool-usage and timing insights.
+
+### Fixed
+
+- Fixed `omp stats` omitting usage from online auto-thinking classifier calls.
+
 ## [18.0.9] - 2026-08-28
 
 ### Fixed

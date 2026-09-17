@@ -1553,6 +1553,12 @@ providers:
 		expect(ProviderDiscoverySchema.allows({ type: "llama.cpp", timeoutMs: Number.NaN })).toBe(false);
 		expect(ProviderDiscoverySchema.allows({ type: "llama.cpp", timeoutMs: "30000" as any })).toBe(false);
 	});
+	test("ProviderDiscoverySchema restricts injectV1 to openai-models-list", () => {
+		expect(ProviderDiscoverySchema.allows({ type: "openai-models-list", injectV1: false })).toBe(true);
+		expect(ProviderDiscoverySchema.allows({ type: "openai-models-list", injectV1: true })).toBe(true);
+		expect(ProviderDiscoverySchema.allows({ type: "lm-studio", injectV1: false })).toBe(false);
+		expect(ProviderDiscoverySchema.allows({ type: "proxy", injectV1: false })).toBe(false);
+	});
 	test("llama.cpp discovery marks per-model architecture image modalities as vision-capable", async () => {
 		const fetchMock: FetchImpl = async input => {
 			const url = String(input);
@@ -2400,6 +2406,65 @@ providers:
 		expect(registry.find("openai-test", "medium")?.input).toEqual(["text"]);
 	});
 
+	test("openai-models-list with injectV1: false hits {baseUrl}/models verbatim", async () => {
+		// Gateways like opper.ai root their OpenAI-compatible surface at a
+		// versioned path (`https://api.opper.ai/v3/compat`); the default
+		// normalizer would force `/v1/models` onto that root and land on a
+		// different (much smaller) model list than chat uses.
+		writeRawModelsJson({
+			"opper-test": {
+				baseUrl: "https://api.opper.ai/v3/compat",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "openai-models-list", injectV1: false },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "https://api.opper.ai/v3/compat/models") {
+				return new Response(JSON.stringify({ data: [{ id: "opper-full-a" }, { id: "opper-full-b" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		// Discovered models carry the configured URL as their chat base —
+		// discovery and chat share the same endpoint root.
+		expect(registry.find("opper-test", "opper-full-a")?.baseUrl).toBe("https://api.opper.ai/v3/compat");
+		expect(registry.find("opper-test", "opper-full-b")?.baseUrl).toBe("https://api.opper.ai/v3/compat");
+	});
+
+	test("openai-models-list with injectV1: false strips query strings from the base URL", async () => {
+		// Chat builds the inference URL by appending `/chat/completions` to the
+		// base string, so a query in `baseUrl` would corrupt it
+		// (`?token=x/chat/completions`). The bare normalizer drops queries and
+		// hashes, matching the default mode's normalizer.
+		writeRawModelsJson({
+			"opper-test": {
+				baseUrl: "https://api.opper.ai/v3/compat?token=gateway",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "openai-models-list", injectV1: false },
+			},
+		});
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "https://api.opper.ai/v3/compat/models") {
+				return new Response(JSON.stringify({ data: [{ id: "opper-full-a" }] }), {
+					status: 200,
+					headers: { "Content-Type": "application/json" },
+				});
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+		expect(registry.find("opper-test", "opper-full-a")?.baseUrl).toBe("https://api.opper.ai/v3/compat");
+	});
+
 	test("lm-studio discovery keeps native VLM modalities over a thin OpenAI row", async () => {
 		writeRawModelsJson({
 			"lm-studio-test": {
@@ -2574,6 +2639,41 @@ providers:
 		expect(model?.input).toEqual(["text", "image"]);
 		expect(model?.reasoning).toBe(true);
 		expect(model?.api).toBe("openai-responses");
+	});
+
+	test("litellm discovery falls back to /v1/models when the rich phase times out (#10964)", async () => {
+		writeRawModelsJson({
+			"litellm-test": {
+				baseUrl: "http://127.0.0.1:4013/v1",
+				api: "openai-completions",
+				auth: "none",
+				discovery: { type: "litellm", timeoutMs: 50 },
+			},
+		});
+		const { promise: richHang } = Promise.withResolvers<Response>(); // never resolves
+		const richEndpoints = ["/model_group/info", "/v2/model/info", "/model/info", "/v1/model/info"];
+		let v1ModelsHits = 0;
+		const fetchMock: FetchImpl = async input => {
+			const url = String(input);
+			if (url === "http://127.0.0.1:4013/v1/models") {
+				v1ModelsHits++;
+				return Response.json({
+					object: "list",
+					data: [{ id: "vendor-7/model-7", object: "model", owned_by: "mockvendor" }],
+				});
+			}
+			// Rich metadata endpoints stall past the discovery budget; anything else
+			// (unrelated implicit probes) fails fast so it cannot hang the suite.
+			if (richEndpoints.some(endpoint => url === `http://127.0.0.1:4013${endpoint}`)) {
+				return richHang;
+			}
+			throw new Error(`Unexpected URL: ${url}`);
+		};
+		const registry = new ModelRegistry(authStorage, modelsJsonPath, { fetch: fetchMock });
+		await registry.refresh();
+
+		expect(v1ModelsHits).toBeGreaterThan(0);
+		expect(registry.find("litellm-test", "vendor-7/model-7")?.baseUrl).toBe("http://127.0.0.1:4013/v1");
 	});
 
 	test("litellm discovery enriches configured proxy models with bundled references", async () => {

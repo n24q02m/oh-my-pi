@@ -2,6 +2,23 @@
 
 ## [Unreleased]
 
+## [18.1.18] - 2026-09-11
+
+### Fixed
+
+- A snapcompact pass now also strips a superseded Anthropic server-compaction payload (`preserveData.anthropicCompaction`) alongside the OpenAI replacement history, so a stale native summary can never replay ahead of the archived frames.
+
+## [18.1.0] - 2026-09-01
+
+### Added
+
+- Added a declarative compatibility rules system for consistent model identification, capabilities, policies, and provider-specific behavior across model classes, families, and revisions.
+- Added the compat-compiler CLI for managing model identity and capability rules through KDL configuration files.
+
+### Changed
+
+- Standardized model revision handling and compatibility resolution across model discovery and runtime behavior.
+
 ## [17.4.1] - 2026-08-21
 
 ### Added

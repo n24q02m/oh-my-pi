@@ -1,7 +1,6 @@
 import { toClinePassWireModelId } from "@oh-my-pi/pi-catalog/cline-pass-model-id";
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { toFirepassWireModelId, toFireworksWireModelId } from "@oh-my-pi/pi-catalog/fireworks-model-id";
-import { isGlm52ReasoningEffortModelId, isKimiK3ModelId } from "@oh-my-pi/pi-catalog/identity";
 import { getSupportedEfforts } from "@oh-my-pi/pi-catalog/model-thinking";
 import { calculateCost } from "@oh-my-pi/pi-catalog/models";
 import type {
@@ -60,6 +59,7 @@ import {
 	type ToolResultMessage,
 	type Usage,
 } from "../types";
+import { resolveCopilotRequestIdentity } from "./github-copilot-headers";
 
 export type { OpenAIPromptCacheOptions } from "../types";
 
@@ -92,6 +92,8 @@ import { getOpenRouterHeaders } from "../utils/openrouter-headers";
 import { isForcedToolChoice } from "../utils/tool-choice";
 import {
 	buildCopilotDynamicHeaders,
+	getCachedCopilotIntegrationId,
+	getCopilotIntegrationCacheKey,
 	hasCopilotVisionInput,
 	resolveGitHubCopilotBaseUrl,
 } from "./github-copilot-headers";
@@ -115,6 +117,7 @@ import type {
 	ResponseStatus,
 	ResponseStreamEvent,
 } from "./openai-responses-wire";
+import { applyInferenceHeaders, setHeaderIfAbsent } from "./inference-headers";
 import { transformMessages } from "./transform-messages";
 import { joinTextWithImagePlaceholder, NON_VISION_IMAGE_PLACEHOLDER, partitionVisionContent } from "./vision-guard";
 
@@ -131,6 +134,7 @@ export const NO_AUTH_SENTINEL = "N/A";
 export interface OpenAIModelIdentity {
 	provider: string;
 	id: string;
+	identity?: Model["identity"];
 	baseUrl?: string;
 }
 
@@ -171,7 +175,7 @@ export interface OpenAIRequestSetupOptions {
 		apiVersion: string;
 		deploymentName: string;
 	};
-	openAISessionId?: string;
+	sessionId?: string;
 	promptCacheSessionId?: string;
 }
 
@@ -181,6 +185,14 @@ export interface OpenAIRequestSetup {
 	headers: Record<string, string>;
 	query: Record<string, string> | undefined;
 	requestHeaders: Record<string, string>;
+	/** Working-identity cache key for this credential+host; undefined off the Copilot path. */
+	copilotCacheKey: string | undefined;
+	/**
+	 * Build-time cache provenance for the wrapper: the cached value the
+	 * outgoing headers were built from, or `null` when the cache was empty at
+	 * build. `undefined` off the Copilot path (wrapper rereads at dispatch).
+	 */
+	copilotCacheSnapshot: string | null | undefined;
 }
 
 function normalizeSakanaRequestBaseUrl(baseUrl: string | undefined): string | undefined {
@@ -205,14 +217,6 @@ function applyCoreWeaveProjectHeader(headers: Record<string, string>): void {
 	}
 }
 
-function setHeaderIfAbsent(headers: Record<string, string>, name: string, value: string): void {
-	const normalizedName = name.toLowerCase();
-	for (const existingName in headers) {
-		if (existingName.toLowerCase() === normalizedName) return;
-	}
-	headers[name] = value;
-}
-
 export function resolveOpenAIRequestSetup(
 	model: OpenAIRequestSetupModel,
 	options: OpenAIRequestSetupOptions,
@@ -228,7 +232,7 @@ export function resolveOpenAIRequestSetup(
 		apiKey = $env.OPENAI_API_KEY;
 	}
 	const rawApiKey = apiKey;
-	let headers = { ...(model.headers ?? {}) };
+	let headers = { ...model.headers };
 	if (model.provider === "openrouter") {
 		Object.assign(headers, getOpenRouterHeaders());
 	}
@@ -241,6 +245,8 @@ export function resolveOpenAIRequestSetup(
 	}
 
 	let copilotPremiumRequests: number | undefined;
+	let copilotCacheKey: string | undefined;
+	let copilotCacheSnapshot: string | null | undefined;
 	let baseUrl = model.baseUrl;
 	if (model.provider === "moonshot") {
 		// Bundled `moonshot` catalog models hardcode the international endpoint
@@ -259,17 +265,25 @@ export function resolveOpenAIRequestSetup(
 		}
 	}
 	if (model.provider === "github-copilot") {
-		apiKey = parseGitHubCopilotApiKey(rawApiKey).accessToken;
+		const copilotApiKey = parseGitHubCopilotApiKey(rawApiKey);
+		apiKey = copilotApiKey.accessToken;
+		const copilotBaseUrl = resolveGitHubCopilotBaseUrl(model.baseUrl, rawApiKey) ?? model.baseUrl;
+		copilotCacheKey = getCopilotIntegrationCacheKey(rawApiKey, copilotBaseUrl);
+		const copilotCached = getCachedCopilotIntegrationId(copilotCacheKey);
 		const copilot = buildCopilotDynamicHeaders({
 			messages: options.messages,
 			hasImages: hasCopilotVisionInput(options.messages),
 			premiumMultiplier: model.premiumMultiplier,
 			headers,
 			initiatorOverride: options.initiatorOverride,
+			enterpriseUrl: copilotApiKey.enterpriseUrl,
+			integrationId: resolveCopilotRequestIdentity(options.extraHeaders),
+			cachedIntegrationId: copilotCached,
 		});
 		Object.assign(headers, copilot.headers);
 		copilotPremiumRequests = copilot.premiumRequests;
-		baseUrl = resolveGitHubCopilotBaseUrl(model.baseUrl, rawApiKey) ?? model.baseUrl;
+		baseUrl = copilotBaseUrl;
+		copilotCacheSnapshot = copilotCached ?? null;
 	}
 
 	if (model.provider === "alibaba-token-plan") {
@@ -307,10 +321,12 @@ export function resolveOpenAIRequestSetup(
 		query = { "api-version": options.azureChatCompletions.apiVersion };
 	}
 
-	if (options.openAISessionId && model.provider === "openai") {
-		setHeaderIfAbsent(headers, "session_id", options.openAISessionId);
-		setHeaderIfAbsent(headers, "x-client-request-id", options.openAISessionId);
-	}
+	const sessionId = options.sessionId ?? options.promptCacheSessionId;
+	applyInferenceHeaders(headers, {
+		provider: model.provider,
+		protocol: "openai",
+		sessionId,
+	});
 	if (options.promptCacheSessionId && model.compat?.promptCacheSessionHeader) {
 		setHeaderIfAbsent(headers, model.compat.promptCacheSessionHeader, options.promptCacheSessionId);
 	}
@@ -332,13 +348,13 @@ export function resolveOpenAIRequestSetup(
 	if (apiKey !== NO_AUTH_SENTINEL) {
 		headers.Authorization ??= `Bearer ${apiKey}`;
 	}
-	return { copilotPremiumRequests, baseUrl, headers, query, requestHeaders };
+	return { copilotPremiumRequests, baseUrl, headers, query, requestHeaders, copilotCacheKey, copilotCacheSnapshot };
 }
 
 export function applyOpenAIServiceTier(
 	params: { service_tier?: ServiceTier | null | undefined },
 	serviceTier: ServiceTier | null | undefined,
-	model: Pick<Model, "provider" | "api" | "id">,
+	model: Pick<Model, "provider" | "api" | "identity">,
 ): void {
 	if (!shouldSendServiceTier(serviceTier, model)) return;
 	params.service_tier = serviceTier;
@@ -350,7 +366,12 @@ export function applyOpenAIServiceTier(
  * half price; Priority is a 2x premium. Codex bills the same tiers with its own
  * table (Priority is 2.5x on gpt-5.5) and applies that separately.
  */
-function getOpenAIResponsesServiceTierCostMultiplier(tier: string | null | undefined): number {
+function getOpenAIResponsesServiceTierCostMultiplier(
+	model: Pick<Model, "serviceTierCost">,
+	tier: string | null | undefined,
+): number {
+	const resolvedMultiplier = tier === "flex" || tier === "priority" ? model.serviceTierCost?.[tier] : undefined;
+	if (resolvedMultiplier !== undefined) return resolvedMultiplier;
 	switch (tier) {
 		case "flex":
 			return 0.5;
@@ -370,7 +391,7 @@ function getOpenAIResponsesServiceTierCostMultiplier(tier: string | null | undef
  * proxy can never skew those costs.
  */
 export function applyOpenAIResponsesServiceTierCost(
-	model: Pick<Model, "provider">,
+	model: Pick<Model, "provider" | "serviceTierCost">,
 	usage: AssistantMessage["usage"],
 	responseServiceTier: unknown,
 	requestServiceTier: ServiceTier | null | undefined,
@@ -380,7 +401,7 @@ export function applyOpenAIResponsesServiceTierCost(
 	// requested priority/flex turn to default under load); only fall back to the
 	// requested tier when the response omits the echo entirely.
 	const served = typeof responseServiceTier === "string" ? responseServiceTier : (requestServiceTier ?? undefined);
-	const multiplier = getOpenAIResponsesServiceTierCostMultiplier(served);
+	const multiplier = getOpenAIResponsesServiceTierCostMultiplier(model, served);
 	if (multiplier === 1) return;
 	usage.cost.input *= multiplier;
 	usage.cost.output *= multiplier;
@@ -538,10 +559,6 @@ export function disableStrictToolsForScope(
 ): void {
 	if (!scope) return;
 	state?.strictTools.disabledModelScopes.add(`${scope.provider}:${scope.baseUrl ?? ""}:${scope.modelId}`);
-}
-
-export function isOpenRouterAnthropicModel(model: OpenAIModelIdentity): boolean {
-	return model.provider === "openrouter" && model.id.toLowerCase().startsWith("anthropic/");
 }
 
 /**
@@ -1211,8 +1228,8 @@ export function disableChatCompletionsReasoningForDialect(
  * true but are NOT GLM-5.2, so the model-id check is load-bearing — never swap it
  * for `compat.supportsReasoningEffort`.
  */
-function isZaiReasoningEffortDialect(model: Model<"openai-completions">, compat: ResolvedOpenAICompat): boolean {
-	return compat.thinkingFormat === "zai" && isGlm52ReasoningEffortModelId(model.id);
+function isZaiReasoningEffortDialect(_model: Model<"openai-completions">, compat: ResolvedOpenAICompat): boolean {
+	return compat.thinkingFormat === "zai" && compat.zaiReasoningEffortDialect;
 }
 
 /**
@@ -1233,7 +1250,7 @@ export function resolveOpenAICompletionsOutputClamp(
 	if (isZaiReasoningEffortDialect(model, compat)) {
 		return model.maxTokens ?? OPENAI_MAX_OUTPUT_TOKENS;
 	}
-	if (model.provider === "moonshot" && isKimiK3ModelId(model.id)) {
+	if (compat.clampOutputToModelMax) {
 		return model.maxTokens ?? OPENAI_MAX_OUTPUT_TOKENS;
 	}
 	return undefined;
@@ -1242,12 +1259,13 @@ export function resolveOpenAICompletionsOutputClamp(
 /**
  * Provider-specific Responses API output clamp.
  *
- * Meta documents a 131,072-token output limit for Muse Spark 1.1, so native
- * Meta requests may use the model's full advertised cap instead of the
- * conservative 64k OpenAI-compatible default.
+ * Models whose compiled provider policy opts in may use their full advertised
+ * output cap instead of the conservative 64k OpenAI-compatible default.
  */
-export function resolveOpenAIResponsesOutputClamp(model: Pick<Model, "provider" | "maxTokens">): number | undefined {
-	if (model.provider === "meta") {
+export function resolveOpenAIResponsesOutputClamp(
+	model: Pick<Model, "maxTokens"> & { compat: Pick<ResolvedOpenAISharedCompat, "clampOutputToModelMax"> },
+): number | undefined {
+	if (model.compat.clampOutputToModelMax) {
 		return model.maxTokens ?? OPENAI_MAX_OUTPUT_TOKENS;
 	}
 	return undefined;
@@ -2115,6 +2133,19 @@ function parseResponseReasoningReplayItem(signature: string | undefined): Respon
 	}
 }
 
+/**
+ * Non-empty `reasoning_text` shipped for a synthesized reasoning item when no
+ * thinking text survived history reconstruction. DeepSeek-family Responses
+ * targets (e.g. opencode-go) reject BOTH a missing reasoning item and one whose
+ * `reasoning_text` is empty — "The reasoning_text in the thinking mode must be
+ * passed back to the API" (#8248 covered the missing case, #10690 the empty
+ * one). The item's presence plus a non-empty payload is what satisfies the
+ * contract; the exact text is immaterial once the source turn's reasoning is
+ * gone. Kept out of `reasoning_content="."`-territory since DeepSeek rejects the
+ * bare-dot synthetic placeholder on the chat-completions path.
+ */
+export const SYNTHETIC_REASONING_REPLAY_PLACEHOLDER = "reasoning unavailable";
+
 export function convertResponsesAssistantMessage<TApi extends Api>(
 	assistantMsg: AssistantMessage,
 	model: Model<TApi>,
@@ -2272,12 +2303,15 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 	if (requiresReasoningItem && !reasoningItemEmitted && outputItems.length > 0) {
 		// Replay the demoted reasoning (already present in `content` as visible
 		// text) as a structured reasoning item so the thinking-mode continuation
-		// carries the `reasoning_text` the provider requires. The text may be empty
-		// when the source turn was minted by another model and its reasoning is
-		// already folded into the message text; the item's presence is what
-		// satisfies the provider contract, mirroring the empty `reasoning_content`
-		// placeholder used on the chat-completions path.
-		const reasoningText = carriedReasoningTexts.join("\n");
+		// carries the `reasoning_text` the provider requires. When no thinking
+		// text survived reconstruction (source turn minted by another model, or
+		// reasoning dropped by compaction/archive budget) the carried text is
+		// empty — and DeepSeek-family targets reject an empty `reasoning_text`
+		// exactly like a missing item (#10690), so substitute a non-empty
+		// placeholder. The `id` still prefers a surviving upstream item id.
+		const carriedReasoningText = carriedReasoningTexts.join("\n");
+		const reasoningText =
+			carriedReasoningText.length > 0 ? carriedReasoningText : SYNTHETIC_REASONING_REPLAY_PLACEHOLDER;
 		const reasoningId =
 			synthesizedReasoningItemId ?? `rs_${Bun.hash(`${model.id}:${msgIndex}:${reasoningText}`).toString(36)}`;
 		const reasoningItem: ResponseReasoningItem = {
@@ -3337,7 +3371,7 @@ export async function processResponsesStream<TApi extends Api>(
 				output.responseId = response.id;
 			}
 			populateResponsesUsageFromResponse(output, response?.usage);
-			calculateCost(model, output.usage);
+			calculateCost(model, output.usage, output.timestamp);
 			applyProviderReportedCost(model, output.usage, response?.usage);
 			applyOpenAIResponsesServiceTierCost(
 				model,
@@ -3560,8 +3594,11 @@ type CommonSamplingOptions = Pick<
 export function applyCommonResponsesSamplingParams<P extends CommonResponsesParams>(
 	params: P,
 	options: CommonSamplingOptions | undefined,
-	model: Pick<Model, "provider" | "api" | "id" | "omitMaxOutputTokens" | "maxTokens"> & {
-		compat: Pick<ResolvedOpenAISharedCompat, "supportsSamplingParams" | "supportsPenaltyAndStopParams">;
+	model: Pick<Model, "provider" | "api" | "id" | "omitMaxOutputTokens" | "maxTokens" | "identity"> & {
+		compat: Pick<
+			ResolvedOpenAISharedCompat,
+			"supportsSamplingParams" | "supportsPenaltyAndStopParams" | "clampOutputToModelMax"
+		>;
 	},
 ): void {
 	if (options?.maxTokens && !model.omitMaxOutputTokens) {
@@ -3592,6 +3629,19 @@ type ReasoningOptions = {
 	disableReasoning?: boolean;
 	toolChoice?: unknown;
 };
+
+/**
+ * Resolve the caller's reasoning-summary request against catalog compat.
+ * Hosts that reject `reasoning.summary` get an explicit `null` (wire omission)
+ * whenever reasoning is engaged, so the policy never fills the `"auto"` default.
+ */
+export function resolveReasoningSummaryOption(
+	model: Model<"openai-responses" | "azure-openai-responses" | "openai-codex-responses">,
+	options: { reasoning?: string; reasoningSummary?: "auto" | "detailed" | "concise" | null } | undefined,
+): "auto" | "detailed" | "concise" | null | undefined {
+	if (model.compat.supportsReasoningSummary) return options?.reasoningSummary;
+	return options?.reasoning === undefined ? undefined : null;
+}
 
 export interface ApplyResponsesCompatPolicyOptions {
 	reasoningSummary?: "auto" | "detailed" | "concise" | null;
@@ -3686,7 +3736,7 @@ export function applyResponsesReasoningParams<P extends ResponseCreateParamsStre
 			includeEncryptedReasoning,
 			omitReasoningEffort,
 		}),
-		{ reasoningSummary: options?.reasoningSummary, mapEffort },
+		{ reasoningSummary: resolveReasoningSummaryOption(model, options), mapEffort },
 	);
 }
 

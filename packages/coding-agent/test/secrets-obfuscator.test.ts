@@ -259,6 +259,33 @@ describe("SecretObfuscator regex behavior", () => {
 		expect(obfuscated[1]).toBe(systemDeveloperMsg);
 	});
 
+	it("obfuscates file metadata on a replayed compaction payload but keeps the block verbatim", () => {
+		const secret = "SUPER_SECRET_TOKEN_12345";
+		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
+		const message: Message = {
+			role: "user",
+			content: "Prior model work available.",
+			timestamp: 1,
+			providerPayload: {
+				type: "anthropicCompaction",
+				provider: "anthropic",
+				content: "## Goal\nAudit the handlers.",
+				filesText: `<files>\n# /repo/\n${secret}.key (Read)\n</files>`,
+			},
+		};
+
+		const [obfuscated] = obfuscateMessages(obfuscator, [message]);
+		if (obfuscated?.role !== "user") throw new Error("expected user message");
+		const payload = obfuscated.providerPayload;
+		if (payload?.type !== "anthropicCompaction") throw new Error("expected compaction payload");
+		// The metadata takes the same boundary as the summary text...
+		expect(payload.filesText).not.toContain(secret);
+		expect(obfuscator.deobfuscate(payload.filesText ?? "")).toContain(secret);
+		// ...while the replayed block stays byte-identical to the API summary.
+		expect(payload.content).toBe("## Goal\nAudit the handlers.");
+		expect(obfuscated).not.toBe(message);
+	});
+
 	it("never rewrites inline image bytes", () => {
 		const secret = "SUPER_SECRET_TOKEN_12345";
 		const obfuscator = new SecretObfuscator([{ type: "plain", content: secret }]);
@@ -807,18 +834,22 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("api_key=abcdefghXYZ");
 	});
 	it("obfuscates bounded regex remainders around prior placeholders", () => {
-		const obfuscator = new SecretObfuscator([
-			{ type: "plain", content: "abcdefgh" },
-			{ type: "regex", content: "api_key=[A-Za-z0-9]{11}", friendlyName: "api-key" },
-		]);
+		const obfuscator = new SecretObfuscator(
+			[
+				{ type: "plain", content: "abcdefgh" },
+				{ type: "regex", content: "api_key=[A-Za-z0-9]{11}", friendlyName: "api-key" },
+			],
+			"collision-6422",
+		);
 		const token = obfuscator.obfuscate("abcdefgh");
+		expect(token).toContain("XYZ");
 
 		const obfuscated = obfuscator.obfuscate(`api_key=${token}XYZ`);
 
 		expect(obfuscated).not.toContain("api_key=");
-		expect(obfuscated).not.toContain("XYZ");
-		expect(obfuscated).toContain(token);
+		expect(obfuscated.replaceAll(token, "")).not.toContain("XYZ");
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("api_key=abcdefghXYZ");
+		expect(obfuscated).toContain(token);
 		expect(obfuscator.obfuscate(obfuscated)).toBe(obfuscated);
 	});
 

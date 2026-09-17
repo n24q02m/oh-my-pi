@@ -1,11 +1,11 @@
 import type { Api, Model, ModelSpec, RemoteCompactionConfig } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getVariantAliasSources, resolveVariantSelector } from "@oh-my-pi/pi-catalog/compat/collapse";
 import {
 	getBundledModelReferenceIndex,
 	inheritReferenceThinking,
 	resolveModelReference,
 } from "@oh-my-pi/pi-catalog/identity";
-import { getVariantAliasSources, resolveVariantAlias } from "@oh-my-pi/pi-catalog/variant-collapse";
 import { logger } from "@oh-my-pi/pi-utils";
 import { createLiveConfigHeaders, type HeaderSource } from "./model-config-values";
 import { type ModelPatch, mergeCompat, mergeRemoteCompactionConfig } from "./model-patch";
@@ -121,7 +121,7 @@ export function finalizeCustomModel(model: CustomModelOverlay, options: CustomMo
 		(options.useDefaults ? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } : undefined);
 	const input = resolvedModel.input ?? reference?.input ?? (options.useDefaults ? ["text"] : undefined);
 	const supportsTools = resolvedModel.supportsTools ?? reference?.supportsTools;
-	return buildModel({
+	const built = buildModel({
 		id: resolvedModel.id,
 		name: resolvedModel.name ?? (options.useDefaults ? resolvedModel.id : undefined),
 		api: resolvedModel.api,
@@ -146,6 +146,13 @@ export function finalizeCustomModel(model: CustomModelOverlay, options: CustomMo
 		premiumMultiplier: resolvedModel.premiumMultiplier,
 		isOAuth: resolvedModel.isOAuth,
 	} as ModelSpec<Api>);
+	if (resolvedModel.cost) {
+		// Explicit custom prices outrank catalog corrections and schedules, just
+		// as they do for same-id model patches.
+		built.cost = { ...resolvedModel.cost };
+		delete built.cost.timeBased;
+	}
+	return built;
 }
 
 export function normalizeSuppressedSelector(
@@ -162,7 +169,7 @@ export function normalizeSuppressedSelector(
 	if (!parsed) return trimmed;
 	// Retired effort-tier variant ids normalize to their collapsed logical id
 	// so persisted suppressions keyed by raw member ids still bind.
-	const aliasId = resolveVariantAlias(parsed.provider, parsed.id);
+	const aliasId = resolveVariantSelector(parsed.provider, parsed.id);
 	return `${parsed.provider}/${aliasId ?? parsed.id}`;
 }
 

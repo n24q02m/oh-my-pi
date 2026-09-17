@@ -87,6 +87,8 @@ type Offered =
 	| { batch: HistoryBatch; kind: "replay" };
 
 const MAX_LIVE_BLOCKS = 256;
+/** Grace before a pressure-blocked frontier is reported; a streaming block may legitimately hold it briefly. */
+const PINNED_FRONTIER_WARN_MS = 30_000;
 const EMPTY_ROWS: readonly string[] = [];
 const EMPTY_STABLE_ROWS: readonly TranscriptStableRow[] = [];
 
@@ -131,6 +133,13 @@ export function trimBlankEdges(rows: readonly string[]): readonly string[] {
 	return start === 0 && end === rows.length ? rows : rows.slice(start, end);
 }
 
+/** One live block's row span in the last `renderViewport` output (half-open `[start, end)`). */
+export interface TranscriptViewportSpan {
+	component: Component;
+	start: number;
+	end: number;
+}
+
 /** Owns transcript order, live capacity, and ordered immutable retirement. */
 export class TranscriptContainer extends Container {
 	#entries: TranscriptEntry[] = [];
@@ -141,6 +150,14 @@ export class TranscriptContainer extends Container {
 	#replayRequested = false;
 	#toolActivityVisible = true;
 	#lastFrame: AnimationFrame = { tick: 0, now: 0 };
+	// Start rows from the last full render(), keyed by child component (transcript deep-links).
+	#childStartRows = new Map<Component, number>();
+	// Watchdog for the wedge where an unfinalized frontier block pins pressure
+	// retirement: everything behind it stays live and degrades to one-line
+	// allocations. Logs once per pinned episode after a grace period.
+	#pinnedFrontier: { index: number; since: number; logged: boolean } | undefined;
+	/** Block spans of the last `renderViewport` output, for click hit-testing. */
+	#lastViewportSpans: TranscriptViewportSpan[] = [];
 
 	override addChild(component: Component): void {
 		if (isToolActivityComponent(component)) component.setToolActivityVisible(this.#toolActivityVisible);
@@ -161,6 +178,7 @@ export class TranscriptContainer extends Container {
 		super.removeChild(component);
 		this.#entries = this.#entries.filter(candidate => candidate.component !== component);
 		this.#frontier = Math.min(this.#frontier, this.#entries.length);
+		this.#childStartRows.delete(component);
 	}
 
 	override clear(): void {
@@ -168,8 +186,11 @@ export class TranscriptContainer extends Container {
 		this.#entries = [];
 		this.#frontier = 0;
 		this.#offered = undefined;
+		this.#childStartRows.clear();
+		this.#pinnedFrontier = undefined;
 		this.#replayPending = false;
 		this.#replayRequested = false;
+		this.#lastViewportSpans = [];
 	}
 
 	setToolActivityVisible(visible: boolean): void {
@@ -276,6 +297,29 @@ export class TranscriptContainer extends Container {
 		return total;
 	}
 
+	/** Block spans of the last `renderViewport` output, in output coordinates. Empty when the tail is empty. */
+	getLastViewportSpans(): readonly TranscriptViewportSpan[] {
+		return this.#lastViewportSpans;
+	}
+
+	/** Collapse a per-line owner list into run-length block spans, clamped to `length`. */
+	#commitViewportSpans(owners: readonly (Component | undefined)[], length: number = owners.length): void {
+		const spans: TranscriptViewportSpan[] = [];
+		let index = 0;
+		while (index < length) {
+			const component = owners[index];
+			if (component === undefined) {
+				index++;
+				continue;
+			}
+			let end = index + 1;
+			while (end < length && owners[end] === component) end++;
+			spans.push({ component, start: index, end });
+			index = end;
+		}
+		this.#lastViewportSpans = spans;
+	}
+
 	/** Render the live tail, constrained to the supplied transcript height. */
 	renderViewport(width: number, rows: number, frame: AnimationFrame): readonly string[] {
 		this.#lastFrame = frame;
@@ -283,7 +327,10 @@ export class TranscriptContainer extends Container {
 		this.#settleFinalized();
 		const live = this.#liveEntries();
 		const capacity = Math.max(0, Math.trunc(rows));
-		if (live.length === 0 || capacity === 0) return EMPTY_ROWS;
+		if (live.length === 0 || capacity === 0) {
+			this.#lastViewportSpans = [];
+			return EMPTY_ROWS;
+		}
 
 		const shown: Array<{ entry: TranscriptEntry; index: number }> = [];
 		const blocks: (readonly string[])[] = [];
@@ -297,17 +344,30 @@ export class TranscriptContainer extends Container {
 			shown.push(candidate);
 			blocks.push(block);
 		}
-		if (shown.length === 0) return EMPTY_ROWS;
+		if (shown.length === 0) {
+			this.#lastViewportSpans = [];
+			return EMPTY_ROWS;
+		}
 		if (shown.length > capacity) return this.#renderEmergency(shown, width, capacity, frame);
 		if (total <= capacity) {
 			const output: string[] = [];
-			for (const rendered of blocks) {
-				if (output.length > 0) output.push("");
-				output.push(...rendered);
+			const owners: (Component | undefined)[] = [];
+			for (let blockIndex = 0; blockIndex < blocks.length; blockIndex++) {
+				if (output.length > 0) {
+					output.push("");
+					owners.push(undefined);
+				}
+				const component = shown[blockIndex]!.entry.component;
+				for (const line of blocks[blockIndex]!) {
+					output.push(line);
+					owners.push(component);
+				}
 			}
+			this.#commitViewportSpans(owners, output.length);
 			return output;
 		}
 
+		// oxlint-disable-next-line unicorn/no-new-array -- length preallocation
 		const allocation: number[] = new Array(shown.length).fill(1);
 		let surplus = capacity - shown.length;
 		// Surplus rows favor ordinary transcript blocks over dynamic tool-activity
@@ -327,6 +387,7 @@ export class TranscriptContainer extends Container {
 			surplus -= extra;
 		}
 		const output: string[] = [];
+		const owners: (Component | undefined)[] = [];
 		for (let index = 0; index < shown.length; index++) {
 			const candidate = shown[index]!;
 			const allocated = allocation[index]!;
@@ -334,10 +395,15 @@ export class TranscriptContainer extends Container {
 			const rendered = this.#renderEntry(candidate.entry, width).slice(
 				this.#projectedEmitted(candidate.entry, candidate.index, width),
 			);
-			if (rendered.length <= allocated) output.push(...rendered);
-			else output.push(...rendered.slice(rendered.length - allocated));
+			const visible = rendered.length <= allocated ? rendered : rendered.slice(rendered.length - allocated);
+			for (const line of visible) {
+				output.push(line);
+				owners.push(candidate.entry.component);
+			}
 		}
-		return output.length > capacity ? output.slice(output.length - capacity) : output;
+		const drop = Math.max(0, output.length - capacity);
+		this.#commitViewportSpans(owners.slice(drop), output.length - drop);
+		return drop > 0 ? output.slice(drop) : output;
 	}
 
 	/** Offers stable-head emission or the shortest finalized prefix needed under pressure. */
@@ -366,6 +432,26 @@ export class TranscriptContainer extends Container {
 		return this.#peekBatch(width, 0, "flush");
 	}
 
+	/** Recompose the unacknowledged batch so a discarded TUI frame can be rendered again. */
+	rerenderOfferedBatch(width: number): HistoryBatch | undefined {
+		const offered = this.#offered;
+		if (offered === undefined) return undefined;
+		let rows: readonly string[];
+		if (offered.kind === "append") {
+			const entry = this.#entries[offered.entry];
+			if (entry === undefined) return undefined;
+			const before = this.#renderStablePrefix(entry, entry.emitted, width);
+			const after = this.#renderStablePrefix(entry, offered.emittedEnd, width);
+			rows = after.slice(before.length);
+		} else if (offered.kind === "commit") {
+			rows = this.#renderRange(this.#frontier, offered.end, width, true);
+		} else {
+			rows = this.#renderReplay(width);
+		}
+		offered.batch = { id: offered.batch.id, rows, kind: offered.batch.kind };
+		return offered.batch;
+	}
+
 	#peekBatch(width: number, capacity: number, policy: RetirementPolicy): HistoryBatch | undefined {
 		this.#syncEntries();
 		this.#settleFinalized();
@@ -377,7 +463,9 @@ export class TranscriptContainer extends Container {
 		const room = Math.max(0, Math.trunc(capacity));
 		const live = this.#liveEntries();
 		if (live.length === 0) return undefined;
+		// oxlint-disable-next-line unicorn/no-new-array -- length preallocation
 		const rendered: (readonly string[])[] = new Array(live.length);
+		// oxlint-disable-next-line unicorn/no-new-array -- length preallocation
 		const heights: number[] = new Array(live.length);
 		let total = 0;
 		let visible = 0;
@@ -393,7 +481,10 @@ export class TranscriptContainer extends Container {
 			if (rows.length > 0) total += rows.length + (visible++ > 0 ? 1 : 0);
 		}
 		const overflowing = total > room || this.#liveCount() >= MAX_LIVE_BLOCKS;
-		if (policy === "pressure" && !overflowing) return undefined;
+		if (policy === "pressure" && !overflowing) {
+			this.#pinnedFrontier = undefined;
+			return undefined;
+		}
 
 		const head = this.#entries[this.#frontier];
 		if (
@@ -417,6 +508,7 @@ export class TranscriptContainer extends Container {
 				kind: "append",
 			};
 			this.#offered = { batch, kind: "append", entry: this.#frontier, emittedEnd };
+			this.#pinnedFrontier = undefined;
 			return batch;
 		}
 
@@ -434,7 +526,11 @@ export class TranscriptContainer extends Container {
 			end++;
 			index++;
 		}
-		if (end === this.#frontier) return undefined;
+		if (end === this.#frontier) {
+			if (policy === "pressure") this.#notePinnedFrontier();
+			return undefined;
+		}
+		this.#pinnedFrontier = undefined;
 		const batch: HistoryBatch = {
 			id: this.#nextBatchId++,
 			rows: this.#renderRange(this.#frontier, end, width, true),
@@ -489,15 +585,22 @@ export class TranscriptContainer extends Container {
 	/** Full semantic render used by exports and non-terminal commands. */
 	override render(width: number): readonly string[] {
 		this.#syncEntries();
+		this.#childStartRows.clear();
 		const rows: string[] = [];
 		for (const entry of this.#entries) {
 			this.#setAllocation(entry.component, Number.MAX_SAFE_INTEGER, this.#lastFrame);
 			const block = this.#renderEntry(entry, width);
 			if (block.length === 0) continue;
 			if (rows.length > 0) rows.push("");
+			this.#childStartRows.set(entry.component, rows.length);
 			rows.push(...block);
 		}
 		return rows;
+	}
+
+	/** Rendered row where a child's block begins in the last full render() (transcript deep-links). */
+	getChildStartRow(child: Component): number | undefined {
+		return this.#childStartRows.get(child);
 	}
 
 	#renderEntry(entry: TranscriptEntry, width: number): readonly string[] {
@@ -545,6 +648,30 @@ export class TranscriptContainer extends Container {
 		if (count === 0) return EMPTY_ROWS;
 		const appendOnly = entry.component as Component & AppendOnlyTranscriptBlock;
 		return appendOnly.renderTranscriptStableRows(Math.min(count, entry.stableRows.length), width);
+	}
+	/**
+	 * Record that pressure retirement is blocked behind a not-yet-settled
+	 * frontier block, and log its identity once the episode outlives the grace
+	 * period. A block that never finalizes (a dropped terminal event) pins the
+	 * whole live region here with no visible symptom other than degraded
+	 * one-line layout, so the log line is the only forensic trail.
+	 */
+	#notePinnedFrontier(): void {
+		const entry = this.#entries[this.#frontier];
+		if (entry === undefined) return;
+		const now = Date.now();
+		if (this.#pinnedFrontier?.index !== this.#frontier) {
+			this.#pinnedFrontier = { index: this.#frontier, since: now, logged: false };
+			return;
+		}
+		if (this.#pinnedFrontier.logged || now - this.#pinnedFrontier.since < PINNED_FRONTIER_WARN_MS) return;
+		this.#pinnedFrontier.logged = true;
+		logger.warn("Transcript retirement pinned by unfinalized frontier block", {
+			component: entry.component.constructor.name,
+			state: entry.state,
+			mode: entry.mode,
+			liveBlocks: this.#liveCount(),
+		});
 	}
 
 	#renderRange(start: number, end: number, width: number, trailingBlank: boolean): readonly string[] {
@@ -646,9 +773,11 @@ export class TranscriptContainer extends Container {
 		}
 
 		const output = hiddenActive > 0 ? [`${hiddenActive} more transcript blocks active`] : [];
+		const owners: (Component | undefined)[] = hiddenActive > 0 ? [undefined] : [];
 		for (const candidate of visible) {
 			if (candidate === emergencyCandidate) {
 				output.push(emergencyRow ?? "");
+				owners.push(candidate.entry.component);
 				continue;
 			}
 			this.#setAllocation(candidate.entry.component, 1, frame);
@@ -656,8 +785,11 @@ export class TranscriptContainer extends Container {
 				this.#projectedEmitted(candidate.entry, candidate.index, width),
 			);
 			output.push(rendered[0] ?? "");
+			owners.push(candidate.entry.component);
 		}
-		return output.slice(0, rows);
+		const visibleOutput = output.slice(0, rows);
+		this.#commitViewportSpans(owners, visibleOutput.length);
+		return visibleOutput;
 	}
 
 	#projectedEmitted(entry: TranscriptEntry, index: number, width: number): number {
