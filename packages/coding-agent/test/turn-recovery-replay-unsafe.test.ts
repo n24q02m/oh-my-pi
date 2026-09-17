@@ -665,6 +665,94 @@ describe("TurnRecovery replay-unsafe output classification", () => {
 		});
 	});
 
+	// A Connect/gRPC usage-limit trailer (e.g. Devin `resource_exhausted: Reached
+	// free model rate limit … Your limit will reset in 18 seconds`) classifies as
+	// Flag.UsageLimit. The credential is blocked regardless of what the turn
+	// already emitted, so committed text must NOT veto the bounded wait-and-retry:
+	// the alternative is a dead session the provider explicitly said would reset.
+	// Side-effecting output (executed tool calls, images, server tools) still
+	// vetoes replay.
+	describe("usage-limit error with committed text", () => {
+		const devinRateLimit =
+			"Devin stream error resource_exhausted: Reached free model rate limit. " +
+			"Upgrade to Max for higher limits, or switch to a different model. " +
+			"Your limit will reset in 18 seconds. (trace ID: 27142b6dfb884fc3494b8c366e27f336)";
+
+		function usageLimitError(content: AssistantMessage["content"]): AssistantMessage {
+			const message = makeMessage(content, model);
+			message.provider = "devin";
+			message.errorMessage = devinRateLimit;
+			return message;
+		}
+
+		function toolCall(id: string): AssistantMessage["content"][number] {
+			return { type: "toolCall", id, name: "bash", arguments: { command: "ssh host" } };
+		}
+
+		function syntheticResult(toolCallId: string): ToolResultMessage<SyntheticToolResultDetails> {
+			return {
+				role: "toolResult",
+				toolCallId,
+				toolName: "bash",
+				content: [{ type: "text", text: "Tool call was not executed." }],
+				isError: true,
+				details: { __synthetic: true, source: "assistant_stop_error", executed: false },
+				timestamp: Date.now(),
+			};
+		}
+
+		function realResult(toolCallId: string): ToolResultMessage {
+			return {
+				role: "toolResult",
+				toolCallId,
+				toolName: "bash",
+				content: [{ type: "text", text: "ok" }],
+				isError: false,
+				timestamp: Date.now(),
+			};
+		}
+
+		function recoveryForUsageLimit(message: AssistantMessage, tail: readonly AgentMessage[]): TurnRecovery {
+			return new TurnRecovery(createHost(model, modelRegistry, { messages: [message as AgentMessage, ...tail] }));
+		}
+
+		it("classifies the Devin free-tier trailer as a usage limit", () => {
+			const message = usageLimitError([]);
+			expect(AIError.is(AIError.classifyMessage(message), AIError.Flag.UsageLimit)).toBe(true);
+		});
+
+		it("retries a usage-limit error after committed text", () => {
+			const message = usageLimitError([{ type: "text", text: "Partial answer before the cap." }]);
+			expect(recoveryForUsageLimit(message, []).isRetryableError(message)).toBe(true);
+		});
+
+		it("retries a usage-limit error with committed text and a provably unexecuted tool call", () => {
+			const message = usageLimitError([
+				{ type: "text", text: "Connecting..." },
+				toolCall("call-1"),
+			]);
+			expect(recoveryForUsageLimit(message, [syntheticResult("call-1")]).isRetryableError(message)).toBe(true);
+		});
+
+		it("does not retry a usage-limit error whose tool call produced a real result", () => {
+			const message = usageLimitError([toolCall("call-1")]);
+			expect(recoveryForUsageLimit(message, [realResult("call-1")]).isRetryableError(message)).toBe(false);
+		});
+
+		it("does not retry a usage-limit error with an unpaired tool call", () => {
+			const message = usageLimitError([{ type: "text", text: "Working..." }, toolCall("call-1")]);
+			expect(recoveryForUsageLimit(message, []).isRetryableError(message)).toBe(false);
+		});
+
+		it("does not retry a usage-limit error that generated an image", () => {
+			const message = usageLimitError([
+				{ type: "text", text: "Here is the render." },
+				{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
+			]);
+			expect(recoveryForUsageLimit(message, []).isRetryableError(message)).toBe(false);
+		});
+	});
+
 	describe("HTTP/2 stream reset after resolved tool calls", () => {
 		const nghttp2Internal = "Stream closed with error code NGHTTP2_INTERNAL_ERROR";
 		const nghttp2Refused = "Stream closed with error code NGHTTP2_REFUSED_STREAM";

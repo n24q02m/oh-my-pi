@@ -1269,12 +1269,14 @@ export class TurnRecovery {
 		// emitted call was paired with a synthetic `executed: false` result) may
 		// also be replayed when every emitted tool call is paired with positive
 		// proof that it never executed.
+		const usageLimit = AIError.is(id, AIError.Flag.UsageLimit);
 		const replaySafeUnexecutedTools =
 			(this.isClassifierRefusal(message) ||
 				AIError.is(id, AIError.Flag.MalformedFunctionCall) ||
 				AIError.retriable(id)) &&
-			this.#unexecutedToolCallsReplaySafe(message);
-		if (this.#hasReplayUnsafeOutput(message) && !replaySafeUnexecutedTools) return false;
+			this.#unexecutedToolCallsReplaySafe(message, { tolerateCommittedText: usageLimit });
+		if (this.#hasReplayUnsafeOutput(message, { tolerateCommittedText: usageLimit }) && !replaySafeUnexecutedTools)
+			return false;
 		if (AIError.is(id, AIError.Flag.AccountPolicy) || this.isClassifierRefusal(message)) return true;
 		return AIError.retriable(id);
 	}
@@ -1293,9 +1295,14 @@ export class TurnRecovery {
 	 * Any uncertainty keeps the replay veto in place: the assistant must exist
 	 * in state, every call must have a later synthetic result, every result must
 	 * say `executed === false`, and the turn must contain no image, server tool,
-	 * or committed non-whitespace text.
+	 * or committed non-whitespace text. A usage-limit failure may tolerate
+	 * committed text (`tolerateCommittedText`): the credential is blocked either
+	 * way, so waiting out the provider's reset window beats a dead session.
 	 */
-	#unexecutedToolCallsReplaySafe(message: AssistantMessage): boolean {
+	#unexecutedToolCallsReplaySafe(
+		message: AssistantMessage,
+		options?: { tolerateCommittedText?: boolean },
+	): boolean {
 		const emittedToolCallIds = new Set<string>();
 		for (const block of message.content) {
 			if (block.type === "toolCall") {
@@ -1303,7 +1310,13 @@ export class TurnRecovery {
 				continue;
 			}
 			if (block.type === "image" || block.type === "anthropicServerTool") return false;
-			if (block.type === "text" && this.#host.textOutputCommitted() && hasNonWhitespace(block.text)) return false;
+			if (
+				block.type === "text" &&
+				!options?.tolerateCommittedText &&
+				this.#host.textOutputCommitted() &&
+				hasNonWhitespace(block.text)
+			)
+				return false;
 		}
 		if (emittedToolCallIds.size === 0) return false;
 
@@ -1414,15 +1427,21 @@ export class TurnRecovery {
 	 * Whitespace-only and buffered text are likewise safe since nothing meaningful
 	 * reached the user. Committed text, generated images, server tools, and retained
 	 * tool calls are NOT safe: each has already rendered or may have side effects,
-	 * so replaying the turn can duplicate user-visible output or work.
+	 * so replaying the turn can duplicate user-visible output or work. Callers may
+	 * pass `tolerateCommittedText` for usage-limit errors, where the credential is
+	 * blocked regardless and a bounded wait-and-retry beats surfacing a terminal
+	 * error the provider explicitly says will reset.
 	 */
-	#hasReplayUnsafeOutput(message: AssistantMessage): boolean {
+	#hasReplayUnsafeOutput(message: AssistantMessage, options?: { tolerateCommittedText?: boolean }): boolean {
 		return message.content.some(
 			block =>
 				block.type === "toolCall" ||
 				block.type === "image" ||
 				block.type === "anthropicServerTool" ||
-				(block.type === "text" && this.#host.textOutputCommitted() && block.text.trim().length > 0),
+				(block.type === "text" &&
+					!options?.tolerateCommittedText &&
+					this.#host.textOutputCommitted() &&
+					block.text.trim().length > 0),
 		);
 	}
 
@@ -2396,13 +2415,13 @@ export class TurnRecovery {
 
 		const errorMessage = message.errorMessage || "Unknown error";
 		const id = this.#classifyRetryMessage(message);
+		const usageLimit = AIError.is(id, AIError.Flag.UsageLimit);
 		const preserveFailedTurn =
 			options?.preserveFailedTurn === true ||
 			((classifierRefusal || AIError.is(id, AIError.Flag.MalformedFunctionCall) || AIError.retriable(id)) &&
-				this.#unexecutedToolCallsReplaySafe(message));
+				this.#unexecutedToolCallsReplaySafe(message, { tolerateCommittedText: usageLimit }));
 		const rateLimitReason = parseRateLimitReason(errorMessage);
 		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
-		const usageLimit = AIError.is(id, AIError.Flag.UsageLimit);
 		const authFailure = AIError.is(id, AIError.Flag.AuthFailed);
 		const accountPolicyDenial = AIError.is(id, AIError.Flag.AccountPolicy);
 		const recordedUsageLimitOutcome = await this.#usageLimitOutcomes.get(message);
