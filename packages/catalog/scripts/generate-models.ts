@@ -45,6 +45,7 @@ import {
 	clampKimiK27CodeMaxTokens,
 	fetchWellKnownModels,
 	FIREPASS_STATIC_MODELS,
+	GITHUB_COPILOT_AUTO_STATIC_MODELS,
 	GMI_CLOUD_STATIC_MODELS,
 	isFireworksKimiK2ModelId,
 	isKimiK27CodeModelId,
@@ -79,6 +80,63 @@ import {
 } from "./generated-policies";
 
 const packageRoot = path.join(import.meta.dir, "..");
+
+export function parseOnlyModelSelector(selector: string): { provider: string; modelId: string } {
+	if (selector.length === 0) throw new Error("Invalid --only-model selector: empty value");
+	const slash = selector.indexOf("/");
+	if (slash <= 0 || slash === selector.length - 1) {
+		throw new Error(`Invalid --only-model selector "${selector}": expected provider/model-id`);
+	}
+	return { provider: selector.slice(0, slash), modelId: selector.slice(slash + 1) };
+}
+
+export function parseOnlyModelArg(argv: readonly string[]): string | undefined {
+	const index = argv.indexOf("--only-model");
+	if (index === -1) return undefined;
+	const value = argv[index + 1];
+	if (!value || value.startsWith("-")) throw new Error("--only-model requires a provider/model-id value");
+	return value;
+}
+
+export function mergeOnlyModel(
+	previous: Record<string, Record<string, Model>>,
+	targetProvider: string,
+	targetId: string,
+	targetModel: Model,
+): Record<string, Record<string, Model>> {
+	const targetModels = { ...previous[targetProvider], [targetId]: targetModel };
+	return {
+		...previous,
+		[targetProvider]: Object.fromEntries(Object.entries(targetModels).sort(([a], [b]) => a.localeCompare(b))),
+	};
+}
+
+export function resolveOnlyModelTarget(models: Record<string, Record<string, Model>>, selector: string): Model {
+	const { provider, modelId } = parseOnlyModelSelector(selector);
+	const target = models[provider]?.[modelId];
+	if (!target) throw new Error(`Target model ${selector} not found in generated catalog`);
+	return target;
+}
+
+export function resolveStaticOnlyModel(selector: string): Model | undefined {
+	const { provider, modelId } = parseOnlyModelSelector(selector);
+	const spec = GITHUB_COPILOT_AUTO_STATIC_MODELS.find(
+		candidate => candidate.provider === provider && candidate.id === modelId,
+	);
+	return spec ? buildModel(spec) : undefined;
+}
+
+async function writeOnlyModel(selector: string, targetModel: Model): Promise<void> {
+	const { provider, modelId } = parseOnlyModelSelector(selector);
+	const patched = mergeOnlyModel(
+		prevModelsJson as unknown as Record<string, Record<string, Model>>,
+		provider,
+		modelId,
+		targetModel,
+	);
+	await Bun.write(path.join(packageRoot, "src/models.json"), JSON.stringify(patched, null, "\t"));
+	console.log(`Patched src/models.json with ${provider}/${modelId} (only-model)`);
+}
 
 /**
  * Local/self-hosted providers (Ollama, vLLM, LM Studio, LiteLLM). Their model
@@ -530,7 +588,14 @@ async function fetchCodexDiscoveryModels(): Promise<ModelSpec<"openai-codex-resp
 	return [...models];
 }
 
-async function generateModels() {
+async function generateModels(options: { onlyModel?: string } = {}) {
+	if (options.onlyModel) {
+		const staticTarget = resolveStaticOnlyModel(options.onlyModel);
+		if (staticTarget) {
+			await writeOnlyModel(options.onlyModel, staticTarget);
+			return;
+		}
+	}
 	// Fetch models from dynamic sources.
 	const modelsDevModels = await loadModelsDevData();
 	const catalogProviderDescriptors = PROVIDER_DESCRIPTORS.filter(
@@ -595,6 +660,7 @@ async function generateModels() {
 	// Mythos 5). Deduped behind upstream entries; metadata is pinned in
 	// applyAnthropicCatalogPolicy.
 	allModels.push(...ANTHROPIC_CURATED_FALLBACK_MODELS);
+	allModels.push(...GITHUB_COPILOT_AUTO_STATIC_MODELS);
 	// Seed GLM-5.3 on the z.AI provider. GLM-5.3 is live on the Anthropic and
 	// coding endpoints but not yet advertised in `/v1/models` (which still tops
 	// out at glm-5.2), so endpoint discovery misses it. The zai provider is not
@@ -832,6 +898,10 @@ async function generateModels() {
 	}
 
 	// Generate JSON file
+	if (options.onlyModel) {
+		await writeOnlyModel(options.onlyModel, resolveOnlyModelTarget(MODELS, options.onlyModel));
+		return;
+	}
 	await Bun.write(path.join(packageRoot, "src/models.json"), JSON.stringify(MODELS, null, "	"));
 	console.log("Generated src/models.json");
 
@@ -867,5 +937,9 @@ function canonicalizeModelCompat(model: ModelSpec<Api>): void {
 }
 
 if (import.meta.main) {
-	generateModels().catch(console.error);
+	const onlyModel = parseOnlyModelArg(Bun.argv.slice(2));
+	generateModels({ onlyModel }).catch(error => {
+		console.error(error);
+		process.exit(1);
+	});
 }

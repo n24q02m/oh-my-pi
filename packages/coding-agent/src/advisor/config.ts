@@ -32,6 +32,12 @@ export interface AdvisorConfig {
 	 * update (default `4`). Blockers are exempt from the budget.
 	 */
 	maxNotesPerUpdate?: number;
+	/** Max `severity="blocker"` cards this advisor may deliver per primary turn
+	 *  (default 1). Blockers past the budget are downgraded to `concern` instead
+	 *  of steering the primary — a flash-tier advisor mislabeling most notes as
+	 *  blockers can no longer trigger-interrupt the run every update. `null`
+	 *  disables the cap (every blocker delivered verbatim). */
+	maxBlockersPerTurn?: number | null;
 }
 
 /**
@@ -63,6 +69,7 @@ const advisorEntrySchema = type({
 	"instructions?": "string",
 	"enabled?": "boolean",
 	"maxNotesPerUpdate?": "number",
+	"maxBlockersPerTurn?": "number | null",
 });
 
 const watchdogYamlSchema = type({
@@ -196,6 +203,7 @@ export async function discoverAdvisorConfigs(cwd: string, agentDir?: string): Pr
 					entry.maxNotesPerUpdate >= 1
 						? Math.trunc(entry.maxNotesPerUpdate)
 						: undefined,
+				maxBlockersPerTurn: entry.maxBlockersPerTurn,
 			});
 		}
 	}
@@ -287,6 +295,7 @@ export async function loadWatchdogConfigFile(filePath: string): Promise<Watchdog
 		if (typeof a.maxNotesPerUpdate === "number" && Number.isFinite(a.maxNotesPerUpdate) && a.maxNotesPerUpdate >= 1) {
 			advisor.maxNotesPerUpdate = Math.trunc(a.maxNotesPerUpdate);
 		}
+		if (a.maxBlockersPerTurn !== undefined) advisor.maxBlockersPerTurn = a.maxBlockersPerTurn;
 		return advisor;
 	});
 	const doc: WatchdogConfigDoc = { advisors };
@@ -366,6 +375,8 @@ export function serializeWatchdogConfig(doc: WatchdogConfigDoc): string {
 			) {
 				lines.push(`    maxNotesPerUpdate: ${Math.trunc(advisor.maxNotesPerUpdate)}`);
 			}
+			if (advisor.maxBlockersPerTurn !== undefined)
+				lines.push(`    maxBlockersPerTurn: ${advisor.maxBlockersPerTurn}`);
 		}
 	}
 	return lines.length === 0 ? "" : `${lines.join("\n")}\n`;

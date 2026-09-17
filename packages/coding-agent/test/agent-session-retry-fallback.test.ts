@@ -298,6 +298,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				default: [
 					`${firstFallback.provider}/${firstFallback.id}`,
@@ -356,7 +357,7 @@ describe("AgentSession retry fallback", () => {
 			},
 		]);
 		expect(retryEndEvents).toHaveLength(1);
-		expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 2 });
+		expect(retryEndEvents[0]).toMatchObject({ success: true, attempt: 1 });
 		expect(fallbackSucceededEvents).toEqual([
 			{
 				type: "retry_fallback_succeeded",
@@ -407,6 +408,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				default: [`${firstFallback.provider}/${firstFallback.id}`],
 				[`${firstFallback.provider}/${firstFallback.id}`]: [`${secondFallback.provider}/${secondFallback.id}`],
@@ -506,6 +508,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
 			},
@@ -1531,6 +1534,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				slow: [`${firstFallback.provider}/${firstFallback.id}`, `${secondFallback.provider}/${secondFallback.id}`],
 			},
@@ -2071,7 +2075,7 @@ describe("AgentSession retry fallback", () => {
 
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
-			"retry.maxRetries": 1,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				[`${primaryModel.provider}/${primaryModel.id}`]: [`${fallbackModel.provider}/${fallbackModel.id}`],
 			},
@@ -2123,7 +2127,7 @@ describe("AgentSession retry fallback", () => {
 
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
-			"retry.maxRetries": 1,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				default: [`${roleChainFallback.provider}/${roleChainFallback.id}`],
 				[`${primaryModel.provider}/${primaryModel.id}`]: [`${modelKeyFallback.provider}/${modelKeyFallback.id}`],
@@ -2442,6 +2446,45 @@ describe("AgentSession retry fallback", () => {
 		expect(session.model?.id).toBe(fallbackModel.id);
 	});
 
+	it("immediately falls back on authentication failure", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel || !fallbackModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const agent = createFallbackAgent(primaryModel, requestedModels, {
+			firstError: "Unable to connect: 401 Unauthorized",
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxRetries": 3,
+			"retry.modelFallback": true,
+			"retry.fallbackChains": {
+				[`${primaryModel.provider}/${primaryModel.id}`]: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+		});
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+
+		await session.prompt("Prompt triggering fallback on authentication failure");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}`,
+		]);
+		expect(session.model?.provider).toBe(fallbackModel.provider);
+		expect(session.model?.id).toBe(fallbackModel.id);
+	});
+
 	it("applies a provider-wildcard chain to any model of that provider", async () => {
 		const primaryModel = getBundledModel("anthropic", "claude-opus-4-1");
 		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
@@ -2457,7 +2500,7 @@ describe("AgentSession retry fallback", () => {
 		// `anthropic/*` wildcard can match, proving provider-level coverage.
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
-			"retry.maxRetries": 1,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				"anthropic/*": [`${fallbackModel.provider}/${fallbackModel.id}`],
 			},
@@ -2533,6 +2576,7 @@ describe("AgentSession retry fallback", () => {
 				"anthropic/*": [`${fallbackModel.provider}/${fallbackModel.id}`],
 			},
 		});
+		const getApiKey = vi.spyOn(modelRegistry, "getApiKey");
 
 		session = new AgentSession({
 			agent,
@@ -2565,6 +2609,11 @@ describe("AgentSession retry fallback", () => {
 			},
 		]);
 		expect(session.model?.provider).toBe(fallbackModel.provider);
+		expect(
+			getApiKey.mock.calls.filter(
+				([model]) => model.provider === fallbackModel.provider && model.id === fallbackModel.id,
+			),
+		).toHaveLength(1);
 		expect(getLastAssistantMessage(session).stopReason).toBe("stop");
 	});
 	it("surfaces immutable Anthropic thinking errors without retry fallback", async () => {
@@ -2653,6 +2702,7 @@ describe("AgentSession retry fallback", () => {
 		const mock = createMockModel();
 		const requestedModels: string[] = [];
 		const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const notices: string[] = [];
 		let requestCount = 0;
 		const agent = new Agent({
 			getApiKey: model => `${model.provider}-test-key`,
@@ -2701,6 +2751,7 @@ describe("AgentSession retry fallback", () => {
 			if (event.type === "retry_fallback_applied") {
 				fallbackAppliedEvents.push(event);
 			}
+			if (event.type === "notice" && event.source === "retry-fallback") notices.push(event.message);
 		});
 
 		await session.prompt("Seed signed thinking");
@@ -2721,6 +2772,7 @@ describe("AgentSession retry fallback", () => {
 			`${primaryModel.provider}/${primaryModel.id}`,
 		]);
 		expect(fallbackAppliedEvents).toEqual([]);
+		expect(notices).toEqual([]);
 		expect(retryStartEvents).toHaveLength(1);
 		expect(retryEndEvents).toEqual([expect.objectContaining({ success: true })]);
 		expect(session.model?.id).toBe(primaryModel.id);
@@ -2794,66 +2846,78 @@ describe("AgentSession retry fallback", () => {
 		expect(getLastAssistantMessage(session).stopReason).toBe("stop");
 	});
 
-	it("surfaces a non-retryable error without same-model retries when no fallback candidate has a credential", async () => {
-		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
-		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
-		if (!primaryModel || !fallbackModel) {
-			throw new Error("Expected bundled test models to exist");
-		}
-
-		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
-		vi.spyOn(modelRegistry, "getApiKey").mockImplementation((model, sessionId) =>
-			model.provider === fallbackModel.provider ? Promise.resolve(undefined) : originalGetApiKey(model, sessionId),
-		);
-
-		const mock = createMockModel();
-		const requestedModels: string[] = [];
-		const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
-		const agent = new Agent({
-			getApiKey: model => `${model.provider}-test-key`,
-			initialState: {
-				model: primaryModel,
-				systemPrompt: ["Test"],
-				tools: [],
-				messages: [],
-			},
-			streamFn: (model, context, options) => {
-				requestedModels.push(`${model.provider}/${model.id}`);
-				mock.push({ throw: "unrecoverable model quirk" });
-				return mock.stream(model, context, options);
-			},
-		});
-
-		const settings = Settings.isolated({
-			"compaction.enabled": false,
-			"retry.baseDelayMs": 5,
-			"retry.fallbackChains": {
-				"anthropic/*": [`${fallbackModel.provider}/${fallbackModel.id}`],
-			},
-		});
-
-		session = new AgentSession({
-			agent,
-			sessionManager: SessionManager.inMemory(),
-			settings,
-			modelRegistry,
-		});
-
-		session.subscribe(event => {
-			if (event.type === "retry_fallback_applied") {
-				fallbackAppliedEvents.push(event);
+	it.each([0, 1])(
+		"surfaces a hard error when fallback auth is unavailable (keyLookupThrows=%d)",
+		async keyLookupThrows => {
+			const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+			const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+			if (!primaryModel || !fallbackModel) {
+				throw new Error("Expected bundled test models to exist");
 			}
-		});
 
-		await session.prompt("Fail hard with no fallback credential");
-		await session.waitForIdle();
+			const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+			vi.spyOn(modelRegistry, "getApiKey").mockImplementation((model, sessionId) =>
+				model.provider === fallbackModel.provider
+					? keyLookupThrows
+						? Promise.reject(new Error("credential lookup failed"))
+						: Promise.resolve(undefined)
+					: originalGetApiKey(model, sessionId),
+			);
 
-		// The switch could not happen and the error is non-retryable: surface it
-		// after a single attempt instead of backoff-retrying the failing model.
-		expect(requestedModels).toEqual([`${primaryModel.provider}/${primaryModel.id}`]);
-		expect(fallbackAppliedEvents).toEqual([]);
-		expect(getLastAssistantMessage(session).stopReason).toBe("error");
-	});
+			const mock = createMockModel();
+			const requestedModels: string[] = [];
+			const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+			const notices: string[] = [];
+			const agent = new Agent({
+				getApiKey: model => `${model.provider}-test-key`,
+				initialState: {
+					model: primaryModel,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+				streamFn: (model, context, options) => {
+					requestedModels.push(`${model.provider}/${model.id}`);
+					mock.push({ throw: "unrecoverable model quirk" });
+					return mock.stream(model, context, options);
+				},
+			});
+
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.baseDelayMs": 5,
+				"retry.fallbackChains": {
+					"anthropic/*": [`${fallbackModel.provider}/${fallbackModel.id}`],
+				},
+			});
+
+			session = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				modelRegistry,
+			});
+
+			session.subscribe(event => {
+				if (event.type === "retry_fallback_applied") {
+					fallbackAppliedEvents.push(event);
+				}
+				if (event.type === "notice" && event.source === "retry-fallback") notices.push(event.message);
+			});
+
+			await session.prompt("Fail hard with no fallback credential");
+			await session.waitForIdle();
+
+			// The switch could not happen and the error is non-retryable: surface it
+			// after a single attempt instead of backoff-retrying the failing model.
+			expect(requestedModels).toEqual([`${primaryModel.provider}/${primaryModel.id}`]);
+			expect(fallbackAppliedEvents).toEqual([]);
+			expect(notices).toEqual([
+				`Retry fallback skipped [auth-unavailable]: selector=${fallbackModel.provider}/${fallbackModel.id} from=${primaryModel.provider}/${primaryModel.id} role=anthropic/*`,
+			]);
+			expect(getLastAssistantMessage(session).stopReason).toBe("error");
+		},
+	);
 
 	it("substitutes the failing model id into provider-wildcard chain entries", async () => {
 		const primaryModel = getBundledModel("google", "gemini-2.5-flash");
@@ -2870,7 +2934,7 @@ describe("AgentSession retry fallback", () => {
 		// model's id (google/gemini-2.5-flash -> google-vertex/gemini-2.5-flash).
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
-			"retry.maxRetries": 1,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				"google/*": ["google-vertex/*"],
 			},
@@ -2924,7 +2988,7 @@ describe("AgentSession retry fallback", () => {
 		// namespace (google/gemini-2.5-flash -> openrouter/google/gemini-2.5-flash).
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
-			"retry.maxRetries": 1,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				"google/*": ["openrouter/google/*"],
 			},
@@ -2978,7 +3042,7 @@ describe("AgentSession retry fallback", () => {
 		// prefix because vertex only knows the bare id.
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
-			"retry.maxRetries": 1,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				"openrouter/google/*": ["google-vertex/*"],
 			},
@@ -3030,7 +3094,7 @@ describe("AgentSession retry fallback", () => {
 
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
-			"retry.maxRetries": 1,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
 				smol: [`${otherRoleFallbackModel.provider}/${otherRoleFallbackModel.id}`],
@@ -3415,6 +3479,7 @@ describe("AgentSession retry fallback", () => {
 
 		expect(requestedModels).toEqual([
 			`${primaryModel.provider}/${primaryModel.id}`,
+			`${primaryModel.provider}/${primaryModel.id}`,
 			`${firstFallback.provider}/${firstFallback.id}`,
 		]);
 		expect(fallbackAppliedEvents).toEqual([
@@ -3432,10 +3497,16 @@ describe("AgentSession retry fallback", () => {
 			attempt: 1,
 			finalError: refusalMessage,
 		});
-		// The superseded first attempt is aggregated onto the terminal event so
-		// the transcript renders one budget-labeled error, not per-attempt rows.
-		expect(retryEndEvents[0]?.retryErrors).toHaveLength(1);
+		// Both the same-model retry and the switch into the classifier-rejected
+		// fallback aggregate onto one terminal event.
+		expect(retryEndEvents[0]?.retryErrors).toHaveLength(2);
 		expect(retryEndEvents[0]?.retryErrors?.[0]?.retryRecovery).toMatchObject({
+			kind: "auto-retry",
+			recovery: "plain",
+			status: "superseded",
+			attempt: 1,
+		});
+		expect(retryEndEvents[0]?.retryErrors?.[1]?.retryRecovery).toMatchObject({
 			kind: "auto-retry",
 			recovery: "model",
 			status: "superseded",
@@ -3583,6 +3654,197 @@ describe("AgentSession retry fallback", () => {
 		const lastAssistant = getLastAssistantMessage(session);
 		expect(lastAssistant.stopReason).toBe("stop");
 		expect(lastAssistant.content).toContainEqual({ type: "text", text: "Recovered after Google quota retry" });
+	});
+
+	it("retries a transient rate limit on the primary before a configured fallback", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel || !fallbackModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const fallbackAppliedEvents: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const mock = createMockModel();
+		let primaryAttempts = 0;
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model: primaryModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				if (model.provider === primaryModel.provider && model.id === primaryModel.id) {
+					primaryAttempts += 1;
+					mock.push(
+						primaryAttempts === 1
+							? { throw: "rate limit exceeded retry-after-ms=25" }
+							: { content: ["Recovered on primary retry"] },
+					);
+				} else {
+					mock.push({ content: ["Unexpected fallback"] });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxRetries": 1,
+			"retry.modelFallback": true,
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") fallbackAppliedEvents.push(event);
+		});
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("Retry transient rate limit before fallback");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${primaryModel.provider}/${primaryModel.id}`,
+		]);
+		expect(waitSpy).toHaveBeenCalledWith(25, { signal: expect.any(AbortSignal) });
+		expect(fallbackAppliedEvents).toHaveLength(0);
+		expect(getLastAssistantMessage(session).content).toEqual([{ type: "text", text: "Recovered on primary retry" }]);
+	});
+
+	it("advances fallback after the primary retry budget is exhausted", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel || !fallbackModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const mock = createMockModel();
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model: primaryModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				mock.push(
+					model.provider === primaryModel.provider && model.id === primaryModel.id
+						? { throw: "rate limit exceeded retry-after-ms=25" }
+						: { content: ["Recovered on fallback after primary retries"] },
+				);
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxRetries": 1,
+			"retry.modelFallback": true,
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("Fallback only after primary retry budget is exhausted");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${fallbackModel.provider}/${fallbackModel.id}`,
+		]);
+		expect(waitSpy).toHaveBeenCalledWith(25, { signal: expect.any(AbortSignal) });
+		expect(session.model?.provider).toBe(fallbackModel.provider);
+		expect(session.model?.id).toBe(fallbackModel.id);
+	});
+
+	it("uses retry budget and backoff overrides for the active provider", async () => {
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const fallbackModel = getBundledModel("openai", "gpt-4o-mini");
+		if (!primaryModel || !fallbackModel) {
+			throw new Error("Expected bundled test models to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const mock = createMockModel();
+		let primaryAttempts = 0;
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model: primaryModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				if (model.provider === primaryModel.provider && model.id === primaryModel.id) {
+					primaryAttempts += 1;
+					mock.push(
+						primaryAttempts === 1
+							? { throw: "overloaded_error: provider returned error 503" }
+							: { content: ["Recovered with provider override"] },
+					);
+				} else {
+					mock.push({ content: ["Unexpected fallback"] });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 1,
+			"retry.maxRetries": 0,
+			"retry.maxRetriesByProvider": { [primaryModel.provider]: 1 },
+			"retry.baseDelayMsByProvider": { [primaryModel.provider]: 17 },
+			"retry.modelFallback": true,
+			"retry.fallbackChains": {
+				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		const waitSpy = vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		vi.spyOn(Math, "random").mockReturnValue(0);
+
+		await session.prompt("Use active-provider retry override");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${primaryModel.provider}/${primaryModel.id}`,
+		]);
+		expect(waitSpy).toHaveBeenCalledWith(17, { signal: expect.any(AbortSignal) });
+		expect(session.model?.provider).toBe(primaryModel.provider);
+		expect(session.model?.id).toBe(primaryModel.id);
 	});
 
 	it("keeps retry on the primary model when retry model fallback is disabled", async () => {
@@ -4354,6 +4616,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
 			},
@@ -4410,6 +4673,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
 			},
@@ -4445,6 +4709,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
 			},
@@ -4702,6 +4967,7 @@ describe("AgentSession retry fallback", () => {
 			"compaction.thresholdTokens": -1,
 			"contextPromotion.enabled": true,
 			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
 			},
@@ -4789,6 +5055,7 @@ describe("AgentSession retry fallback", () => {
 		// (80% => 3200), so the small fallback cannot legally receive the request.
 		const bigText = "lorem ipsum ".repeat(5000);
 		const requestedModels: string[] = [];
+		const notices: string[] = [];
 		const mock = createMockModel();
 		let primaryAttempts = 0;
 		const agent = new Agent({
@@ -4818,6 +5085,7 @@ describe("AgentSession retry fallback", () => {
 			"compaction.thresholdTokens": -1,
 			"contextPromotion.enabled": true,
 			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				default: [`${smallFallback.provider}/${smallFallback.id}`, `${largeFallback.provider}/${largeFallback.id}`],
 			},
@@ -4829,6 +5097,9 @@ describe("AgentSession retry fallback", () => {
 			sessionManager: SessionManager.inMemory(),
 			settings,
 			modelRegistry,
+		});
+		session.subscribe(event => {
+			if (event.type === "notice" && event.source === "retry-fallback") notices.push(event.message);
 		});
 		const now = Date.now();
 		vi.spyOn(Date, "now").mockImplementation(() => now);
@@ -4842,6 +5113,9 @@ describe("AgentSession retry fallback", () => {
 		expect(requestedModels).toContain(`${largeFallback.provider}/${largeFallback.id}`);
 		expect(session.model?.id).toBe(largeFallback.id);
 		expect(requestedModels.at(-1)).toBe(`${largeFallback.provider}/${largeFallback.id}`);
+		expect(notices).toEqual([
+			`Retry fallback skipped [context-too-large]: selector=${smallFallback.provider}/${smallFallback.id} from=${primaryModel.provider}/${primaryModel.id} role=default`,
+		]);
 	});
 
 	it("fits retry fallbacks after excluding the failed assistant turn", async () => {
@@ -4901,6 +5175,7 @@ describe("AgentSession retry fallback", () => {
 			"compaction.thresholdPercent": 80,
 			"compaction.thresholdTokens": -1,
 			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
 			},
@@ -4987,7 +5262,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 1,
-			"retry.maxRetries": 1,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				default: [`${smallFallback.provider}/${smallFallback.id}`, `${largeFallback.provider}/${largeFallback.id}`],
 			},
@@ -5058,6 +5333,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
 			},
@@ -5108,6 +5384,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				default: [`${fallbackModel.provider}/${fallbackModel.id}`],
 			},
@@ -5162,6 +5439,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				// Explicit `:high` on the fallback selector tries to raise effort
 				// above the spawn's ceiling.
@@ -5925,6 +6203,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": { default: [`${fallbackModel.provider}/${fallbackModel.id}`] },
 		});
 		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
@@ -5966,6 +6245,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": { default: [`${fallbackModel.provider}/${fallbackModel.id}`] },
 		});
 		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
@@ -6022,7 +6302,7 @@ describe("AgentSession retry fallback", () => {
 		const settings = Settings.isolated({
 			"compaction.enabled": false,
 			"retry.baseDelayMs": 5,
-			"retry.maxRetries": 1,
+			"retry.maxRetries": 0,
 			"retry.fallbackChains": {
 				default: [
 					`${firstFallback.provider}/${firstFallback.id}`,
@@ -6193,5 +6473,959 @@ describe("AgentSession retry fallback", () => {
 		expect(modelRegistry.isSelectorSuppressed(primarySelector)).toBe(false);
 		const finalAssistant = getLastAssistantMessage(session);
 		expect(finalAssistant.content).toEqual([{ type: "text", text: "Recovered on the same model." }]);
+	});
+	it("deduplicates unavailable and cooldown skip notices before continuing", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const suppressed = getBundledModel("openai", "gpt-4o-mini");
+		const compatible = getBundledModel("openai", "gpt-4o");
+		if (!primary || !suppressed || !compatible) {
+			throw new Error("Expected skip-notice test models to exist");
+		}
+		const missingSelector = "missing-provider/missing-model";
+		const suppressedSelector = `${suppressed.provider}/${suppressed.id}`;
+		modelRegistry.suppressSelector(suppressedSelector, Date.now() + 60_000);
+		const requested: string[] = [];
+		const notices: string[] = [];
+		const agent = createFallbackAgent(primary, requested, { retryAfterMs: 0 });
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.maxRetries": 0,
+			"retry.baseDelayMs": 0,
+			"retry.maxDelayMs": 0,
+			"retry.fallbackChains": {
+				default: [
+					missingSelector,
+					missingSelector,
+					suppressedSelector,
+					suppressedSelector,
+					`${compatible.provider}/${compatible.id}`,
+				],
+			},
+		});
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "notice" && event.source === "retry-fallback") notices.push(event.message);
+		});
+
+		await session.prompt("Skip duplicate ineligible routes");
+		await session.waitForIdle();
+
+		expect(requested).toEqual([`${primary.provider}/${primary.id}`, `${compatible.provider}/${compatible.id}`]);
+		expect(notices).toEqual([
+			`Retry fallback skipped [model-unavailable]: selector=${missingSelector} from=${primary.provider}/${primary.id} role=default`,
+			`Retry fallback skipped [cooldown]: selector=${suppressedSelector} from=${primary.provider}/${primary.id} role=default`,
+		]);
+	});
+
+	it("skips a candidate whose effort floor exceeds the session ceiling", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const effortIncompatible = getBundledModel("openrouter", "deepseek/deepseek-v4-pro");
+		const compatible = getBundledModel("openai", "gpt-4o-mini");
+		if (!primary || !effortIncompatible || !compatible) {
+			throw new Error("Expected effort-capability test models to exist");
+		}
+		const requested: string[] = [];
+		const notices: string[] = [];
+		const agent = createFallbackAgent(primary, requested, { retryAfterMs: 0 });
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.maxRetries": 0,
+			"retry.baseDelayMs": 0,
+			"retry.maxDelayMs": 0,
+			"retry.fallbackChains": {
+				default: [
+					`${effortIncompatible.provider}/${effortIncompatible.id}`,
+					`${compatible.provider}/${compatible.id}`,
+				],
+			},
+		});
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+			thinkingLevel: Effort.Low,
+			thinkingLevelCeiling: Effort.Low,
+		});
+		session.subscribe(event => {
+			if (event.type === "notice" && event.source === "retry-fallback") notices.push(event.message);
+		});
+
+		await session.prompt("Skip the incompatible effort floor");
+		await session.waitForIdle();
+
+		expect(requested).toEqual([`${primary.provider}/${primary.id}`, `${compatible.provider}/${compatible.id}`]);
+		expect(notices).toEqual([
+			`Retry fallback skipped [effort-ceiling-incompatible]: selector=${effortIncompatible.provider}/${effortIncompatible.id} from=${primary.provider}/${primary.id}:low role=default`,
+		]);
+	});
+
+	it("skips a tool-incompatible candidate once and continues to a tool-capable model", async () => {
+		const modelsConfigPath = path.join(tempDir.path(), "fallback-tool-capability-models.json");
+		await Bun.write(
+			modelsConfigPath,
+			JSON.stringify({
+				providers: {
+					openai: { modelOverrides: { "gpt-4o-mini": { supportsTools: false } } },
+				},
+			}),
+		);
+		modelRegistry = new ModelRegistry(authStorage, modelsConfigPath);
+		const primary = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		const toolIncompatible = modelRegistry.find("openai", "gpt-4o-mini");
+		const compatible = modelRegistry.find("openai", "gpt-4o");
+		if (!primary || !toolIncompatible || !compatible) {
+			throw new Error("Expected tool-capability test models to exist");
+		}
+		expect(toolIncompatible.supportsTools).toBe(false);
+
+		const toolSchema = type({ value: type("string") });
+		const tool: AgentTool<typeof toolSchema, { value: string }> = {
+			name: "record",
+			label: "Record",
+			description: "Record a value",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				return { content: [{ type: "text", text: params.value }], details: params };
+			},
+		};
+		const requested: string[] = [];
+		const notices: string[] = [];
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [tool], messages: [] },
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				const mock = createMockModel();
+				mock.push(
+					model.id === primary.id ? { throw: "rate limit exceeded retry-after-ms=0" } : { content: ["ok:tools"] },
+				);
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.maxRetries": 0,
+			"retry.baseDelayMs": 0,
+			"retry.maxDelayMs": 0,
+			"retry.fallbackChains": {
+				default: [`${toolIncompatible.provider}/${toolIncompatible.id}`, `${compatible.provider}/${compatible.id}`],
+			},
+		});
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "notice" && event.source === "retry-fallback") notices.push(event.message);
+		});
+
+		await session.prompt("Retry with active tools");
+		await session.waitForIdle();
+
+		expect(requested).toEqual([`${primary.provider}/${primary.id}`, `${compatible.provider}/${compatible.id}`]);
+		expect(notices).toEqual([
+			`Retry fallback skipped [tool-use-incompatible]: selector=${toolIncompatible.provider}/${toolIncompatible.id} from=${primary.provider}/${primary.id} role=default`,
+		]);
+		expect(getLastAssistantMessage(session).content).toEqual([{ type: "text", text: "ok:tools" }]);
+	});
+
+	it("skips an image-incompatible candidate once and continues to an image-capable model", async () => {
+		const primary = getBundledModel("anthropic", "claude-sonnet-4-5");
+		const imageIncompatible = getBundledModel("github-copilot", "auto");
+		const compatible = getBundledModel("openai", "gpt-4o");
+		if (!primary || !imageIncompatible || !compatible) {
+			throw new Error("Expected image-capability test models to exist");
+		}
+		expect(imageIncompatible.input).not.toContain("image");
+		expect(compatible.input).toContain("image");
+
+		const requested: string[] = [];
+		const notices: string[] = [];
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model: primary,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [
+					{
+						role: "user",
+						content: [
+							{
+								type: "image",
+								data: "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZQmcAAAAASUVORK5CYII=",
+								mimeType: "image/png",
+							},
+						],
+						timestamp: Date.now(),
+					},
+				],
+			},
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				const mock = createMockModel();
+				mock.push(
+					model.id === primary.id ? { throw: "rate limit exceeded retry-after-ms=0" } : { content: ["ok:image"] },
+				);
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.maxRetries": 0,
+			"retry.baseDelayMs": 0,
+			"retry.maxDelayMs": 0,
+			"retry.fallbackChains": {
+				default: [
+					`${imageIncompatible.provider}/${imageIncompatible.id}`,
+					`${compatible.provider}/${compatible.id}`,
+				],
+			},
+		});
+		settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "notice" && event.source === "retry-fallback") notices.push(event.message);
+		});
+
+		await session.prompt("Retry with image context");
+		await session.waitForIdle();
+
+		expect(requested).toEqual([`${primary.provider}/${primary.id}`, `${compatible.provider}/${compatible.id}`]);
+		expect(notices).toEqual([
+			`Retry fallback skipped [image-input-incompatible]: selector=${imageIncompatible.provider}/${imageIncompatible.id} from=${primary.provider}/${primary.id} role=default`,
+		]);
+		expect(getLastAssistantMessage(session).content).toEqual([{ type: "text", text: "ok:image" }]);
+	});
+
+	it("skips a previously attempted cycle target once and reaches the next chain target", async () => {
+		authStorage.setRuntimeApiKey("google-antigravity", "antigravity-test-key");
+
+		const primary = getBundledModel("openai-codex", "gpt-5.6-terra");
+		const gemini = getBundledModel("google-antigravity", "gemini-3.7-flash");
+		const sonnet = getBundledModel("google-antigravity", "claude-sonnet-4-6");
+		if (!primary || !gemini || !sonnet) {
+			throw new Error("Expected bundled cycle-chain models to exist");
+		}
+
+		const primarySelector = `${primary.provider}/${primary.id}`;
+		const geminiSelector = `${gemini.provider}/${gemini.id}`;
+		const sonnetSelector = `${sonnet.provider}/${sonnet.id}`;
+		const requested: string[] = [];
+		const notices: string[] = [];
+		const applied: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const mock = createMockModel();
+		let primaryAttempts = 0;
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				const selector = `${model.provider}/${model.id}`;
+				requested.push(selector);
+				if (selector === primarySelector && primaryAttempts++ === 0) {
+					mock.push({ throw: "rate limit exceeded retry-after-ms=0" });
+				} else if (selector === geminiSelector) {
+					mock.push({ throw: "rate limit exceeded retry-after-ms=0" });
+				} else if (selector === sonnetSelector) {
+					mock.push({ content: ["ok:sonnet"] });
+				} else {
+					mock.push({ content: ["cycle target was not skipped"] });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.maxRetries": 0,
+			"retry.baseDelayMs": 0,
+			"retry.maxDelayMs": 0,
+			"retry.modelFallback": true,
+			"retry.fallbackChains": {
+				"openai-codex/*": [geminiSelector],
+				[geminiSelector]: [primarySelector, sonnetSelector],
+			},
+		});
+		settings.setModelRole("default", primarySelector);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") applied.push(event);
+			if (event.type === "notice" && event.source === "retry-fallback") notices.push(event.message);
+		});
+
+		await session.prompt("Traverse a cycle without revisiting the primary");
+		await session.waitForIdle();
+
+		expect(requested).toEqual([primarySelector, geminiSelector, sonnetSelector]);
+		expect(applied.map(event => event.to)).toEqual([geminiSelector, sonnetSelector]);
+		expect(notices).toEqual([
+			`Retry fallback skipped [already-attempted]: selector=${primarySelector} from=${geminiSelector} role=${geminiSelector}`,
+		]);
+		expect(getLastAssistantMessage(session).content).toEqual([{ type: "text", text: "ok:sonnet" }]);
+	});
+
+	it.each([0, 1])(
+		"traverses the seven-node chain after each model exhausts its retry budget (maxRetries=%d)",
+		async maxRetries => {
+			authStorage.setRuntimeApiKey("google-antigravity", "antigravity-test-key");
+			authStorage.setRuntimeApiKey("opencode-zen", "opencode-test-key");
+			authStorage.setRuntimeApiKey("github-copilot", "copilot-test-key");
+			authStorage.setRuntimeApiKey("cursor", "cursor-test-key");
+
+			const primary = getBundledModel("openai-codex", "gpt-5.6-terra");
+			const gemini = getBundledModel("google-antigravity", "gemini-3.7-flash");
+			const sonnet = getBundledModel("google-antigravity", "claude-sonnet-4-6");
+			const muse = getBundledModel("opencode-zen", "muse-spark-1.2-contributor-free");
+			const glm = getBundledModel("openrouter", "z-ai/glm-5.2:free");
+			const copilotAuto = getBundledModel("github-copilot", "auto");
+			const cursorDefault = getBundledModel("cursor", "default");
+			if (!primary || !gemini || !sonnet || !muse || !glm || !copilotAuto || !cursorDefault) {
+				throw new Error("Expected bundled seven-node chain models to exist");
+			}
+
+			const chain = [
+				`${gemini.provider}/${gemini.id}`,
+				`${sonnet.provider}/${sonnet.id}`,
+				`${muse.provider}/${muse.id}`,
+				`${glm.provider}/${glm.id}`,
+				`${copilotAuto.provider}/${copilotAuto.id}`,
+				`${cursorDefault.provider}/${cursorDefault.id}`,
+			];
+			const requested: string[] = [];
+			const applied: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+			const retryEnds: AutoRetryEndEvent[] = [];
+			const eventTrace: string[] = [];
+			const succeeded: Array<Extract<AgentSessionEvent, { type: "retry_fallback_succeeded" }>> = [];
+			const mock = createMockModel();
+			let nowMs = 1_000;
+			vi.spyOn(Date, "now").mockImplementation(() => nowMs);
+			const agent = new Agent({
+				getApiKey: model => `${model.provider}-test-key`,
+				initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (model, context, options) => {
+					const selector = `${model.provider}/${model.id}`;
+					requested.push(selector);
+					eventTrace.push(`request:${selector}`);
+					if (selector === `${sonnet.provider}/${sonnet.id}`) nowMs += 2;
+					if (selector === `${cursorDefault.provider}/${cursorDefault.id}`) {
+						mock.push({ content: ["ok:cursor"] });
+					} else {
+						mock.push({ throw: `rate limit exceeded for ${selector} retry-after-ms=1` });
+					}
+					return mock.stream(model, context, options);
+				},
+			});
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.enabled": true,
+				"retry.maxRetries": maxRetries,
+				"retry.baseDelayMs": 0,
+				"retry.maxDelayMs": 0,
+				"retry.modelFallback": true,
+				"retry.fallbackChains": { "openai-codex/*": chain },
+			});
+			settings.setModelRole("default", `${primary.provider}/${primary.id}`);
+			session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+			session.subscribe(event => {
+				if (event.type === "retry_fallback_applied") {
+					applied.push(event);
+					eventTrace.push(`applied:${event.to}`);
+				}
+				if (event.type === "retry_fallback_succeeded") {
+					succeeded.push(event);
+					eventTrace.push(`succeeded:${event.model}`);
+				}
+				if (event.type === "auto_retry_end") {
+					retryEnds.push(event);
+					eventTrace.push(`end:${event.success}`);
+				}
+			});
+			vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+			await session.prompt("Trigger seven-node fallback");
+			await session.waitForIdle();
+
+			const expectedRequests = [
+				...Array.from({ length: maxRetries + 1 }, () => `${primary.provider}/${primary.id}`),
+				...chain.flatMap((selector, index) =>
+					index === chain.length - 1 ? [selector] : Array.from({ length: maxRetries + 1 }, () => selector),
+				),
+			];
+			expect(requested).toEqual(expectedRequests);
+			expect(applied).toHaveLength(6);
+			expect(applied.map(event => event.to)).toEqual(chain);
+			expect(applied.map(event => event.from)).toEqual([`${primary.provider}/${primary.id}`, ...chain.slice(0, -1)]);
+			expect(succeeded).toHaveLength(1);
+			expect(succeeded[0].model).toBe(`${cursorDefault.provider}/${cursorDefault.id}`);
+			expect(retryEnds).toEqual([expect.objectContaining({ success: true })]);
+			expect(eventTrace.indexOf("end:true")).toBeGreaterThan(
+				eventTrace.indexOf(`request:${cursorDefault.provider}/${cursorDefault.id}`),
+			);
+			expect(eventTrace).not.toContain("end:false");
+			expect(getLastAssistantMessage(session).content).toEqual([{ type: "text", text: "ok:cursor" }]);
+		},
+	);
+	it("gives the terminal fallback its provider retry budget", async () => {
+		authStorage.setRuntimeApiKey("google-antigravity", "antigravity-test-key");
+		authStorage.setRuntimeApiKey("opencode-zen", "opencode-test-key");
+		authStorage.setRuntimeApiKey("github-copilot", "copilot-test-key");
+		authStorage.setRuntimeApiKey("cursor", "cursor-test-key");
+
+		const primary = getBundledModel("openai-codex", "gpt-5.6-terra");
+		const gemini = getBundledModel("google-antigravity", "gemini-3.7-flash");
+		const sonnet = getBundledModel("google-antigravity", "claude-sonnet-4-6");
+		const muse = getBundledModel("opencode-zen", "muse-spark-1.2-contributor-free");
+		const glm = getBundledModel("openrouter", "z-ai/glm-5.2:free");
+		const copilotAuto = getBundledModel("github-copilot", "auto");
+		const cursorDefault = getBundledModel("cursor", "default");
+		if (!primary || !gemini || !sonnet || !muse || !glm || !copilotAuto || !cursorDefault) {
+			throw new Error("Expected bundled terminal-fallback test models to exist");
+		}
+
+		const primarySelector = `${primary.provider}/${primary.id}`;
+		const cursorSelector = `${cursorDefault.provider}/${cursorDefault.id}`;
+		const chain = [
+			`${gemini.provider}/${gemini.id}`,
+			`${sonnet.provider}/${sonnet.id}`,
+			`${muse.provider}/${muse.id}`,
+			`${glm.provider}/${glm.id}`,
+			`${copilotAuto.provider}/${copilotAuto.id}`,
+			cursorSelector,
+		];
+		const requested: string[] = [];
+		const applied: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const retryEnds: AutoRetryEndEvent[] = [];
+		const mock = createMockModel();
+		let cursorAttempts = 0;
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				const selector = `${model.provider}/${model.id}`;
+				requested.push(selector);
+				if (selector === cursorSelector && cursorAttempts++ === 0) {
+					mock.push({ throw: `rate limit exceeded for ${selector} retry-after-ms=0` });
+				} else if (selector === cursorSelector) {
+					mock.push({ content: ["ok:cursor-after-retry"] });
+				} else {
+					mock.push({ throw: `rate limit exceeded for ${selector} retry-after-ms=0` });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.maxRetries": 0,
+			"retry.maxRetriesByProvider": { [cursorDefault.provider]: 1 },
+			"retry.baseDelayMs": 0,
+			"retry.maxDelayMs": 0,
+			"retry.modelFallback": true,
+			"retry.fallbackChains": { "openai-codex/*": chain },
+		});
+		settings.setModelRole("default", primarySelector);
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") applied.push(event);
+			if (event.type === "auto_retry_end") retryEnds.push(event);
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("Retry the terminal fallback once");
+		await session.waitForIdle();
+
+		expect(requested).toEqual([primarySelector, ...chain, cursorSelector]);
+		expect(applied.map(event => event.to)).toEqual(chain);
+		expect(retryEnds).toEqual([expect.objectContaining({ success: true })]);
+		expect(getLastAssistantMessage(session).content).toEqual([{ type: "text", text: "ok:cursor-after-retry" }]);
+	});
+
+	it("parks quota-exhausted provider when quotaResetDelay exceeds retry.maxDelayMs and propagates reset time to notice and error", async () => {
+		const gemini = getBundledModel("google-antigravity", "gemini-3.7-flash");
+		const sonnet = getBundledModel("google-antigravity", "claude-sonnet-4-6");
+		if (!gemini || !sonnet) {
+			throw new Error("Expected bundled gemini and sonnet models to exist");
+		}
+		const geminiSelector = `${gemini.provider}/${gemini.id}`;
+		const sonnetSelector = `${sonnet.provider}/${sonnet.id}`;
+		authStorage.setRuntimeApiKey("google-antigravity", "antigravity-test-key");
+
+		const requested: string[] = [];
+		const applied: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const notices: string[] = [];
+		const retryEnds: AutoRetryEndEvent[] = [];
+		const mock = createMockModel();
+
+		// Fixed reference time for deterministic ISO assertions
+		// 2026-09-02T11:50:00.000Z + 51h59m = 2026-09-04T15:49:00.000Z
+		const fixedNow = Date.parse("2026-09-02T11:50:00.000Z");
+		vi.spyOn(Date, "now").mockReturnValue(fixedNow);
+
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: gemini, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				const selector = `${model.provider}/${model.id}`;
+				requested.push(selector);
+				if (selector === geminiSelector) {
+					mock.push({
+						throw: 'Google 429 RESOURCE_EXHAUSTED with "quotaResetDelay": "51h59m"',
+					});
+				} else if (selector === sonnetSelector) {
+					mock.push({ content: ["ok:sonnet"] });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.maxRetries": 2,
+			"retry.baseDelayMs": 1000,
+			"retry.maxDelayMs": 300_000, // 5 minutes < 51h59m
+			"retry.modelFallback": true,
+			"retry.fallbackChains": {
+				[geminiSelector]: [sonnetSelector],
+			},
+		});
+		settings.setModelRole("default", geminiSelector);
+
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") applied.push(event);
+			if (event.type === "notice") notices.push(event.message);
+			if (event.type === "auto_retry_end") retryEnds.push(event);
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("Trigger quotaResetDelay parking");
+		await session.waitForIdle();
+
+		// 1. Gemini was called once, not retried repeatedly
+		expect(requested).toEqual([geminiSelector, sonnetSelector]);
+		// 2. Fallback applied to sonnet
+		expect(applied.map(event => event.to)).toEqual([sonnetSelector]);
+		// 3. User notice emitted with concrete ISO reset timestamp
+		expect(notices).toContain("gemini-3.7-flash parked until 2026-09-04T15:49Z");
+		// 4. Gemini is suppressed (parked) in model registry
+		expect(modelRegistry.isSelectorSuppressed(geminiSelector)).toBe(true);
+		expect(modelRegistry.getSelectorSuppressedUntil(geminiSelector)).toBe(fixedNow + (51 * 60 + 59) * 60_000);
+		// 5. Turn completed on sonnet
+		expect(getLastAssistantMessage(session).content).toEqual([{ type: "text", text: "ok:sonnet" }]);
+
+		// Subsequent turn: gemini remains parked and is skipped by fallback traversals
+		await session.prompt("Subsequent turn while gemini is parked");
+		await session.waitForIdle();
+		// Stays on sonnet, does not attempt gemini
+		expect(requested).toEqual([geminiSelector, sonnetSelector, sonnetSelector]);
+	});
+
+	it("parks quota-exhausted provider and surfaces reset time in terminal error when no fallback is available", async () => {
+		const gemini = getBundledModel("google-antigravity", "gemini-3.7-flash");
+		if (!gemini) throw new Error("Expected gemini model");
+		const geminiSelector = `${gemini.provider}/${gemini.id}`;
+		authStorage.setRuntimeApiKey("google-antigravity", "antigravity-test-key");
+
+		const requested: string[] = [];
+		const notices: string[] = [];
+		const retryEnds: AutoRetryEndEvent[] = [];
+		const mock = createMockModel();
+
+		const fixedNow = Date.parse("2026-09-02T11:50:00.000Z");
+		vi.spyOn(Date, "now").mockReturnValue(fixedNow);
+
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: gemini, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				mock.push({
+					throw: 'Google 429 RESOURCE_EXHAUSTED with "quotaResetDelay": "51h59m"',
+				});
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.maxRetries": 2,
+			"retry.baseDelayMs": 1000,
+			"retry.maxDelayMs": 300_000,
+			"retry.modelFallback": false, // No fallback
+		});
+		settings.setModelRole("default", geminiSelector);
+
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+			if (event.type === "auto_retry_end") retryEnds.push(event);
+		});
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+
+		await session.prompt("Trigger fail-fast parking without fallback");
+		await session.waitForIdle();
+
+		// Gemini was attempted once, fail-fast triggered without immediate retry
+		expect(requested).toEqual([geminiSelector]);
+		// Parked notice emitted
+		expect(notices).toContain("gemini-3.7-flash parked until 2026-09-04T15:49Z");
+		// Node is parked in registry
+		expect(modelRegistry.isSelectorSuppressed(geminiSelector)).toBe(true);
+		// auto_retry_end emitted with finalError containing parked reset time
+		expect(retryEnds).toHaveLength(1);
+		expect(retryEnds[0].success).toBe(false);
+		expect(retryEnds[0].finalError).toContain("gemini-3.7-flash parked until 2026-09-04T15:49Z");
+	});
+
+	it("skips credential-less fallback nodes during traversal and continues to subsequent candidates", async () => {
+		const primary = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		const credentialLess = modelRegistry.find("openai", "gpt-4o-mini");
+		const validFallback = modelRegistry.find("openai", "gpt-4o");
+		if (!primary || !credentialLess || !validFallback) {
+			throw new Error("Expected test models to resolve");
+		}
+
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId) => {
+			if (model.provider === credentialLess.provider && model.id === credentialLess.id) {
+				return undefined; // no credentials
+			}
+			if (model.provider === validFallback.provider && model.id === validFallback.id) {
+				return "valid-openai-key";
+			}
+			return originalGetApiKey(model, sessionId);
+		});
+
+		const requested: string[] = [];
+		const fallbackApplied: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const notices: string[] = [];
+		const mock = createMockModel();
+
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				if (model.id === primary.id) {
+					mock.push({ throw: "unrecoverable primary error" });
+				} else {
+					mock.push({ content: ["ok:valid-fallback"] });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const primarySelector = `${primary.provider}/${primary.id}`;
+		const credLessSelector = `${credentialLess.provider}/${credentialLess.id}`;
+		const validSelector = `${validFallback.provider}/${validFallback.id}`;
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				[primarySelector]: [credLessSelector, validSelector],
+			},
+		});
+		settings.setModelRole("default", primarySelector);
+
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+			if (event.type === "retry_fallback_applied") fallbackApplied.push(event);
+		});
+
+		await session.prompt("Run fallback with credential-less node in chain");
+		await session.waitForIdle();
+
+		// 1. Primary was called and failed
+		expect(requested).toContain(primarySelector);
+		// 2. Credential-less node was skipped with notice, not invoked
+		expect(requested).not.toContain(credLessSelector);
+		expect(notices).toContain(
+			`Retry fallback skipped [auth-unavailable]: selector=${credLessSelector} from=${primarySelector} role=${primarySelector}`,
+		);
+		// 3. Fallback continued to validSelector and succeeded
+		expect(fallbackApplied).toEqual([
+			{
+				type: "retry_fallback_applied",
+				from: primarySelector,
+				to: validSelector,
+				role: primarySelector,
+			},
+		]);
+		expect(requested).toContain(validSelector);
+		expect(getLastAssistantMessage(session).content).toEqual([{ type: "text", text: "ok:valid-fallback" }]);
+	});
+
+	it("enumerates all skip reasons in the aggregated error when a fallback chain is exhausted", async () => {
+		const primary = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		const credLess = modelRegistry.find("openai", "gpt-4o-mini");
+		const parked = modelRegistry.find("openai", "gpt-4o");
+		if (!primary || !credLess || !parked) {
+			throw new Error("Expected test models to resolve");
+		}
+
+		const fixedUntil = Math.floor((Date.now() + 10 * 60 * 1000) / 60000) * 60000;
+		const parkedUntilMinute = `${new Date(fixedUntil).toISOString().slice(0, 16)}Z`;
+		const parkedSelector = `${parked.provider}/${parked.id}`;
+		modelRegistry.suppressSelector(parkedSelector, fixedUntil);
+
+		const originalGetApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (model, sessionId) => {
+			if (model.id === credLess.id) {
+				return undefined; // no credentials
+			}
+			return originalGetApiKey(model, sessionId);
+		});
+
+		const requested: string[] = [];
+		const notices: string[] = [];
+		const retryEnds: Array<Extract<AgentSessionEvent, { type: "auto_retry_end" }>> = [];
+		const mock = createMockModel();
+
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				mock.push({ throw: "fatal unrecoverable primary fault" });
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const primarySelector = `${primary.provider}/${primary.id}`;
+		const credLessSelector = `${credLess.provider}/${credLess.id}`;
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				[primarySelector]: [credLessSelector, parkedSelector],
+			},
+		});
+		settings.setModelRole("default", primarySelector);
+
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "notice") notices.push(event.message);
+			if (event.type === "auto_retry_end") retryEnds.push(event);
+		});
+
+		await session.prompt("Run fallback when all nodes in chain are skipped");
+		await session.waitForIdle();
+
+		// Primary failed
+		expect(requested).toEqual([primarySelector]);
+		// Notices for both skipped nodes
+		expect(notices).toContain(
+			`Retry fallback skipped [auth-unavailable]: selector=${credLessSelector} from=${primarySelector} role=${primarySelector}`,
+		);
+		expect(notices).toContain(
+			`Retry fallback skipped [cooldown]: selector=${parkedSelector} from=${primarySelector} role=${primarySelector}`,
+		);
+		// Chain exhausted, terminal error aggregates skip reasons
+		const lastMessage = getLastAssistantMessage(session);
+		expect(lastMessage.stopReason).toBe("error");
+		expect(lastMessage.errorMessage).toContain("Fallback chain exhausted:");
+		expect(lastMessage.errorMessage).toContain(`${credLessSelector} (no-credentials)`);
+		expect(lastMessage.errorMessage).toContain(`${parkedSelector} (quota-exhausted-until ${parkedUntilMinute})`);
+		expect(lastMessage.errorMessage).toContain("fatal unrecoverable primary fault");
+	});
+	it("labels previously attempted candidates in exhausted fallback summaries", async () => {
+		const primary = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		const intermediate = modelRegistry.find("openai", "gpt-4o-mini");
+		if (!primary || !intermediate) {
+			throw new Error("Expected test models to resolve");
+		}
+
+		const primarySelector = `${primary.provider}/${primary.id}`;
+		const intermediateSelector = `${intermediate.provider}/${intermediate.id}`;
+		const requested: string[] = [];
+		const notices: string[] = [];
+		const mock = createMockModel();
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: primary, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				mock.push({ throw: "fatal unrecoverable fallback fault" });
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.maxRetries": 0,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				[primarySelector]: [intermediateSelector],
+				[intermediateSelector]: [primarySelector],
+			},
+		});
+		settings.setModelRole("default", primarySelector);
+
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "notice" && event.source === "retry-fallback") notices.push(event.message);
+		});
+
+		await session.prompt("Exhaust a cycle without mislabeling skipped candidates");
+		await session.waitForIdle();
+
+		expect(requested).toEqual([primarySelector, intermediateSelector]);
+		expect(notices).toContain(
+			`Retry fallback skipped [already-attempted]: selector=${primarySelector} from=${intermediateSelector} role=${intermediateSelector}`,
+		);
+		const lastMessage = getLastAssistantMessage(session);
+		expect(lastMessage.stopReason).toBe("error");
+		expect(lastMessage.errorMessage).toContain(`${primarySelector} (already-attempted)`);
+	});
+
+
+	it("hops from chat-exhausted Luna to gpt-reserve when reserve meter is available", async () => {
+		const luna =
+			modelRegistry.find("openai-codex", "gpt-5.6-luna") ?? modelRegistry.find("openai-codex", "gpt-5.6-sol");
+		const externalFallback = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!luna || !externalFallback) {
+			throw new Error("Expected test models to resolve");
+		}
+
+		vi.spyOn(modelRegistry.authStorage, "hasCodexLunaReserveCapacity").mockResolvedValue(true);
+		vi.spyOn(modelRegistry.authStorage, "getModelUsageHealth").mockImplementation(async () => ({
+			state: "healthy",
+			accounts: [],
+		}));
+		vi.spyOn(modelRegistry.authStorage, "markUsageLimitReached").mockResolvedValue({ switched: false });
+		vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const requested: string[] = [];
+		const fallbackApplied: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const mock = createMockModel();
+
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: luna, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				if (model.id === luna.id) {
+					mock.push({ throw: "429 usage_limit_reached" });
+				} else {
+					mock.push({ content: ["ok:luna-reserve"] });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const lunaSelector = `${luna.provider}/${luna.id}`;
+		const externalSelector = `${externalFallback.provider}/${externalFallback.id}`;
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				"openai-codex/*": [externalSelector],
+			},
+		});
+		settings.setModelRole("default", lunaSelector);
+
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") fallbackApplied.push(event);
+		});
+		await session.prompt("Trigger Luna Reserve hop");
+		await session.waitForIdle();
+
+		// 1. Primary was called and hit usage limit
+		expect(requested).toContain(lunaSelector);
+		// 2. Hopped to gpt-reserve rather than external provider
+		expect(fallbackApplied).toEqual([
+			{
+				type: "retry_fallback_applied",
+				from: lunaSelector,
+				to: "openai-codex/gpt-reserve",
+				role: "openai-codex/*",
+			},
+		]);
+		expect(requested).toContain("openai-codex/gpt-reserve");
+		expect(requested).not.toContain(externalSelector);
+		expect(getLastAssistantMessage(session).content).toEqual([{ type: "text", text: "ok:luna-reserve" }]);
+	});
+
+	it("preserves normal fallback when Luna reserve meter is absent or exhausted", async () => {
+		const luna =
+			modelRegistry.find("openai-codex", "gpt-5.6-luna") ?? modelRegistry.find("openai-codex", "gpt-5.6-sol");
+		const externalFallback = modelRegistry.find("anthropic", "claude-sonnet-4-5");
+		if (!luna || !externalFallback) {
+			throw new Error("Expected test models to resolve");
+		}
+
+		// Reserve absent or exhausted
+		vi.spyOn(modelRegistry.authStorage, "hasCodexLunaReserveCapacity").mockResolvedValue(false);
+		vi.spyOn(modelRegistry.authStorage, "getModelUsageHealth").mockImplementation(async () => ({
+			state: "healthy",
+			accounts: [],
+		}));
+		vi.spyOn(modelRegistry.authStorage, "markUsageLimitReached").mockResolvedValue({ switched: false });
+		vi.spyOn(modelRegistry, "getApiKey").mockResolvedValue("test-key");
+		vi.spyOn(scheduler, "wait").mockResolvedValue(undefined);
+		const requested: string[] = [];
+		const fallbackApplied: Array<Extract<AgentSessionEvent, { type: "retry_fallback_applied" }>> = [];
+		const mock = createMockModel();
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: { model: luna, systemPrompt: ["Test"], tools: [], messages: [] },
+			streamFn: (model, context, options) => {
+				requested.push(`${model.provider}/${model.id}`);
+				if (model.id === luna.id) {
+					mock.push({ throw: "429 usage_limit_reached" });
+				} else {
+					mock.push({ content: ["ok:external-fallback"] });
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const lunaSelector = `${luna.provider}/${luna.id}`;
+		const externalSelector = `${externalFallback.provider}/${externalFallback.id}`;
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.enabled": true,
+			"retry.baseDelayMs": 5,
+			"retry.fallbackChains": {
+				"openai-codex/*": [externalSelector],
+			},
+		});
+		settings.setModelRole("default", lunaSelector);
+
+		session = new AgentSession({ agent, sessionManager: SessionManager.inMemory(), settings, modelRegistry });
+		session.subscribe(event => {
+			if (event.type === "retry_fallback_applied") fallbackApplied.push(event);
+		});
+
+		await session.prompt("Trigger standard fallback without reserve");
+		await session.waitForIdle();
+
+		// 1. Primary was called and hit usage limit
+		expect(requested).toContain(lunaSelector);
+		// 2. Normal fallback chain was used (external provider)
+		expect(fallbackApplied).toEqual([
+			{
+				type: "retry_fallback_applied",
+				from: lunaSelector,
+				to: externalSelector,
+				role: "openai-codex/*",
+			},
+		]);
+		expect(requested).toContain(externalSelector);
+		expect(requested).not.toContain("openai-codex/gpt-reserve");
+		expect(getLastAssistantMessage(session).content).toEqual([{ type: "text", text: "ok:external-fallback" }]);
 	});
 });

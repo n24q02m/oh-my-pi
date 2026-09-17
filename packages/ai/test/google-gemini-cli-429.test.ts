@@ -72,6 +72,17 @@ describe("extractRetryHint – body text parsing", () => {
 		expect(extractRetryHint(undefined, "Your quota will reset after 1h30m10s")).toBe(5_410_000);
 	});
 
+	it("parses 'quotaResetDelay' without seconds '51h59m'", () => {
+		const expectedMs = (51 * 60 + 59) * 60_000;
+		expect(extractRetryHint(undefined, 'Google 429 RESOURCE_EXHAUSTED with "quotaResetDelay": "51h59m"')).toBe(
+			expectedMs,
+		);
+		expect(extractRetryHint(undefined, "Google 429 RESOURCE_EXHAUSTED with quotaResetDelay of 51h59m")).toBe(
+			expectedMs,
+		);
+		expect(extractRetryHint(undefined, "Your quota will reset after 51h59m")).toBe(expectedMs);
+	});
+
 	it("parses Codex-style 'try again in Xms'", () => {
 		expect(extractRetryHint(undefined, "try again in 250ms")).toBe(250);
 	});

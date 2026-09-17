@@ -86,8 +86,26 @@ const HTTP2_STREAM_RESET_ERROR_RE =
 // continuation on resolved tool turns.
 const PREMATURE_STREAM_CLOSE_ERROR_RE =
 	/(?:stream closed before a (?:finish_reason|terminal response event)|Codex stream ended before terminal completion event)/i;
+
+export function formatParkedUntilIso(untilMs: number): string {
+	const d = new Date(untilMs);
+	if (d.getUTCSeconds() === 0 && d.getUTCMilliseconds() === 0) {
+		return `${d.toISOString().slice(0, 16)}Z`;
+	}
+	return d.toISOString().replace(/\.\d{3}Z$/, "Z");
+}
 const IMMUTABLE_ANTHROPIC_THINKING_ERROR_PATTERN =
 	/messages\.\d+\.content\.\d+.*\b(?:thinking|redacted_thinking)\b.*\blatest assistant message cannot be modified\b/is;
+
+function resolveProviderRetrySetting(
+	overrides: Record<string, number>,
+	provider: string | undefined,
+	fallback: number,
+): number {
+	const override = provider === undefined ? undefined : overrides[provider];
+	if (typeof override !== "number" || !Number.isFinite(override) || override < 0) return fallback;
+	return override;
+}
 
 function hasNonWhitespace(value: string): boolean {
 	return NON_WHITESPACE_RE.test(value);
@@ -258,11 +276,24 @@ type UsageLimitOutcome = {
 	reportResetAtMs: number | undefined;
 };
 
+type RetryFallbackSkipReason =
+	| "already-attempted"
+	| "auth-unavailable"
+	| "no-credentials"
+	| "context-too-large"
+	| "cooldown"
+	| "effort-ceiling-incompatible"
+	| "image-input-incompatible"
+	| "model-unavailable"
+	| "signed-anthropic-thinking-incompatible"
+	| "tool-use-incompatible";
+
 /** Owns terminal-stop recovery, automatic retries, and fallback routing. */
 export class TurnRecovery {
 	readonly #host: TurnRecoveryHost;
 	#retryAbortController: AbortController | undefined;
 	#retryAttempt = 0;
+	#sameModelRetryAttempt = 0;
 	#retryPromise: Promise<void> | undefined;
 	#retryResolve: (() => void) | undefined;
 	#activeRetryFallback: ActiveRetryFallbackState | undefined;
@@ -308,6 +339,15 @@ export class TurnRecovery {
 	#fallbackChainWarnings = new Set<string>();
 	/** Whether startup validation deferred any warning pending in-flight discovery (#10048). */
 	#pendingDiscoveryDeferredValidation = false;
+	#retryFallbackSkipNoticeGeneration = -1;
+	#retryFallbackSkipNotices = new Set<string>();
+	/**
+	 * Candidates examined while recovering one prompt. This cursor is independent
+	 * of cooldown expiry and same-model retry accounting, so a short-lived 429
+	 * cannot reopen an earlier node in a finite configured chain.
+	 */
+	#retryFallbackTraversal: { generation: number; selectors: Set<string> } | undefined;
+	#lastFallbackChainSummary: string | undefined;
 
 	constructor(host: TurnRecoveryHost, options: TurnRecoveryOptions = {}) {
 		this.#host = host;
@@ -327,6 +367,11 @@ export class TurnRecovery {
 		return this.#retryAttempt;
 	}
 
+	#resetRetryAttempts(): void {
+		this.#retryAttempt = 0;
+		this.#sameModelRetryAttempt = 0;
+	}
+
 	/** Promise settled when the active retry saga finishes. */
 	get retryPromise(): Promise<void> | undefined {
 		return this.#retryPromise;
@@ -341,6 +386,50 @@ export class TurnRecovery {
 
 	#markFallbackRouted(): void {
 		this.#fallbackRoutedFor = this.#host.sessionManager.getSessionId();
+	}
+
+	#retryFallbackTraversalSelectors(): Set<string> {
+		const generation = this.#host.promptGeneration();
+		if (this.#retryFallbackTraversal?.generation === generation) {
+			return this.#retryFallbackTraversal.selectors;
+		}
+		const selectors = new Set<string>();
+		this.#retryFallbackTraversal = { generation, selectors };
+		return selectors;
+	}
+
+	#retryFallbackTraversalKey(selector: RetryFallbackSelector): string {
+		return `${selector.provider}/${selector.id}`;
+	}
+
+	#hasTraversedRetryFallbackSelector(selector: RetryFallbackSelector): boolean {
+		const traversal = this.#retryFallbackTraversal;
+		return (
+			traversal?.generation === this.#host.promptGeneration() &&
+			traversal.selectors.has(this.#retryFallbackTraversalKey(selector))
+		);
+	}
+
+	async #emitRetryFallbackSkipNotice(params: {
+		selector: RetryFallbackSelector;
+		reason: RetryFallbackSkipReason;
+		role: string;
+		from: string;
+	}): Promise<void> {
+		const generation = this.#host.promptGeneration();
+		if (this.#retryFallbackSkipNoticeGeneration !== generation) {
+			this.#retryFallbackSkipNotices.clear();
+			this.#retryFallbackSkipNoticeGeneration = generation;
+		}
+		const key = `${params.selector.raw}\0${params.reason}`;
+		if (this.#retryFallbackSkipNotices.has(key)) return;
+		this.#retryFallbackSkipNotices.add(key);
+		await this.#host.emitSessionEvent({
+			type: "notice",
+			level: "info",
+			source: "retry-fallback",
+			message: `Retry fallback skipped [${params.reason}]: selector=${params.selector.raw} from=${params.from} role=${params.role}`,
+		});
 	}
 
 	/**
@@ -377,6 +466,11 @@ export class TurnRecovery {
 		return value;
 	}
 
+	/** Details of all skipped nodes when a fallback chain was traversed and exhausted. */
+	get lastFallbackChainSummary(): string | undefined {
+		return this.#lastFallbackChainSummary;
+	}
+
 	/**
 	 * Carries attribution onto a new session id that continues this conversation.
 	 *
@@ -400,12 +494,15 @@ export class TurnRecovery {
 		}
 	}
 
-	/** Resets per-prompt recovery counters and terminal-stop acceptance. */
+	/** Resets per-prompt recovery counters, traversal state, and terminal-stop acceptance. */
 	resetForNewPrompt(): void {
 		this.#emptyStopRetryCount = 0;
 		this.#unexpectedStopRetryCount = 0;
 		this.#malformedFunctionCallRetryCount = 0;
 		this.#acceptTerminalEmptyStopForPrompt = false;
+		this.#retryFallbackTraversal = undefined;
+		this.#retryFallbackSkipNoticeGeneration = -1;
+		this.#retryFallbackSkipNotices.clear();
 	}
 
 	/** Sets whether one terminal empty stop is accepted for the current prompt. */
@@ -462,7 +559,7 @@ export class TurnRecovery {
 			retryErrors,
 		});
 		this.#clearPendingRetryErrors();
-		this.#retryAttempt = 0;
+		this.#resetRetryAttempts();
 		this.resolveRetry();
 	}
 
@@ -470,7 +567,7 @@ export class TurnRecovery {
 	async onErrorSettledWithoutRetry(message: AssistantMessage, compaction: RecoveryCompactionResult): Promise<void> {
 		if (message.stopReason !== "error" || this.#retryAttempt === 0 || compaction.continuationScheduled) return;
 		const attempt = this.#retryAttempt;
-		this.#retryAttempt = 0;
+		this.#resetRetryAttempts();
 		await this.#host.emitSessionEvent({
 			type: "auto_retry_end",
 			success: false,
@@ -867,7 +964,7 @@ export class TurnRecovery {
 				finalError,
 			});
 			this.#clearPendingRetryErrors();
-			this.#retryAttempt = 0;
+			this.#resetRetryAttempts();
 			this.resolveRetry();
 			// A turn with no actionable output carries no transcript value, while its
 			// provider usage can anchor the next prompt at the full failed-request size
@@ -1535,7 +1632,75 @@ export class TurnRecovery {
 			const reason = parseRateLimitReason(errorMessage);
 			cooldownMs = reason === "UNKNOWN" ? 5 * 60 * 1000 : calculateRateLimitBackoffMs(reason);
 		}
-		this.#host.modelRegistry.suppressSelector(currentSelector, Date.now() + cooldownMs);
+		const untilMs = Date.now() + cooldownMs;
+		this.#host.modelRegistry.suppressSelector(currentSelector, untilMs);
+
+		const maxDelayMs = this.#host.settings.get("retry.maxDelayMs");
+		if (retryAfterMs !== undefined && maxDelayMs > 0 && cooldownMs > maxDelayMs) {
+			const resetTimeIso = formatParkedUntilIso(untilMs);
+			const modelLabel = currentSelector.split("/").pop() ?? currentSelector;
+			void this.#host.emitSessionEvent({
+				type: "notice",
+				level: "warning",
+				source: "retry-fallback",
+				message: `${modelLabel} parked until ${resetTimeIso}`,
+			});
+		}
+	}
+
+	/**
+	 * When the active model is parked on cooldown, advance to an available fallback candidate
+	 * or surface the parked notice if no candidate is available.
+	 */
+	async maybeAdvanceSuppressedActiveModel(): Promise<boolean> {
+		const currentModel = this.#host.model();
+		if (!currentModel) return false;
+		const currentSelector = formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel());
+		const parsed = parseRetryFallbackSelector(currentSelector, this.#host.modelRegistry);
+		if (!parsed || !this.isRetryFallbackSelectorSuppressed(parsed)) return false;
+
+		const untilMs = this.#host.modelRegistry.getSelectorSuppressedUntil(currentSelector);
+		if (!untilMs) return false;
+		const maxDelayMs = this.#host.settings.get("retry.maxDelayMs");
+		if (maxDelayMs > 0 && untilMs - Date.now() <= maxDelayMs) {
+			return false;
+		}
+
+		const resetTimeIso = formatParkedUntilIso(untilMs);
+		const modelLabel = currentModel.id;
+
+		for (const role of this.retryFallbackChainKeys(currentSelector, currentModel)) {
+			for (const selector of this.findRetryFallbackCandidates(role, currentSelector, currentModel)) {
+				if (this.isRetryFallbackSelectorSuppressed(selector)) continue;
+				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
+				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
+				if (!candidate) continue;
+				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
+				if (!apiKey) continue;
+
+				const targetSelector = formatModelStringWithRouting(candidate);
+				await this.#host.setModelWithProviderSessionReset(candidate);
+				this.#host.sessionManager.appendModelChange(targetSelector, EPHEMERAL_MODEL_CHANGE_ROLE);
+				this.#host.settings.getStorage()?.recordModelUsage(targetSelector);
+				await this.#host.emitSessionEvent({
+					type: "retry_fallback_applied",
+					from: currentSelector,
+					to: targetSelector,
+					role,
+				});
+				return true;
+			}
+		}
+
+		if (resetTimeIso) {
+			await this.#host.emitSessionEvent({
+				type: "notice",
+				level: "warning",
+				source: "retry-fallback",
+				message: `${modelLabel} parked until ${resetTimeIso}`,
+			});
+		}
+		return false;
 	}
 
 	/**
@@ -1876,12 +2041,61 @@ export class TurnRecovery {
 			: this.#host.agent.state.messages.findLast(
 					(message): message is AssistantMessage => message.role === "assistant" && message !== failedMessage,
 				);
+		const retryContextHasImage = this.#host.agent.state.messages.some(message => {
+			if (!("content" in message) || !Array.isArray(message.content)) return false;
+			return message.content.some(
+				(block: unknown) =>
+					typeof block === "object" && block !== null && "type" in block && block.type === "image",
+			);
+		});
+		const retryRequestHasTools = this.#host.agent.state.tools.length > 0;
+		const traversalSelectors = this.#retryFallbackTraversalSelectors();
+		const current = parseRetryFallbackSelector(currentSelector, this.#host.modelRegistry);
+		if (current) traversalSelectors.add(this.#retryFallbackTraversalKey(current));
+		this.#lastFallbackChainSummary = undefined;
+		const skippedNodes = new Map<string, string>();
 		for (const role of this.retryFallbackChainKeys(currentSelector)) {
 			for (const selector of this.findRetryFallbackCandidates(role, currentSelector, undefined, options)) {
-				if (this.isRetryFallbackSelectorSuppressed(selector)) continue;
+				const selectorKey = this.#retryFallbackTraversalKey(selector);
+				if (traversalSelectors.has(selectorKey)) {
+					await this.#emitRetryFallbackSkipNotice({
+						selector,
+						reason: "already-attempted",
+						role,
+						from: currentSelector,
+					});
+					if (!skippedNodes.has(selector.raw)) {
+						skippedNodes.set(selector.raw, "already-attempted");
+					}
+					continue;
+				}
+				traversalSelectors.add(selectorKey);
+				if (this.isRetryFallbackSelectorSuppressed(selector)) {
+					await this.#emitRetryFallbackSkipNotice({ selector, reason: "cooldown", role, from: currentSelector });
+					if (!skippedNodes.has(selector.raw)) {
+						const untilMs = this.#host.modelRegistry.getSelectorSuppressedUntil(selector.raw);
+						const reasonDesc =
+							untilMs && untilMs > Date.now()
+								? `quota-exhausted-until ${formatParkedUntilIso(untilMs)}`
+								: "cooldown";
+						skippedNodes.set(selector.raw, reasonDesc);
+					}
+					continue;
+				}
 				const resolved = resolveModelOverride([selector.raw], this.#host.modelRegistry, this.#host.settings);
 				const candidate = resolved.model ?? this.#host.modelRegistry.find(selector.provider, selector.id);
-				if (!candidate) continue;
+				if (!candidate) {
+					await this.#emitRetryFallbackSkipNotice({
+						selector,
+						reason: "model-unavailable",
+						role,
+						from: currentSelector,
+					});
+					if (!skippedNodes.has(selector.raw)) {
+						skippedNodes.set(selector.raw, "model-unavailable");
+					}
+					continue;
+				}
 				if (options?.excludeProvider === candidate.provider) continue;
 				// Anthropic signatures and redacted blocks are model-bound, while the
 				// latest assistant response must remain byte-identical. A same-provider
@@ -1899,21 +2113,100 @@ export class TurnRecovery {
 							block.type === "redactedThinking",
 					)
 				) {
+					await this.#emitRetryFallbackSkipNotice({
+						selector,
+						reason: "signed-anthropic-thinking-incompatible",
+						role,
+						from: currentSelector,
+					});
+					if (!skippedNodes.has(selector.raw)) {
+						skippedNodes.set(selector.raw, "signed-anthropic-thinking-incompatible");
+					}
 					continue;
 				}
 				// A candidate whose effort floor exceeds the per-spawn ceiling would be
 				// clamped UP past the cap by its model floor — skip it entirely.
-				if (ceiling !== undefined && !modelSupportsEffortCeiling(candidate, ceiling)) continue;
+				if (ceiling !== undefined && !modelSupportsEffortCeiling(candidate, ceiling)) {
+					await this.#emitRetryFallbackSkipNotice({
+						selector,
+						reason: "effort-ceiling-incompatible",
+						role,
+						from: currentSelector,
+					});
+					if (!skippedNodes.has(selector.raw)) {
+						skippedNodes.set(selector.raw, "effort-ceiling-incompatible");
+					}
+					continue;
+				}
+				if (retryContextHasImage && !candidate.input.includes("image")) {
+					await this.#emitRetryFallbackSkipNotice({
+						selector,
+						reason: "image-input-incompatible",
+						role,
+						from: currentSelector,
+					});
+					if (!skippedNodes.has(selector.raw)) {
+						skippedNodes.set(selector.raw, "image-input-incompatible");
+					}
+					continue;
+				}
+				if (retryRequestHasTools && candidate.supportsTools === false) {
+					await this.#emitRetryFallbackSkipNotice({
+						selector,
+						reason: "tool-use-incompatible",
+						role,
+						from: currentSelector,
+					});
+					if (!skippedNodes.has(selector.raw)) {
+						skippedNodes.set(selector.raw, "tool-use-incompatible");
+					}
+					continue;
+				}
 				// Skip a candidate whose window cannot hold the retry context. The
 				// failed assistant is excluded only when retry removes it; preserved
 				// unexecuted-tool turns remain part of the request (issue #8065).
 				if (!this.#host.contextFitsModel(candidate, options?.preserveFailedTurn ? undefined : failedMessage)) {
+					await this.#emitRetryFallbackSkipNotice({
+						selector,
+						reason: "context-too-large",
+						role,
+						from: currentSelector,
+					});
+					if (!skippedNodes.has(selector.raw)) {
+						skippedNodes.set(selector.raw, "context-too-large");
+					}
 					continue;
 				}
-				const apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
-				if (!apiKey) continue;
-				return this.applyRetryFallbackCandidate(role, selector, currentSelector, options);
+				let apiKey: string | undefined;
+				try {
+					apiKey = await this.#host.modelRegistry.getApiKey(candidate, this.#host.sessionId());
+				} catch {
+					apiKey = undefined;
+				}
+				if (!apiKey || (typeof apiKey === "string" && !apiKey.trim())) {
+					await this.#emitRetryFallbackSkipNotice({
+						selector,
+						reason: "auth-unavailable",
+						role,
+						from: currentSelector,
+					});
+					if (!skippedNodes.has(selector.raw)) {
+						skippedNodes.set(selector.raw, "no-credentials");
+					}
+					continue;
+				}
+				return this.applyRetryFallbackCandidate(role, selector, currentSelector, {
+					apiKey,
+					pinFallback: options?.pinFallback,
+				});
 			}
+		}
+
+		if (skippedNodes.size > 0) {
+			const summary = Array.from(skippedNodes.entries())
+				.map(([sel, r]) => `${sel} (${r})`)
+				.join(", ");
+			this.#lastFallbackChainSummary = summary;
 		}
 
 		return false;
@@ -2056,6 +2349,7 @@ export class TurnRecovery {
 			return false;
 		}
 		if (this.isRetryFallbackSelectorSuppressed(originalSelector)) return false;
+		if (this.#hasTraversedRetryFallbackSelector(originalSelector)) return false;
 
 		const resolvedPrimary = resolveModelOverride(
 			[originalSelector.raw],
@@ -2115,9 +2409,11 @@ export class TurnRecovery {
 		// the model once and lets the base turn proceed.
 		if (!retrySettings.enabled && !options?.fireworksFastFallback) return false;
 		const classifierRefusal = this.isClassifierRefusal(message);
+		const currentModel = this.#host.model();
 
 		const generation = this.#host.promptGeneration();
 		this.#retryAttempt++;
+		this.#sameModelRetryAttempt++;
 
 		// Create retry promise on first attempt so waitForRetry() can await it
 		// Ensure only one promise exists (avoid orphaned promises from concurrent calls)
@@ -2127,16 +2423,27 @@ export class TurnRecovery {
 			this.#retryResolve = resolve;
 		}
 
-		// All attempts on the current model are spent. Don't fail yet: the
-		// fallback chain below gets one last consult. Credential rotation can
-		// consume the entire budget without the fallback branch ever running
-		// (every rotation sets switchedCredential and skips it), so without
-		// this last resort a provider-wide usage cap never fails over to the
-		// configured chain.
+		// Ordinary transient failures spend the current provider's budget before
+		// consulting a configured fallback. Explicit hard failures retain their
+		// immediate recovery path below.
+		const provider = currentModel?.provider;
+		const configuredMaxRetries = resolveProviderRetrySetting(
+			retrySettings.maxRetriesByProvider,
+			provider,
+			retrySettings.maxRetries,
+		);
+		const configuredBaseDelayMs = resolveProviderRetrySetting(
+			retrySettings.baseDelayMsByProvider,
+			provider,
+			retrySettings.baseDelayMs,
+		);
 		const maxRetries = this.#isBoundedThinkingStreamClose(message)
-			? Math.min(retrySettings.maxRetries, 1)
-			: retrySettings.maxRetries;
-		const retryBudgetExhausted = this.#retryAttempt > maxRetries;
+			? Math.min(configuredMaxRetries, 1)
+			: configuredMaxRetries;
+		const retryBudgetExhausted = this.#sameModelRetryAttempt > maxRetries;
+		const classifierFallbackBudgetExhausted = this.#retryAttempt > maxRetries;
+		const terminalRetryBudgetExhausted =
+			retryBudgetExhausted || (classifierRefusal && classifierFallbackBudgetExhausted);
 
 		const errorMessage = message.errorMessage || "Unknown error";
 		const id = this.#classifyRetryMessage(message);
@@ -2146,12 +2453,14 @@ export class TurnRecovery {
 				this.#unexecutedToolCallsReplaySafe(message));
 		const rateLimitReason = parseRateLimitReason(errorMessage);
 		const staleOpenAIResponsesReplayError = AIError.is(id, AIError.Flag.StaleResponsesItem);
+		const usageLimit = AIError.is(id, AIError.Flag.UsageLimit);
+		const authFailure = AIError.is(id, AIError.Flag.AuthFailed);
 		const accountPolicyDenial = AIError.is(id, AIError.Flag.AccountPolicy);
 		const recordedUsageLimitOutcome = await this.#usageLimitOutcomes.get(message);
 		const parsedRetryAfterMs = this.#parseRetryAfterMsFromError(errorMessage);
 		let delayMs = staleOpenAIResponsesReplayError
 			? 0
-			: calculateRetryBackoffDelayMs(retrySettings.baseDelayMs, this.#retryAttempt);
+			: calculateRetryBackoffDelayMs(configuredBaseDelayMs, this.#sameModelRetryAttempt);
 		// Transient rate/concurrency caps stay on the same credential, but must
 		// honor their reason-specific windows. The default exponential base
 		// (≈500ms, capped at 8s) otherwise re-hits the cap and burns the retry
@@ -2160,7 +2469,7 @@ export class TurnRecovery {
 		// window only applies when the error carries no parsed timing.
 		if (
 			!staleOpenAIResponsesReplayError &&
-			!AIError.is(id, AIError.Flag.UsageLimit) &&
+			!usageLimit &&
 			parsedRetryAfterMs === undefined &&
 			(rateLimitReason === "CONCURRENT_LIMIT" || rateLimitReason === "RATE_LIMIT_EXCEEDED")
 		) {
@@ -2258,7 +2567,6 @@ export class TurnRecovery {
 		}
 
 		const allowModelFallback = options?.allowModelFallback !== false;
-		const currentModel = this.#host.model();
 		const currentSelector = currentModel
 			? formatRetryFallbackSelector(currentModel, this.#host.thinkingLevel())
 			: undefined;
@@ -2278,6 +2586,7 @@ export class TurnRecovery {
 		// contents, not model health (issue #8760). Keep it on the same model; the
 		// retry budget still bounds a genuinely stuck stream.
 		const thinkingLoop = AIError.is(id, AIError.Flag.ThinkingLoop);
+		const maxDelayMs = retrySettings.maxDelayMs;
 		const effectiveUsageLimitWaitMs =
 			usageLimitWaitMs ??
 			(siblingAvailabilityWaitMs === undefined
@@ -2289,25 +2598,67 @@ export class TurnRecovery {
 		const waitForSiblingCredential =
 			siblingAvailabilityWaitMs !== undefined &&
 			effectiveUsageLimitWaitMs !== undefined &&
-			effectiveUsageLimitWaitMs <= retrySettings.maxDelayMs;
+			effectiveUsageLimitWaitMs <= maxDelayMs;
 		const longUsageLimitFallback =
 			currentModel !== undefined &&
 			resolveModelPolicy(currentModel).catalog.longUsageLimitFallback === true &&
-			retrySettings.maxDelayMs > 0 &&
+			maxDelayMs > 0 &&
 			effectiveUsageLimitWaitMs !== undefined &&
-			effectiveUsageLimitWaitMs > retrySettings.maxDelayMs &&
+			effectiveUsageLimitWaitMs > maxDelayMs &&
 			/\bGoUsageLimitError\b/.test(errorMessage) &&
 			(!this.#hasReplayUnsafeOutput(message) || this.#unexecutedToolCallsReplaySafe(message));
-
+		const quotaDelayExceedsBudget =
+			(usageLimit || parsedRetryAfterMs !== undefined) &&
+			maxDelayMs > 0 &&
+			(effectiveUsageLimitWaitMs ?? parsedRetryAfterMs ?? delayMs) > maxDelayMs;
+		const requiresImmediateModelFallback =
+			terminalRetryBudgetExhausted ||
+			classifierRefusal ||
+			usageLimit ||
+			authFailure ||
+			accountPolicyDenial ||
+			quotaDelayExceedsBudget ||
+			options?.hardErrorFallback === true;
 		if (!staleOpenAIResponsesReplayError && !switchedCredential && currentSelector) {
+			// and the account exposes Luna Reserve with remaining capacity, hop to gpt-reserve
+			// before walking external fallback chains.
+			if (
+				allowModelFallback &&
+				retrySettings.modelFallback &&
+				usageLimit &&
+				currentModel &&
+				currentModel.provider === "openai-codex" &&
+				(currentModel.id.toLowerCase().includes("luna") || currentModel.id.toLowerCase().startsWith("gpt-5.6")) &&
+				currentModel.id !== "gpt-reserve"
+			) {
+				const reserveSelector = parseRetryFallbackSelector("openai-codex/gpt-reserve", this.#host.modelRegistry);
+				if (reserveSelector && !this.isRetryFallbackSelectorSuppressed(reserveSelector)) {
+					const hasReserve = await this.#host.modelRegistry.authStorage.hasCodexLunaReserveCapacity(
+						this.#host.sessionId(),
+					);
+					if (hasReserve) {
+						switchedModel = await this.applyRetryFallbackCandidate(
+							"openai-codex/*",
+							reserveSelector,
+							currentSelector,
+							{
+								pinFallback: true,
+							},
+						);
+					}
+				}
+			}
+
 			// A refusal chain stops at the retry budget: the exhausted-attempt
 			// last resort is for provider failures, not classifier decisions.
 			if (
+				!switchedModel &&
 				allowModelFallback &&
 				retrySettings.modelFallback &&
 				!thinkingLoop &&
 				!waitForSiblingCredential &&
-				!(retryBudgetExhausted && classifierRefusal)
+				requiresImmediateModelFallback &&
+				!(classifierFallbackBudgetExhausted && classifierRefusal)
 			) {
 				if (!classifierRefusal) {
 					this.noteRetryFallbackCooldown(currentSelector, parsedRetryAfterMs, errorMessage);
@@ -2328,26 +2679,34 @@ export class TurnRecovery {
 			}
 			if (switchedModel) {
 				delayMs = 0;
+				this.#sameModelRetryAttempt = 0;
 			} else if (usageLimitWaitMs === undefined && parsedRetryAfterMs && parsedRetryAfterMs > delayMs) {
 				delayMs = parsedRetryAfterMs;
 			}
 		}
 
-		if (retryBudgetExhausted) {
+		if (terminalRetryBudgetExhausted) {
 			if (!switchedModel && !switchedCredential) {
-				const attempt = this.#retryAttempt - 1;
-				message.errorMessage = `Retry budget exhausted after ${attempt} ${attempt === 1 ? "retry" : "retries"}: ${errorMessage}`;
+				const attempt = classifierRefusal ? this.#retryAttempt - 1 : this.#sameModelRetryAttempt - 1;
+				const baseError = `Retry budget exhausted after ${attempt} ${attempt === 1 ? "retry" : "retries"}: ${errorMessage}`;
+				const finalTurnError = this.#lastFallbackChainSummary
+					? `Fallback chain exhausted: ${this.#lastFallbackChainSummary}. ${baseError}`
+					: baseError;
+				message.errorMessage = finalTurnError;
 				await this.persistTerminalEmptyErrorTurn(message);
 				const retryErrors = await this.#markPendingRetryErrors({ status: "superseded" });
+				const finalEndError = this.#lastFallbackChainSummary
+					? `Fallback chain exhausted: ${this.#lastFallbackChainSummary}. ${errorMessage}`
+					: errorMessage;
 				await this.#host.emitSessionEvent({
 					type: "auto_retry_end",
 					success: false,
 					attempt,
-					finalError: errorMessage,
+					finalError: finalEndError,
 					retryErrors,
 				});
 				this.#clearPendingRetryErrors();
-				this.#retryAttempt = 0;
+				this.#resetRetryAttempts();
 				this.resolveRetry(); // Resolve so waitForRetry() completes
 				return false;
 			}
@@ -2374,7 +2733,7 @@ export class TurnRecovery {
 				});
 				this.#clearPendingRetryErrors();
 			}
-			this.#retryAttempt = 0;
+			this.#resetRetryAttempts();
 			this.resolveRetry();
 			return false;
 		}
@@ -2388,18 +2747,40 @@ export class TurnRecovery {
 			!switchedModel &&
 			!this.isRetryableError(message)
 		) {
-			// Same auto_retry_end backstop as the classifier-refusal branch above.
+			const finalError = this.#lastFallbackChainSummary
+				? `Fallback chain exhausted: ${this.#lastFallbackChainSummary}. Original error: ${errorMessage}`
+				: errorMessage;
+			message.errorMessage = finalError;
 			if (this.#retryAttempt > 1) {
 				await this.persistTerminalEmptyErrorTurn(message);
 				await this.#host.emitSessionEvent({
 					type: "auto_retry_end",
 					success: false,
 					attempt: this.#retryAttempt - 1,
-					finalError: errorMessage,
+					finalError,
 				});
 				this.#clearPendingRetryErrors();
 			}
-			this.#retryAttempt = 0;
+			this.#resetRetryAttempts();
+			this.resolveRetry();
+			return false;
+		}
+		if (authFailure && !switchedCredential && !switchedModel) {
+			const finalError = this.#lastFallbackChainSummary
+				? `Fallback chain exhausted: ${this.#lastFallbackChainSummary}. Original error: ${errorMessage}`
+				: errorMessage;
+			message.errorMessage = finalError;
+			if (this.#retryAttempt > 1) {
+				await this.persistTerminalEmptyErrorTurn(message);
+				await this.#host.emitSessionEvent({
+					type: "auto_retry_end",
+					success: false,
+					attempt: this.#retryAttempt - 1,
+					finalError,
+				});
+				this.#clearPendingRetryErrors();
+			}
+			this.#resetRetryAttempts();
 			this.resolveRetry();
 			return false;
 		}
@@ -2422,7 +2803,6 @@ export class TurnRecovery {
 		// through repeated heuristic sleeps instead of surfacing it. Bounded
 		// by the stated wait so an unrelated large backoff cannot sneak
 		// through.
-		const maxDelayMs = retrySettings.maxDelayMs;
 		const waitForUsageReset =
 			retrySettings.waitForUsageReset === true &&
 			recordedUsageLimitOutcome !== undefined &&
@@ -2430,14 +2810,25 @@ export class TurnRecovery {
 			effectiveUsageLimitWaitMs !== undefined &&
 			delayMs <= effectiveUsageLimitWaitMs;
 		if (maxDelayMs > 0 && delayMs > maxDelayMs && !switchedCredential && !switchedModel && !waitForUsageReset) {
+			if (currentSelector) {
+				this.noteRetryFallbackCooldown(currentSelector, delayMs, errorMessage);
+			}
 			await this.persistTerminalEmptyErrorTurn(message);
 			const attempt = this.#retryAttempt;
-			this.#retryAttempt = 0;
+			this.#resetRetryAttempts();
+			const untilMs = Date.now() + delayMs;
+			const resetTimeIso = formatParkedUntilIso(untilMs);
+			const modelLabel = currentModel?.id ?? currentSelector ?? "Provider";
+			const baseError = `${modelLabel} parked until ${resetTimeIso}: retry delay (${delayMs}ms) exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`;
+			const finalError = this.#lastFallbackChainSummary
+				? `Fallback chain exhausted: ${this.#lastFallbackChainSummary}. ${baseError}`
+				: baseError;
+			message.errorMessage = finalError;
 			await this.#host.emitSessionEvent({
 				type: "auto_retry_end",
 				success: false,
 				attempt,
-				finalError: `Provider requested ${Math.ceil(delayMs)}ms wait, exceeds retry.maxDelayMs (${maxDelayMs}ms). Original error: ${errorMessage}`,
+				finalError,
 			});
 			this.#clearPendingRetryErrors();
 			this.resolveRetry();
@@ -2479,7 +2870,7 @@ export class TurnRecovery {
 			}
 			// Aborted during sleep - emit end event so UI can clean up
 			const attempt = this.#retryAttempt;
-			this.#retryAttempt = 0;
+			this.#resetRetryAttempts();
 			this.#retryAbortController = undefined;
 			await this.#host.emitSessionEvent({
 				type: "auto_retry_end",
@@ -2552,7 +2943,7 @@ export class TurnRecovery {
 	async #failRetryAfterLocalContinueError(message: AssistantMessage, error: unknown): Promise<void> {
 		if (this.#retryAttempt === 0) return;
 		const attempt = this.#retryAttempt;
-		this.#retryAttempt = 0;
+		this.#resetRetryAttempts();
 		const localError = error instanceof Error ? error.message : String(error);
 		await this.persistTerminalEmptyErrorTurn(message);
 		await this.#host.emitSessionEvent({
@@ -2710,7 +3101,7 @@ export class TurnRecovery {
 		}
 
 		// Reset retry budget for a fresh attempt
-		this.#retryAttempt = 0;
+		this.#resetRetryAttempts();
 
 		// Re-attempt the turn
 		this.#host.scheduleAgentContinue({ source: "manual-retry", delayMs: 1 });

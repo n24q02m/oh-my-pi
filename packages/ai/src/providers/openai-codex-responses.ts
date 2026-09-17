@@ -1687,7 +1687,7 @@ export async function openCodexCompactionEventStream(
 	options: OpenAICodexCompactionStreamOptions,
 ): Promise<AsyncGenerator<Record<string, unknown>>> {
 	const requestSetup = createRequestSetup(options);
-	let requestContext: CodexRequestContext;
+	let requestContext: CodexRequestContext | undefined;
 	let initial: {
 		eventStream: AsyncGenerator<Record<string, unknown>>;
 		requestBodyForState: RequestBody;
@@ -1695,14 +1695,21 @@ export async function openCodexCompactionEventStream(
 	};
 	try {
 		requestContext = createCodexRequestContext(model, toCodexRequestBody(body), options, {
-			isolateCompactionTransport: false,
+			// Native compaction rewrites the conversation history. Give it an
+			// isolated transport/session state so a stalled or cancelled
+			// compaction cannot corrupt the live turn's append baseline.
+			isolateCompactionTransport: true,
 		});
 		initial = await openInitialCodexEventStream(model, options, requestSetup, requestContext);
 	} catch (error) {
 		requestSetup.requestAbortController.abort();
+		requestContext?.isolatedTransportState?.close();
 		throw error;
 	}
 
+	if (!requestContext) {
+		throw new Error("Codex compaction request context was not created");
+	}
 	if (requestContext.websocketState) {
 		requestContext.websocketState.lastTransport = initial.transport;
 		// The compaction request may use the existing append baseline, but the
@@ -1711,6 +1718,7 @@ export async function openCodexCompactionEventStream(
 	}
 	return streamCodexCompactionEvents(model, options, requestSetup, requestContext, initial);
 }
+
 
 async function* streamCodexCompactionEvents(
 	model: Model<"openai-codex-responses">,
@@ -1762,6 +1770,7 @@ async function* streamCodexCompactionEvents(
 			requestContext.turnState.value = previousTurnState;
 			if (websocketState) websocketState.modelsEtag = previousModelsEtag;
 		}
+		requestContext.isolatedTransportState?.close();
 	}
 }
 
