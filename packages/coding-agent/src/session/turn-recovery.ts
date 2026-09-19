@@ -282,6 +282,17 @@ export class TurnRecovery {
 	#usageReserveApprovedSelector: string | undefined;
 	#pendingRetryErrors: PendingRetryError[] = [];
 	#usageLimitOutcomes = new WeakMap<AssistantMessage, Promise<UsageLimitOutcome>>();
+	/**
+	 * Saga-scoped floor for the next retry sleep, seeded by the most recent
+	 * usage-limit outcome in this retry saga. A transient error that follows a
+	 * usage-limit error (e.g. a first-event stream timeout while the credential
+	 * is still blocked) otherwise retries on the generic backoff — instantly
+	 * re-hitting the still-blocked credential and burning the retry budget on
+	 * attempts that cannot succeed. Epoch ms; `undefined` when no usage-limit
+	 * outcome has been recorded for the saga or a credential/model switch made
+	 * the recorded block irrelevant.
+	 */
+	#sagaUsageLimitBlockedUntilMs: number | undefined;
 	#emptyStopRetryCount = 0;
 	#unexpectedStopRetryCount = 0;
 	#malformedFunctionCallRetryCount = 0;
@@ -476,6 +487,7 @@ export class TurnRecovery {
 		});
 		this.#clearPendingRetryErrors();
 		this.#retryAttempt = 0;
+		this.#sagaUsageLimitBlockedUntilMs = undefined;
 		this.resolveRetry();
 	}
 
@@ -484,6 +496,7 @@ export class TurnRecovery {
 		if (message.stopReason !== "error" || this.#retryAttempt === 0 || compaction.continuationScheduled) return;
 		const attempt = this.#retryAttempt;
 		this.#retryAttempt = 0;
+		this.#sagaUsageLimitBlockedUntilMs = undefined;
 		await this.#host.emitSessionEvent({
 			type: "auto_retry_end",
 			success: false,
@@ -881,6 +894,7 @@ export class TurnRecovery {
 			});
 			this.#clearPendingRetryErrors();
 			this.#retryAttempt = 0;
+			this.#sagaUsageLimitBlockedUntilMs = undefined;
 			this.resolveRetry();
 			// A turn with no actionable output carries no transcript value, while its
 			// provider usage can anchor the next prompt at the full failed-request size
@@ -2234,6 +2248,21 @@ export class TurnRecovery {
 			const reasonBackoffMs = calculateRateLimitBackoffMs(rateLimitReason);
 			if (reasonBackoffMs > delayMs) delayMs = reasonBackoffMs;
 		}
+		// Saga floor: a transient error inside a usage-limit saga (e.g. a
+		// first-event stream timeout while the credential is still blocked)
+		// must not retry on the generic backoff — the next attempt re-hits the
+		// still-blocked credential and burns the retry budget on requests that
+		// cannot succeed. Sleep at least until the saga's earliest usable
+		// credential deadline. A credential/model switch below clears the floor
+		// (and zeroes delayMs), so this only binds same-route retries.
+		if (
+			!AIError.is(id, AIError.Flag.UsageLimit) &&
+			!staleOpenAIResponsesReplayError &&
+			this.#sagaUsageLimitBlockedUntilMs !== undefined
+		) {
+			const sagaFloorMs = Math.max(0, this.#sagaUsageLimitBlockedUntilMs - Date.now());
+			if (sagaFloorMs > delayMs) delayMs = sagaFloorMs;
+		}
 		let switchedCredential = false;
 		let switchedModel = false;
 		// Set when a usage-limit error pinned the wait to credential
@@ -2249,6 +2278,23 @@ export class TurnRecovery {
 		}
 
 		if (!retryBudgetExhausted && !staleOpenAIResponsesReplayError && recordedUsageLimitOutcome) {
+			// Seed the saga floor at the earliest moment any credential can serve:
+			// a sibling's earliest unblock when one exists, else this credential's
+			// merged block deadline, else the requested wait as a last resort.
+			// Seeded here — inside the retry saga — not in recordUsageLimitOutcome,
+			// which also runs for replay-eligible turns that never enter a saga;
+			// seeding there would leak the floor into the next saga's first
+			// transient error.
+			{
+				const floorCandidates = [
+					recordedUsageLimitOutcome.retryAtMs,
+					recordedUsageLimitOutcome.blockedUntilMs,
+				].filter((deadline): deadline is number => deadline !== undefined);
+				this.#sagaUsageLimitBlockedUntilMs =
+					floorCandidates.length > 0
+						? Math.min(...floorCandidates)
+						: Date.now() + (recordedUsageLimitOutcome.retryAfterMs ?? 0);
+			}
 			if (
 				recordedUsageLimitOutcome.switchedCredential ||
 				// Convert the parsed hint to an absolute timestamp NOW, before the
@@ -2259,6 +2305,9 @@ export class TurnRecovery {
 			) {
 				switchedCredential = true;
 				delayMs = 0;
+				// The block belonged to the credential we just left; the new
+				// account is not bound by it.
+				this.#sagaUsageLimitBlockedUntilMs = undefined;
 			} else {
 				// No sibling credential is usable right now. Wait for whichever
 				// comes first: the current account's actual unblock deadline, or
@@ -2335,7 +2384,10 @@ export class TurnRecovery {
 				this.#host.sessionId(),
 				{ error: errorMessage, modelId: currentModel.id },
 			);
-			if (switchedCredential) delayMs = 0;
+			if (switchedCredential) {
+				delayMs = 0;
+				this.#sagaUsageLimitBlockedUntilMs = undefined;
+			}
 		}
 		// A thinking-loop abort is not a provider failure — it is the loop guard
 		// asking for a same-model resample, paired with a hidden
@@ -2395,6 +2447,9 @@ export class TurnRecovery {
 			}
 			if (switchedModel) {
 				delayMs = 0;
+				// The block belonged to the route we just left; the fallback
+				// model is not bound by it.
+				this.#sagaUsageLimitBlockedUntilMs = undefined;
 			} else if (usageLimitWaitMs === undefined && parsedRetryAfterMs && parsedRetryAfterMs > delayMs) {
 				delayMs = parsedRetryAfterMs;
 			}
@@ -2415,6 +2470,7 @@ export class TurnRecovery {
 				});
 				this.#clearPendingRetryErrors();
 				this.#retryAttempt = 0;
+				this.#sagaUsageLimitBlockedUntilMs = undefined;
 				this.resolveRetry(); // Resolve so waitForRetry() completes
 				return false;
 			}
@@ -2442,6 +2498,7 @@ export class TurnRecovery {
 				this.#clearPendingRetryErrors();
 			}
 			this.#retryAttempt = 0;
+			this.#sagaUsageLimitBlockedUntilMs = undefined;
 			this.resolveRetry();
 			return false;
 		}
@@ -2467,6 +2524,7 @@ export class TurnRecovery {
 				this.#clearPendingRetryErrors();
 			}
 			this.#retryAttempt = 0;
+			this.#sagaUsageLimitBlockedUntilMs = undefined;
 			this.resolveRetry();
 			return false;
 		}
@@ -2500,6 +2558,7 @@ export class TurnRecovery {
 			await this.persistTerminalEmptyErrorTurn(message);
 			const attempt = this.#retryAttempt;
 			this.#retryAttempt = 0;
+			this.#sagaUsageLimitBlockedUntilMs = undefined;
 			await this.#host.emitSessionEvent({
 				type: "auto_retry_end",
 				success: false,
@@ -2550,6 +2609,7 @@ export class TurnRecovery {
 			// Aborted during sleep - emit end event so UI can clean up
 			const attempt = this.#retryAttempt;
 			this.#retryAttempt = 0;
+			this.#sagaUsageLimitBlockedUntilMs = undefined;
 			this.#retryAbortController = undefined;
 			await this.#host.emitSessionEvent({
 				type: "auto_retry_end",
@@ -2623,6 +2683,7 @@ export class TurnRecovery {
 		if (this.#retryAttempt === 0) return;
 		const attempt = this.#retryAttempt;
 		this.#retryAttempt = 0;
+		this.#sagaUsageLimitBlockedUntilMs = undefined;
 		const localError = error instanceof Error ? error.message : String(error);
 		await this.persistTerminalEmptyErrorTurn(message);
 		await this.#host.emitSessionEvent({
@@ -2789,6 +2850,7 @@ export class TurnRecovery {
 
 		// Reset retry budget for a fresh attempt
 		this.#retryAttempt = 0;
+		this.#sagaUsageLimitBlockedUntilMs = undefined;
 
 		// Re-attempt the turn
 		this.#host.scheduleAgentContinue({ source: "manual-retry", delayMs: 1 });
