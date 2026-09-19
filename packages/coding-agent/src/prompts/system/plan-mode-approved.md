@@ -1,23 +1,25 @@
-<critical>
-Plan approved. You **MUST** execute it now.
-</critical>
-
-Finalized plan artifact: `{{finalPlanFilePath}}`
-
-## Plan
-
-{{planContent}}
+Plan approved.
+{{#if contextPreserved}}
+- History usable; the plan below authoritative if it conflicts with earlier exploration.
+{{/if}}
 
 <instruction>
-You **MUST** execute this plan step by step from `{{finalPlanFilePath}}`. You have full tool access.
-You **MUST** verify each step before proceeding to the next.
-{{#has tools "todo_write"}}
-Before execution, you **MUST** initialize todo tracking for this plan with `todo_write`.
-After each completed step, you **MUST** immediately update `todo_write` so progress stays visible.
-If a `todo_write` call fails, you **MUST** fix the todo payload and retry before continuing silently.
+Full plan inlined below; durable copy at `{{planFilePath}}` (identical content).
+Execute plan step-by-step with full tool access; MUST verify each step before next.
+NEVER re-read `{{planFilePath}}` while the inline plan is intact; the path is for subagent handoff and recovery only.
+{{#has tools "todo"}}
+Before execution: initialize todo tracking with `todo`.
+After each completed step: immediately update `todo`.
+If `todo` fails: fix payload; retry before continuing.
 {{/has}}
 </instruction>
 
+<plan path="{{planFilePath}}">
+{{planContent}}
+</plan>
+
 <critical>
-You **MUST** keep going until complete. This matters.
+Inline plan compressed, expired, or unrecoverable: NEVER stop; read `{{planFilePath}}`.
+Read failure: report exact path and error; NEVER guess.
+MUST continue until complete.
 </critical>

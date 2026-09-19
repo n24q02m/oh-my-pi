@@ -5,24 +5,23 @@
  * - OpenAI: https://api.kimi.com/coding/v1/chat/completions
  * - Anthropic: https://api.kimi.com/coding/v1/messages
  *
- * The Anthropic API is generally more stable and recommended.
- * Note: Kimi calculates TPM rate limits based on max_tokens, not actual output.
+ * Each discovered model selects its server-declared protocol; legacy models
+ * without protocol metadata retain the Anthropic-compatible default.
  */
 
-import { ANTHROPIC_THINKING } from "../stream";
-import type { Api, Context, Model, SimpleStreamOptions } from "../types";
-import { AssistantMessageEventStream } from "../utils/event-stream";
-import { getKimiCommonHeaders } from "../utils/oauth/kimi";
-import { streamAnthropic } from "./anthropic";
-import { streamOpenAICompletions } from "./openai-completions";
+import { getKimiCommonHeaders } from "../registry/oauth/kimi";
+import type { Api, Context, Model } from "../types";
+import type { AssistantMessageEventStream } from "../utils/event-stream";
+import {
+	type OpenAIAnthropicApiFormat,
+	type OpenAIAnthropicShimOptions,
+	streamOpenAIAnthropicShim,
+} from "./openai-anthropic-shim";
 
-export type KimiApiFormat = "openai" | "anthropic";
+export type KimiApiFormat = OpenAIAnthropicApiFormat;
 
-// Note: Anthropic SDK appends /v1/messages, so base URL should not include /v1
-const KIMI_ANTHROPIC_BASE_URL = "https://api.kimi.com/coding";
-
-export interface KimiOptions extends SimpleStreamOptions {
-	/** API format: "openai" or "anthropic". Default: "anthropic" */
+export interface KimiOptions extends OpenAIAnthropicShimOptions {
+	/** Explicit API format override. Defaults to the model's resolved protocol policy. */
 	format?: KimiApiFormat;
 }
 
@@ -35,110 +34,17 @@ export function streamKimi(
 	context: Context,
 	options?: KimiOptions,
 ): AssistantMessageEventStream {
-	const stream = new AssistantMessageEventStream();
-	const format = options?.format ?? "anthropic";
-
-	// Async IIFE to handle header fetching and stream piping
-	(async () => {
-		try {
-			const kimiHeaders = await getKimiCommonHeaders();
-			const mergedHeaders = { ...kimiHeaders, ...options?.headers };
-
-			if (format === "anthropic") {
-				// Create a synthetic Anthropic model pointing to Kimi's endpoint
-				const anthropicModel: Model<"anthropic-messages"> = {
-					id: model.id,
-					name: model.name,
-					api: "anthropic-messages",
-					provider: model.provider,
-					baseUrl: KIMI_ANTHROPIC_BASE_URL,
-					headers: mergedHeaders,
-					contextWindow: model.contextWindow,
-					maxTokens: model.maxTokens,
-					reasoning: model.reasoning,
-					input: model.input,
-					cost: model.cost,
-				};
-
-				// Calculate thinking budget from reasoning level
-				const reasoning = options?.reasoning;
-				const thinkingEnabled = !!reasoning && model.reasoning;
-				const thinkingBudget = reasoning
-					? (options?.thinkingBudgets?.[reasoning] ?? ANTHROPIC_THINKING[reasoning])
-					: undefined;
-
-				const innerStream = streamAnthropic(anthropicModel, context, {
-					apiKey: options?.apiKey,
-					temperature: options?.temperature,
-					topP: options?.topP,
-					topK: options?.topK,
-					minP: options?.minP,
-					presencePenalty: options?.presencePenalty,
-					repetitionPenalty: options?.repetitionPenalty,
-					maxTokens: options?.maxTokens ?? Math.min(model.maxTokens, 32000),
-					signal: options?.signal,
-					headers: mergedHeaders,
-					sessionId: options?.sessionId,
-					onPayload: options?.onPayload,
-					thinkingEnabled,
-					thinkingBudgetTokens: thinkingBudget,
-				});
-
-				for await (const event of innerStream) {
-					stream.push(event);
-				}
-			} else {
-				// OpenAI format - use original model with Kimi headers
-				const innerStream = streamOpenAICompletions(model, context, {
-					apiKey: options?.apiKey,
-					temperature: options?.temperature,
-					topP: options?.topP,
-					topK: options?.topK,
-					minP: options?.minP,
-					presencePenalty: options?.presencePenalty,
-					repetitionPenalty: options?.repetitionPenalty,
-					maxTokens: options?.maxTokens ?? model.maxTokens,
-					signal: options?.signal,
-					headers: mergedHeaders,
-					sessionId: options?.sessionId,
-					onPayload: options?.onPayload,
-					reasoningEffort: options?.reasoning,
-				});
-
-				for await (const event of innerStream) {
-					stream.push(event);
-				}
-			}
-		} catch (err) {
-			stream.push({
-				type: "error",
-				reason: "error",
-				error: createErrorMessage(model, err),
-			});
-		}
-	})();
-
-	return stream;
-}
-
-function createErrorMessage(model: Model<Api>, err: unknown) {
-	return {
-		role: "assistant" as const,
-		content: [{ type: "text" as const, text: err instanceof Error ? err.message : String(err) }],
-		api: model.api,
-		provider: model.provider,
-		model: model.id,
-		usage: {
-			input: 0,
-			output: 0,
-			cacheRead: 0,
-			cacheWrite: 0,
-			totalTokens: 0,
-			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-		},
-		stopReason: "error" as const,
-		timestamp: Date.now(),
-	};
+	const defaultFormat = model.compat.kimiApiFormat ?? options?.format;
+	if (defaultFormat === undefined) {
+		throw new Error(`Kimi Code model ${model.id} has no resolved API format`);
+	}
+	return streamOpenAIAnthropicShim(model, context, options, {
+		anthropicBaseUrl: model.baseUrl.replace(/\/v1\/?$/, ""),
+		defaultFormat,
+		anthropicThinkingMode: model.compat.thinkingFormat === "kimi" ? "anthropic-adaptive" : undefined,
+		forwardCacheOptions: true,
+		extraHeaders: getKimiCommonHeaders,
+	});
 }
 
 /**

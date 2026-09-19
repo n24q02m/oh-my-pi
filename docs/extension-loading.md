@@ -1,8 +1,8 @@
 # Extension Loading (TypeScript/JavaScript Modules)
 
-This document covers how the coding agent discovers and loads **extension modules** (`.ts`/`.js`) at startup.
+This document covers how the coding agent discovers and loads extension modules at startup. Scanned native/configured directories auto-discover `.ts` and `.js`; explicitly named files and installed-plugin manifest entries may also use `.mjs` and `.cjs`.
 
-It does **not** cover `gemini-extension.json` manifest extensions (documented separately).
+It does **not** cover [`gemini-extension.json` manifest extensions](./gemini-manifest-extensions.md), which are documented separately.
 
 ## What this subsystem does
 
@@ -15,9 +15,11 @@ Extension loading builds a list of module entry files, imports each module with 
 ## Primary implementation files
 
 - `src/extensibility/extensions/loader.ts` — path discovery + import/execution
+- `src/extensibility/extensions/directory-resolution.ts` — shared configured/plugin manifest and directory precedence
 - `src/extensibility/extensions/index.ts` — public exports
 - `src/extensibility/extensions/runner.ts` — runtime/event execution after load
 - `src/discovery/builtin.ts` — native auto-discovery provider for extension modules
+- `src/extensibility/plugins/legacy-pi-compat.ts` — in-place module graph loading and host-package compatibility rewriting
 - `src/config/settings.ts` — loads merged `extensions` / `disabledExtensions` settings
 
 ---
@@ -28,33 +30,50 @@ Extension loading builds a list of module entry files, imports each module with 
 
 `discoverAndLoadExtensions()` first asks discovery providers for `extension-module` capability items, then keeps only provider `native` items.
 
-Effective native locations:
+Native `extension-module` discovery comes from:
 
-- Project: `<cwd>/.omp/extensions`
-- User: `~/.omp/agent/extensions`
+- Project directory: `<cwd>/.omp/extensions`
+- User directory: the active agent directory's `extensions/` (default `~/.omp/agent/extensions`)
+- Native legacy/settings JSON entries: `<cwd>/.omp/settings.json#extensions` and the active agent directory's `settings.json#extensions`
 
-Path roots come from the native provider (`SOURCE_PATHS.native`).
+The project root is the native provider's `.omp` directory (`SOURCE_PATHS.native.projectDir`), cwd-only; it does not walk ancestors. The user root is the active profile's agent directory via `getAgentDir()`, so under `omp --profile <name>` it becomes `~/.omp/profiles/<name>/agent/extensions` (and it honors `PI_CODING_AGENT_DIR`). See [Profiles](./config-usage.md#profiles).
 
 Notes:
 
 - Native auto-discovery is currently `.omp` based.
-- Legacy `.pi` is still accepted in `package.json` manifest keys (`pi.extensions`), but not as a native root here.
+- Legacy `.pi` is still accepted in package manifests (`pi.extensions`) and project override lookup, but `.pi/extensions` is not a native root here.
 
-### 2) Explicitly configured paths
+### 2) Discovered JS/TS hook factories
 
-After auto-discovery, configured paths are appended and resolved.
+After native auto-discovery, `discoverAndLoadExtensions()` also appends JS/TS hook factories from the `hook` capability — any hook whose entry path is a `.ts`/`.js` file — so they load through the same module pipeline. The native provider discovers these under `<cwd>/.omp/hooks/pre|post/` and `<agentDir>/hooks/pre|post/` only; see [Hooks: native discovery location](./hooks.md#native-discovery-location) for the required `pre/`/`post/` layout.
+
+Hook-capability loading already applies its own hook-specific disabled ids, so these paths are not additionally filtered by `disabledExtensions` extension-module names.
+
+### 3) Installed plugin extension entries
+
+After hook discovery, `discoverAndLoadExtensions()` appends extension entry points from enabled installed plugins via `getAllPluginExtensionPaths(cwd)`.
+
+Plugin extension entries come from package `omp.extensions` / `pi.extensions` manifests, including enabled feature entries.
+
+Installed-plugin manifest resolution accepts explicit `.ts`, `.js`, `.mjs`, and `.cjs` files. For a manifest entry that names a directory, it recognizes `index.ts`, `index.js`, `index.mjs`, or `index.cjs`; extension-directory expansion uses the same four suffixes. This is broader than native and configured-directory auto-scanning, which remains limited to `.ts` and `.js`.
+
+### 4) Explicitly configured paths
+
+After plugin extension entries, configured paths are appended and resolved.
 
 Configured path sources in the main session startup path (`sdk.ts`):
 
 1. CLI-provided paths (`--extension/-e`, and `--hook` is also treated as an extension path)
-2. Settings `extensions` array (merged global + project settings)
+2. Merged settings `extensions` array
 
-Global settings file:
+Settings files:
 
-- `~/.omp/agent/config.yml` (or custom agent dir via `PI_CODING_AGENT_DIR`)
+- User: the active agent directory's `config.yml` (default `~/.omp/agent/config.yml`; with `--profile <name>`, `~/.omp/profiles/<name>/agent/config.yml`; `PI_CODING_AGENT_DIR` can override the agent directory)
+- Project/native settings capability: `<cwd>/.omp/config.yml` and `<cwd>/.omp/settings.json`
 
-Project settings file:
+Native extension-module discovery also reads legacy JSON extension lists from:
 
+- The active agent directory's `settings.json` (default `~/.omp/agent/settings.json`)
 - `<cwd>/.omp/settings.json`
 
 Examples:
@@ -83,8 +102,19 @@ extensions:
 
 Behavior split:
 
-- SDK: when `disableExtensionDiscovery=true`, it still loads `additionalExtensionPaths` via `loadExtensions()`.
-- CLI path building (`main.ts`) currently clears CLI extension paths when `--no-extensions` is set, so explicit `-e/--hook` are not forwarded in that mode.
+- SDK: when `disableExtensionDiscovery=true`, ambient extension factories are
+  excluded, while `additionalExtensionPaths` are still resolved normally
+  (including package directories with `package.json#omp.extensions`).
+- CLI: `--no-extensions` follows the same explicit-only contract. Explicit
+  `-e/--extension` and `--hook` paths still load, and only sibling capability
+  roots from explicitly named extension packages remain eligible. Project/user
+  `extensions:` settings and installed OMP extension packages are excluded from
+  that sibling surface.
+
+This flag governs extension factories and OMP extension-package sibling roots;
+it is not a whole-process capability-isolation switch. Skills, MCP servers,
+tools, prompts, and rules owned by other discovery subsystems retain their own
+enable/disable controls.
 
 ### Disable specific extension modules
 
@@ -104,6 +134,24 @@ disabledExtensions:
   - extension-module:foo
 ```
 
+### Disable specific items of other capabilities
+
+`disabledExtensions` is not limited to extension modules. Every capability that
+defines `toExtensionId` contributes ids to the same list, and loading filters
+them out before the item reaches the session.
+
+Context files use `context-file:<level>:<basename>`, where `<level>` is `user`
+or `project`:
+
+```yaml
+disabledExtensions:
+  - context-file:user:CLAUDE.md
+```
+
+The id carries no directory and no depth, so a `project` entry disables files of
+that name at every depth the discovery walk reaches. See
+[Context files](./context-files.md#disabling-a-single-context-file).
+
 ---
 
 ## Path and entry resolution
@@ -112,19 +160,20 @@ disabledExtensions:
 
 For configured paths:
 
-1. Normalize unicode spaces
+1. Normalize Unicode spaces and supported path shorthands (including `file://`, `@/absolute/path`, and a stray `:` before an absolute/relative path)
 2. Expand `~`
 3. If relative, resolve against current `cwd`
+4. Reject the internal `local://` scheme; it must be resolved by its protocol handler, not treated as a filesystem path
 
 ### If configured path is a file
 
-It is used directly as a module entry candidate.
+It is used directly as a module entry candidate. Explicit `.ts`, `.js`, `.mjs`, and `.cjs` files are supported.
 
 ### If configured path is a directory
 
 Resolution order:
 
-1. `package.json` in that directory with `omp.extensions` (or legacy `pi.extensions`) -> use declared entries
+1. `package.json` in that directory with a non-empty `omp.extensions` (or legacy `pi.extensions`) array -> use declared entries
 2. `index.ts`
 3. `index.js`
 4. Otherwise scan one level for extension entries:
@@ -136,7 +185,8 @@ Rules and constraints:
 
 - no recursive discovery beyond one subdirectory level
 - declared `extensions` manifest entries are resolved relative to that package directory
-- declared entries are included only if file exists/access is allowed
+- a non-empty declared array is authoritative: convention-based index/scan fallback stays suppressed even when every declared entry is missing
+- missing or inaccessible declared entries are skipped individually, so existing entries in a partially missing manifest still load
 - in `*/index.{ts,js}` pairs, TypeScript is preferred over JavaScript
 - symlinks are treated as eligible files/directories
 
@@ -154,7 +204,9 @@ Rules and constraints:
 Order:
 
 1. Native auto-discovered modules
-2. Explicit configured paths (in provided order)
+2. Discovered JS/TS hook factories
+3. Installed plugin extension entries
+4. Explicit configured paths (in provided order)
 
 In `sdk.ts`, configured order is:
 
@@ -173,11 +225,15 @@ Implication: if the same module path is both auto-discovered and explicitly conf
 
 ## Module import and factory contract
 
-Each candidate path is loaded with dynamic import:
+Each candidate path is loaded via `loadLegacyPiModule()` (`src/extensibility/plugins/legacy-pi-compat.ts`):
 
-- `await import(resolvedPath)`
-- factory is `module.default ?? module`
-- factory must be a function (`ExtensionFactory`)
+- the entry's realpath is resolved, then dynamically imported with an `?mtime` cache-buster so edited source reloads. Since 16.3.7 the same mtime tag propagates to every module in the extension-owned dependency graph — relative `./`/`../` imports, package `imports` aliases (`#alias/*`), and extension-local bare dependencies — via the graph-wide `onLoad` rewrite, so same-process re-imports pick up edits across the whole graph, not just the entry file. Host-resolved rewrites (legacy pi-package specifiers, the TypeBox shim) stay untagged `file://` URLs because they point at in-process host code that never changes between reloads
+- a scoped Bun `onLoad` hook rewrites legacy pi-package specifiers (`@mariozechner/*`, `@earendil-works/*`) and bare `@sinclair/typebox` onto the host-bundled copies before evaluation. Legacy Pi package-root imports resolve through compat shims: catalog symbols that moved to `@oh-my-pi/pi-catalog/models` (`calculateCost`, `modelsAreEqual`, `getBundledProviders`, plus `getModel`/`getModels` aliases) are re-exported by the legacy pi-ai shim (`src/extensibility/legacy-pi-ai-shim.ts`), and legacy `@oh-my-pi/pi-coding-agent` imports — including `DefaultResourceLoader` — resolve to the compat loader in `src/extensibility/legacy-pi-coding-agent-shim.ts`
+- graph-owned CommonJS modules use synchronous Bun `onLoad` object modules exposing runtime own-string export keys, including computed and non-enumerable names; `default` remains the complete `module.exports` value. The shared evaluator preserves cycles and `require`/import identity, while required host ESM shims are prepared before synchronous evaluation. No generated facade files or AST named-export reconstruction are needed
+- bundled host modules use Bun's native object loader. Modules exporting `theme` add a thin ESM binding bridge so the existing `theme` import follows host assignments synchronously without replacing the UI's change listener
+- package `imports` and `exports` patterns prefer the longest prefix before `*`, then the longest complete pattern; exact matches take precedence and excluded targets never fall back to broader patterns
+- factory is selected by `getExtensionFactory(module)`: the module itself if it is a function, otherwise `module.default`
+- factory must be a function (`ExtensionFactory`) and may return `void` or a promise; loading awaits it before continuing to the next path
 
 If export is not a function, that path fails with a structured error and loading continues.
 
@@ -194,6 +250,23 @@ Common cases:
 - import failure / missing file
 - invalid factory export (non-function)
 - exception thrown while executing factory
+
+### Restricted children and revival
+
+Restricted task/eval children rebind the parent's already-imported extension
+factories to their own session. Hooks and providers remain available without
+ambient extension discovery. Extension tools cannot widen the restricted tool
+set or replace built-ins, including through late registration. New extension
+paths, loaded parent-bound instances, and additional inline factories remain
+excluded.
+
+Revived children inherit the current owning session's extension roots and
+prepared factories, not extension authority from a saved transcript. Cold
+discovery without prepared factories respects the owner's explicit-only or
+merged roots.
+
+Extension factories still execute host code when rebound; tool restrictions are
+not an extension sandbox. Existing per-module load-failure handling is unchanged.
 
 ### Runtime isolation model
 

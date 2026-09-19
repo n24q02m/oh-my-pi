@@ -1,1382 +1,483 @@
-import * as os from "node:os";
-import * as path from "node:path";
-import { Readability } from "@mozilla/readability";
-import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { StringEnum } from "@oh-my-pi/pi-ai";
-import { getPuppeteerDir, logger, Snowflake, untilAborted } from "@oh-my-pi/pi-utils";
-import { type Static, Type } from "@sinclair/typebox";
-import { type HTMLElement, parseHTML } from "linkedom";
-import type {
-	Browser,
-	CDPSession,
-	ElementHandle,
-	KeyInput,
-	Page,
-	default as Puppeteer,
-	SerializedAXNode,
-} from "puppeteer";
-import { renderPromptTemplate } from "../config/prompt-templates";
-import browserDescription from "../prompts/tools/browser.md" with { type: "text" };
+import { type } from "@oh-my-pi/omptype";
+import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
+import { isRecord, logger, untilAborted } from "@oh-my-pi/pi-utils";
+import type { EvalPreludeContext, EvalPreludeDefinition } from "../eval/preludes";
 import type { ToolSession } from "../sdk";
-import { formatDimensionNote, resizeImage } from "../utils/image-resize";
-import { htmlToBasicMarkdown } from "../web/scrapers/types";
-import type { OutputMeta } from "./output-meta";
-import stealthTamperingScript from "./puppeteer/00_stealth_tampering.txt" with { type: "text" };
-import stealthActivityScript from "./puppeteer/01_stealth_activity.txt" with { type: "text" };
-import stealthHairlineScript from "./puppeteer/02_stealth_hairline.txt" with { type: "text" };
-import stealthBotdScript from "./puppeteer/03_stealth_botd.txt" with { type: "text" };
-import stealthIframeScript from "./puppeteer/04_stealth_iframe.txt" with { type: "text" };
-import stealthWebglScript from "./puppeteer/05_stealth_webgl.txt" with { type: "text" };
-import stealthScreenScript from "./puppeteer/06_stealth_screen.txt" with { type: "text" };
-import stealthFontsScript from "./puppeteer/07_stealth_fonts.txt" with { type: "text" };
-import stealthAudioScript from "./puppeteer/08_stealth_audio.txt" with { type: "text" };
-import stealthLocaleScript from "./puppeteer/09_stealth_locale.txt" with { type: "text" };
-import stealthPluginsScript from "./puppeteer/10_stealth_plugins.txt" with { type: "text" };
-import stealthHardwareScript from "./puppeteer/11_stealth_hardware.txt" with { type: "text" };
-import stealthCodecsScript from "./puppeteer/12_stealth_codecs.txt" with { type: "text" };
-import stealthWorkerScript from "./puppeteer/13_stealth_worker.txt" with { type: "text" };
-import { ToolAbortError, ToolError, throwIfAborted } from "./tool-errors";
+import { enforceInlineByteCap } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { resolveCmuxKind } from "./browser/cmux/rpc";
+import { resolveSpawnArgs } from "./browser/attach";
+import {
+	acquireBrowser,
+	browserKey,
+	type BrowserHandle,
+	type BrowserKind,
+	type BrowserKindTag,
+	holdBrowser,
+	releaseBrowser,
+} from "./browser/registry";
+import { ensureChromiumExecutable } from "./browser/launch";
+import { resolveRelayKind } from "./browser/relay/kind";
+import type { AriaSnapshotOptions } from "./browser/aria/aria-snapshot";
+import type { ScreenshotResult } from "./browser/tab-protocol";
+import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
+import {
+	type AcquireTabResult,
+	acquireTab,
+	cancelIdleCloseForOwner,
+	dropHeadlessTabs,
+	getTab,
+	releaseAllTabs,
+	releaseIdleTabsForOwner,
+	releaseTab,
+	runInTab,
+} from "./browser/tab-supervisor";
+import { renderTabCall } from "./browser/tab-call";
+import { resolveToCwd } from "./path-utils";
+import { renderCallChain, renderFunctionRun } from "./run-code";
+import { ToolAbortError, throwIfAborted } from "./tool-errors";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
 
-/**
- * Lazy-import puppeteer from a safe CWD so cosmiconfig doesn't choke
- * on malformed package.json files in the user's project tree.
- */
-let puppeteerModule: typeof Puppeteer | undefined;
-async function loadPuppeteer(): Promise<typeof Puppeteer> {
-	if (puppeteerModule) return puppeteerModule;
-	const prev = process.cwd();
-	const safeDir = getPuppeteerDir();
-	await Bun.write(path.join(safeDir, "package.json"), "{}");
-	try {
-		process.chdir(safeDir);
-		puppeteerModule = (await import("puppeteer")).default;
-		return puppeteerModule;
-	} finally {
-		process.chdir(prev);
-	}
+export type { AriaSnapshotOptions } from "./browser/aria/aria-snapshot";
+
+/** First-use boundary for the generated Playwright ARIA evaluator bundle. */
+export function buildAriaSnapshotScript(selector: string | undefined, options: AriaSnapshotOptions = {}): string {
+	return require("./browser/aria/aria-snapshot").buildAriaSnapshotScript(selector, options);
 }
 
-const DEFAULT_VIEWPORT = { width: 1365, height: 768, deviceScaleFactor: 1.25 };
-const STEALTH_IGNORE_DEFAULT_ARGS = [
-	"--disable-extensions",
-	"--disable-default-apps",
-	"--disable-component-extensions-with-background-pages",
-];
-const STEALTH_ACCEPT_LANGUAGE = "en-US,en";
-const PUPPETEER_SOURCE_URL_SUFFIX = "//# sourceURL=__puppeteer_evaluation_script__";
-const INTERACTIVE_AX_ROLES = new Set([
-	"button",
-	"link",
-	"textbox",
-	"combobox",
-	"listbox",
-	"option",
-	"checkbox",
-	"radio",
-	"switch",
-	"tab",
-	"menuitem",
-	"menuitemcheckbox",
-	"menuitemradio",
-	"slider",
-	"spinbutton",
-	"searchbox",
-	"treeitem",
-]);
-
-declare global {
-	interface Element extends HTMLElement {}
-
-	function getComputedStyle(element: Element): Record<string, unknown>;
-	var innerWidth: number;
-	var innerHeight: number;
-	var document: {
-		elementFromPoint(x: number, y: number): Element | null;
-	};
+/** First-use boundary for ARIA-ref parsing; keeps evaluator construction out of tool registration. */
+export function parseAriaRefSelector(selector: string): string | null {
+	return require("./browser/aria/aria-snapshot").parseAriaRefSelector(selector);
 }
 
-const LEGACY_SELECTOR_PREFIXES = ["p-aria/", "p-text/", "p-xpath/", "p-pierce/"] as const;
+export { cmuxSnapshotToObservation, mapWaitUntil, resolveCmuxKind, serializeEval } from "./browser/cmux/rpc";
+export { CmuxSocketClient } from "./browser/cmux/socket-client";
+export { extractReadableFromHtml, type ReadableFormat, type ReadableResult } from "./browser/readable";
+export { DEFAULT_RELAY_URL, type RelayKind, resolveRelayKind } from "./browser/relay/kind";
+export type { Observation, ObservationEntry } from "./browser/tab-protocol";
 
-function normalizeSelector(selector: string): string {
-	if (!selector) return selector;
-	if (selector.startsWith("p-") && !LEGACY_SELECTOR_PREFIXES.some(prefix => selector.startsWith(prefix))) {
-		throw new ToolError(
-			`Unsupported selector prefix. Use CSS or puppeteer query handlers (aria/, text/, xpath/, pierce/). Got: ${selector}`,
-		);
-	}
-	if (selector.startsWith("p-text/")) {
-		return `text/${selector.slice("p-text/".length)}`;
-	}
-	if (selector.startsWith("p-xpath/")) {
-		return `xpath/${selector.slice("p-xpath/".length)}`;
-	}
-	if (selector.startsWith("p-pierce/")) {
-		return `pierce/${selector.slice("p-pierce/".length)}`;
-	}
-	if (selector.startsWith("p-aria/")) {
-		const rest = selector.slice("p-aria/".length);
-		// Playwright-style: p-aria/[name="Sign in"] → aria/Sign in
-		const nameMatch = rest.match(/\[\s*name\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\]]+))\s*\]/);
-		const name = nameMatch?.[1] ?? nameMatch?.[2] ?? nameMatch?.[3];
-		if (name) return `aria/${name.trim()}`;
-		return `aria/${rest}`;
-	}
-	return selector;
-}
+const DEFAULT_TAB_NAME = "main";
+const BROWSER_RUN_SCOPE: readonly string[] = ["tab", "page", "browser", "wait", "assert"];
 
-type ActionabilityResult = { ok: true; x: number; y: number } | { ok: false; reason: string };
-
-async function resolveActionableQueryHandlerClickTarget(handles: ElementHandle[]): Promise<ElementHandle | null> {
-	const candidates: Array<{
-		handle: ElementHandle;
-		rect: { x: number; y: number; w: number; h: number };
-		ownedProxy?: ElementHandle;
-	}> = [];
-
-	for (const handle of handles) {
-		let clickable: ElementHandle = handle;
-		let clickableProxy: ElementHandle | null = null;
-		try {
-			const proxy = await handle.evaluateHandle(el => {
-				const target =
-					(el as Element).closest(
-						'a,button,[role="button"],[role="link"],input[type="button"],input[type="submit"]',
-					) ?? el;
-				return target;
-			});
-			const nodeHandle = proxy.asElement();
-			clickableProxy = nodeHandle ? (nodeHandle as unknown as ElementHandle) : null;
-			if (clickableProxy) {
-				clickable = clickableProxy;
-			}
-		} catch {
-			// ignore
-		}
-
-		try {
-			const intersecting = await clickable.isIntersectingViewport();
-			if (!intersecting) continue;
-			const rect = (await clickable.evaluate(el => {
-				const r = (el as Element).getBoundingClientRect();
-				return { x: r.left, y: r.top, w: r.width, h: r.height };
-			})) as { x: number; y: number; w: number; h: number };
-			if (rect.w < 1 || rect.h < 1) continue;
-			candidates.push({ handle: clickable, rect, ownedProxy: clickableProxy ?? undefined });
-		} catch {
-			// ignore
-		} finally {
-			if (clickableProxy && clickableProxy !== handle && clickable !== clickableProxy) {
-				try {
-					await clickableProxy.dispose();
-				} catch {}
-			}
-		}
-	}
-
-	if (!candidates.length) return null;
-
-	// Prefer top-most visible element (nav/header usually wins), tie-break by left-most.
-	candidates.sort((a, b) => a.rect.y - b.rect.y || a.rect.x - b.rect.x);
-	const winner = candidates[0]?.handle ?? null;
-	// Dispose owned proxies for non-winning candidates
-	for (let i = 1; i < candidates.length; i++) {
-		const c = candidates[i]!;
-		if (c.ownedProxy) {
-			try {
-				await c.ownedProxy.dispose();
-			} catch {}
-		}
-	}
-	return winner;
-}
-
-async function isClickActionable(handle: ElementHandle): Promise<ActionabilityResult> {
-	return (await handle.evaluate(el => {
-		const element = el as HTMLElement;
-		const style = globalThis.getComputedStyle(element);
-		if (style.display === "none") return { ok: false as const, reason: "display:none" };
-		if (style.visibility === "hidden") return { ok: false as const, reason: "visibility:hidden" };
-		if (style.pointerEvents === "none") return { ok: false as const, reason: "pointer-events:none" };
-		if (Number(style.opacity) === 0) return { ok: false as const, reason: "opacity:0" };
-
-		const r = element.getBoundingClientRect();
-		if (r.width < 1 || r.height < 1) return { ok: false as const, reason: "zero-size" };
-
-		const vw = globalThis.innerWidth;
-		const vh = globalThis.innerHeight;
-		const left = Math.max(0, Math.min(vw, r.left));
-		const right = Math.max(0, Math.min(vw, r.right));
-		const top = Math.max(0, Math.min(vh, r.top));
-		const bottom = Math.max(0, Math.min(vh, r.bottom));
-		if (right - left < 1 || bottom - top < 1) return { ok: false as const, reason: "off-viewport" };
-
-		const x = Math.floor((left + right) / 2);
-		const y = Math.floor((top + bottom) / 2);
-		const topEl = globalThis.document.elementFromPoint(x, y);
-		if (!topEl) return { ok: false as const, reason: "elementFromPoint-null" };
-		if (topEl === element || element.contains(topEl) || (topEl as Element).contains(element)) {
-			return { ok: true as const, x, y };
-		}
-		return { ok: false as const, reason: "obscured" };
-	})) as ActionabilityResult;
-}
-
-async function clickQueryHandlerText(
-	page: Page,
-	selector: string,
-	timeoutMs: number,
-	signal?: AbortSignal,
-): Promise<void> {
-	const timeoutSignal = AbortSignal.timeout(timeoutMs);
-	const clickSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-	const start = Date.now();
-	let lastSeen = 0;
-	let lastReason: string | null = null;
-
-	while (Date.now() - start < timeoutMs) {
-		throwIfAborted(clickSignal);
-		const handles = (await untilAborted(clickSignal, () => page.$$(selector))) as ElementHandle[];
-		try {
-			lastSeen = handles.length;
-			const target = await resolveActionableQueryHandlerClickTarget(handles);
-			if (!target) {
-				lastReason = handles.length ? "no-visible-candidate" : "no-matches";
-				await Bun.sleep(100);
-				continue;
-			}
-			const actionability = await isClickActionable(target);
-			if (!actionability.ok) {
-				lastReason = actionability.reason;
-				await Bun.sleep(100);
-				continue;
-			}
-
-			try {
-				await untilAborted(clickSignal, () => target.click());
-				return;
-			} catch (err) {
-				lastReason = err instanceof Error ? err.message : String(err);
-				await Bun.sleep(100);
-			}
-		} finally {
-			await Promise.all(
-				handles.map(async h => {
-					try {
-						await h.dispose();
-					} catch {}
-				}),
-			);
-		}
-	}
-
-	throw new ToolError(
-		`Timed out clicking ${selector} (seen ${lastSeen} matches; last reason: ${lastReason ?? "unknown"}). ` +
-			"If there are multiple matching elements, use observe+click_id or a more specific selector.",
-	);
-}
-
-/**
- * Stealth init scripts for Puppeteer.
- */
-
-type PuppeteerCdpClient = {
-	send: (method: string, params?: Record<string, unknown>) => Promise<unknown>;
-};
-
-type UserAgentOverride = {
-	userAgent: string;
-	platform: string;
-	acceptLanguage: string;
-	userAgentMetadata: {
-		brands: Array<{ brand: string; version: string }>;
-		fullVersion: string;
-		platform: string;
-		platformVersion: string;
-		architecture: string;
-		model: string;
-		mobile: boolean;
-	};
-};
-
-function resolvePageClient(page: Page): PuppeteerCdpClient | null {
-	const pageWithClient = page as Page & {
-		_client?: (() => PuppeteerCdpClient) | PuppeteerCdpClient;
-	};
-	if (!pageWithClient._client) return null;
-	return typeof pageWithClient._client === "function" ? pageWithClient._client() : pageWithClient._client;
-}
-
-const puppeteerGetArgsSchema = Type.Array(
-	Type.Object({
-		selector: Type.String({
-			description:
-				"Selector for the target element (CSS, or puppeteer query handler like aria/, text/, xpath/, pierce/; also accepts legacy p- prefixes)",
-		}),
-		attribute: Type.Optional(Type.String({ description: "Attribute name (get_attribute)" })),
-	}),
-	{ description: "Batch arguments for get_* actions", minItems: 1 },
-);
-
-const browserSchema = Type.Object({
-	action: StringEnum(
-		[
-			"open",
-			"goto",
-			"observe",
-			"click",
-			"click_id",
-			"type",
-			"type_id",
-			"fill",
-			"fill_id",
-			"press",
-			"scroll",
-			"drag",
-			"wait_for_selector",
-			"evaluate",
-			"get_text",
-			"get_html",
-			"get_attribute",
-			"extract_readable",
-			"screenshot",
-			"close",
-		],
-		{ description: "Action to perform" },
-	),
-	url: Type.Optional(Type.String({ description: "URL to navigate to (goto)" })),
-	selector: Type.Optional(
-		Type.String({
-			description:
-				"Selector for the target element (CSS, or puppeteer query handler like aria/, text/, xpath/, pierce/; also accepts legacy p- prefixes)",
-		}),
-	),
-	element_id: Type.Optional(Type.Number({ description: "Element ID from observe" })),
-	include_all: Type.Optional(Type.Boolean({ description: "Include non-interactive nodes in observe" })),
-	viewport_only: Type.Optional(Type.Boolean({ description: "Limit observe output to elements in the viewport" })),
-	args: Type.Optional(puppeteerGetArgsSchema),
-	script: Type.Optional(Type.String({ description: "JavaScript to evaluate (evaluate)" })),
-	text: Type.Optional(Type.String({ description: "Text to type (type)" })),
-	value: Type.Optional(Type.String({ description: "Value to set (fill)" })),
-	attribute: Type.Optional(Type.String({ description: "Attribute name to read (get_attribute)" })),
-	key: Type.Optional(Type.String({ description: "Keyboard key to press (press)" })),
-	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (default: 30)" })),
-	wait_until: Type.Optional(
-		StringEnum(["load", "domcontentloaded", "networkidle0", "networkidle2"], {
-			description: "Navigation wait condition (goto)",
-		}),
-	),
-	full_page: Type.Optional(Type.Boolean({ description: "Capture full page screenshot (screenshot)" })),
-	format: Type.Optional(
-		StringEnum(["text", "markdown"], {
-			description: "Output format for extract_readable (text/markdown)",
-		}),
-	),
-	path: Type.Optional(Type.String({ description: "Optional path to save screenshot (relative to cwd)" })),
-	viewport: Type.Optional(
-		Type.Object({
-			width: Type.Number({ description: "Viewport width in pixels" }),
-			height: Type.Number({ description: "Viewport height in pixels" }),
-			device_scale_factor: Type.Optional(Type.Number({ description: "Device scale factor" })),
-		}),
-	),
-	delta_x: Type.Optional(Type.Number({ description: "Scroll delta X (scroll)" })),
-	delta_y: Type.Optional(Type.Number({ description: "Scroll delta Y (scroll)" })),
-	from_selector: Type.Optional(
-		Type.String({
-			description:
-				"Drag start selector (CSS, or puppeteer query handler like aria/, text/, xpath/, pierce/; also accepts legacy p- prefixes)",
-		}),
-	),
-	to_selector: Type.Optional(
-		Type.String({
-			description:
-				"Drag end selector (CSS, or puppeteer query handler like aria/, text/, xpath/, pierce/; also accepts legacy p- prefixes)",
-		}),
-	),
+const appSchema = type({
+	"path?": type("string").describe("binary path to spawn"),
+	"cdp_url?": type("string").describe("existing cdp endpoint"),
+	"relay?": type("boolean").describe("drive the user's own tabs via the omp browser relay"),
+	"args?": type("string[]").describe("extra cli args"),
+	"target?": type("string").describe("substring to pick a window"),
 });
 
-/** Input schema for the Puppeteer tool. */
-export type BrowserParams = Static<typeof browserSchema>;
+const tabCallStepSchema = type({
+	method: "string",
+	args: "unknown[]",
+});
 
-/** Details describing a Puppeteer tool execution result. */
-export interface BrowserToolDetails {
-	action: BrowserParams["action"];
-	url?: string;
-	selector?: string;
-	elementId?: number;
-	result?: string | string[];
-	screenshotPath?: string;
-	mimeType?: string;
-	bytes?: number;
-	viewport?: { width: number; height: number; deviceScaleFactor?: number };
-	observation?: Observation;
-	readable?: ReadableResult;
+const browserSchema = type({
+	action: type("'open' | 'close' | 'run' | 'call'").describe("operation"),
+	"name?": type("string").describe("tab id (default 'main')"),
+	"url?": type("string").describe("url to open"),
+	"app?": appSchema,
+	"viewport?": {
+		width: "number",
+		height: "number",
+		"scale?": "number",
+	},
+	"wait_until?": type("'load' | 'domcontentloaded' | 'networkidle0' | 'networkidle2'").describe(
+		"navigation wait condition",
+	),
+	"dialogs?": type("'accept' | 'dismiss'").describe("auto-handle dialogs"),
+	"code?": type("string").describe("js body to run in tab"),
+	"fn?": type("string").describe("serialized JavaScript function to run in tab"),
+	"args?": type("unknown[]").describe("arguments passed to a serialized function"),
+	"chain?": tabCallStepSchema.array(),
+	"timeout?": type("number").describe("timeout in seconds"),
+	"all?": type("boolean").describe("release every managed tab"),
+	"kill?": type("boolean").describe("also kill spawned-app browsers"),
+	"persist?": type("boolean").describe("keep tab live across turn settle and idle close"),
+});
+
+type BrowserParams = typeof browserSchema.infer;
+
+interface BrowserPreludeDetails {
 	meta?: OutputMeta;
+	action: "open" | "close" | "run" | "call";
+	name: string;
+	url?: string;
+	browser?: BrowserKindTag;
+	viewport?: { width: number; height: number; deviceScaleFactor?: number };
+	screenshots?: ScreenshotResult[];
+	value?: unknown;
 }
 
-export interface ObservationEntry {
-	id: number;
-	role: string;
-	name?: string;
-	value?: string | number;
-	description?: string;
-	keyshortcuts?: string;
-	states: string[];
-}
-
-export interface Observation {
-	url: string;
-	title?: string;
-	viewport: { width: number; height: number; deviceScaleFactor?: number };
-	scroll: {
-		x: number;
-		y: number;
-		width: number;
-		height: number;
-		scrollWidth: number;
-		scrollHeight: number;
-	};
-	elements: ObservationEntry[];
-}
-
-export interface ReadableResult {
-	url: string;
-	title?: string;
-	byline?: string;
-	excerpt?: string;
-	contentLength: number;
-	text?: string;
-	markdown?: string;
-}
-
-function ensureParam<T>(value: T | undefined, name: string, action: string): T {
-	if (value === undefined || value === null || value === "") {
-		throw new ToolError(`Missing required parameter '${name}' for action '${action}'.`);
+function resolveBrowserKind(params: BrowserParams, session: ToolSession): BrowserKind {
+	const app = params.app;
+	if (app?.cdp_url) {
+		return { kind: "connected", cdpUrl: app.cdp_url.replace(/\/+$/, "") };
 	}
-	return value;
+	if (app?.path) {
+		const exe = resolveToCwd(app.path, session.cwd);
+		return { kind: "spawned", path: exe, args: resolveSpawnArgs(exe, app.args, session.cwd) };
+	}
+	const relayUrl = session.settings.get("browser.relayUrl");
+	// Explicit app.relay wins over every setting; PI_BROWSER_RELAY stays the
+	// final kill switch (a relay that is down would otherwise brick the tool).
+	if (app?.relay) {
+		const relayKind = resolveRelayKind({ settingEnabled: true, url: relayUrl });
+		if (relayKind) return relayKind;
+	}
+	// Relay before cdpUrl among settings: enabling the opt-out-by-default relay
+	// is a deliberate mode selection, while cdpUrl is a standing fallback
+	// endpoint. A configured endpoint is a default, not an override: explicit
+	// app options win.
+	if (app?.relay !== false) {
+		const relayKind = resolveRelayKind({
+			settingEnabled: session.settings.get("browser.relay"),
+			url: relayUrl,
+		});
+		if (relayKind) return relayKind;
+	}
+	const configuredCdpUrl = session.settings.get("browser.cdpUrl")?.trim();
+	if (configuredCdpUrl) {
+		return { kind: "connected", cdpUrl: configuredCdpUrl.replace(/\/+$/, "") };
+	}
+	const cmuxKind = resolveCmuxKind({
+		settingEnabled: session.settings.get("browser.cmux"),
+	});
+	if (cmuxKind) {
+		return cmuxKind;
+	}
+	const headless = session.settings.get("browser.headless");
+	return { kind: "headless", headless };
 }
 
-function formatEvaluateResult(value: unknown): string {
-	if (typeof value === "string") return value;
-	if (value === undefined) return "undefined";
-	try {
-		const serialized = JSON.stringify(value, null, 2);
-		return serialized ?? "undefined";
-	} catch {
-		return String(value);
+/** Create the enabled-only browser host prelude for one tool session. */
+export function createBrowserPrelude(session: ToolSession): EvalPreludeDefinition {
+	// Eval-first-use boundary: source/declaration assets stay unloaded until a
+	// JavaScript or Python kernel actually asks for its enabled preludes.
+	const { createBrowserPreludeDefinition } = require("./browser/prelude-definition");
+	return createBrowserPreludeDefinition(session, {
+		invoke: (parameters: unknown, context: EvalPreludeContext) => invokeBrowser(session, parameters, context),
+		status: describeBrowserCall,
+	});
+}
+
+/** Status-tree line for a completed browser call: `open main https://…`, `main.id(5).click()`, `close all`. */
+function describeBrowserCall(parameters: unknown, result: AgentToolResult<unknown>): string | undefined {
+	const parsed = browserSchema(parameters);
+	if (parsed instanceof type.errors) return undefined;
+	const name = parsed.name ?? DEFAULT_TAB_NAME;
+	switch (parsed.action) {
+		case "open": {
+			const url = isRecord(result.details) ? result.details.url : undefined;
+			return typeof url === "string" && url.length > 0 ? `open ${name} ${url}` : `open ${name}`;
+		}
+		case "close":
+			return parsed.all ? "close all" : `close ${name}`;
+		case "run":
+			return `${name}.run(${parsed.fn !== undefined ? "fn" : (parsed.code?.trim().split("\n", 1)[0] ?? "")})`;
+		case "call":
+			return `${name}.${renderCallChain(parsed.chain ?? [])}`;
 	}
+}
+
+/** Drop headless tabs so a browser mode change applies to the next open. */
+export async function restartBrowserForModeChange(): Promise<void> {
+	await dropHeadlessTabs();
 }
 
 /**
- * Puppeteer tool for headless browser automation.
+ * Best-effort idle-close sweep for the calling session's owned headless
+ * tabs. Never throws — callers detach it (`void`) so a slow reap cannot
+ * delay the open it follows.
  */
-export class BrowserTool implements AgentTool<typeof browserSchema, BrowserToolDetails> {
-	readonly name = "puppeteer";
-	readonly label = "Puppeteer";
-	readonly description: string;
-	readonly parameters = browserSchema;
-	readonly strict = true;
-	#browser: Browser | null = null;
-	#page: Page | null = null;
-	#currentHeadless: boolean | null = null;
-	#browserSession: CDPSession | null = null;
-	#userAgentOverride: UserAgentOverride | null = null;
-	#elementIdCounter = 0;
-	readonly #elementCache = new Map<number, ElementHandle>();
-	readonly #patchedClients = new WeakSet<object>();
-
-	constructor(private readonly session: ToolSession) {
-		this.description = renderPromptTemplate(browserDescription, {});
+function sweepIdleOwnedTabs(session: ToolSession): Promise<number> {
+	const ownerId = session.getSessionId?.() ?? undefined;
+	if (!ownerId) return Promise.resolve(0);
+	const idleSec = session.settings.get("browser.idleCloseSec");
+	if (!(idleSec > 0)) {
+		cancelIdleCloseForOwner(ownerId);
+		return Promise.resolve(0);
 	}
-
-	async #closeBrowser(): Promise<void> {
-		await this.#clearElementCache();
-		if (this.#page && !this.#page.isClosed()) {
-			await this.#page.close();
-		}
-		this.#page = null;
-		if (this.#browser?.connected) {
-			await this.#browser.close();
-		}
-		this.#browser = null;
-		this.#browserSession = null;
-		this.#userAgentOverride = null;
-	}
-
-	async #resetBrowser(params?: BrowserParams): Promise<Page> {
-		await this.#closeBrowser();
-		this.#currentHeadless = this.session.settings.get("browser.headless");
-		const vp = params?.viewport;
-		const initialViewport = vp
-			? {
-					width: vp.width,
-					height: vp.height,
-					deviceScaleFactor: vp.device_scale_factor ?? DEFAULT_VIEWPORT.deviceScaleFactor,
-				}
-			: DEFAULT_VIEWPORT;
-		const puppeteer = await loadPuppeteer();
-		this.#browser = await puppeteer.launch({
-			headless: this.#currentHeadless,
-			defaultViewport: this.#currentHeadless ? initialViewport : null,
-			args: [
-				"--no-sandbox",
-				"--disable-setuid-sandbox",
-				"--disable-blink-features=AutomationControlled",
-				`--window-size=${initialViewport.width},${initialViewport.height}`,
-			],
-			ignoreDefaultArgs: [...STEALTH_IGNORE_DEFAULT_ARGS],
+	return releaseIdleTabsForOwner(ownerId, { idleMs: idleSec * 1000 }).catch((error: unknown) => {
+		logger.debug("Browser idle-close sweep failed", {
+			error: error instanceof Error ? error.message : String(error),
 		});
-		this.#page = await this.#browser.newPage();
-		await this.#applyStealthPatches(this.#page);
-		if (this.#currentHeadless || params?.viewport) {
-			await this.#applyViewport(this.#page, params?.viewport);
-		}
-		return this.#page;
+		return 0;
+	});
+}
+
+async function invokeBrowser(
+	session: ToolSession,
+	parameters: unknown,
+	context: EvalPreludeContext,
+): Promise<AgentToolResult<unknown>> {
+	const parsed = browserSchema(parameters);
+	if (parsed instanceof type.errors) {
+		throw new ToolError(`browser received invalid arguments: ${parsed.summary}`);
 	}
 
-	async #ensurePage(params?: BrowserParams): Promise<Page> {
-		const desiredHeadless = this.session.settings.get("browser.headless");
-		if (this.#currentHeadless !== null && this.#currentHeadless !== desiredHeadless) {
-			return this.#resetBrowser(params);
-		}
-		if (this.#page && !this.#page.isClosed()) {
-			return this.#page;
-		}
-		if (!this.#browser || !this.#browser.isConnected()) {
-			return this.#resetBrowser(params);
-		}
-		this.#page = await this.#browser.newPage();
-		await this.#applyStealthPatches(this.#page);
-		if (this.#currentHeadless || params?.viewport) {
-			await this.#applyViewport(this.#page, params?.viewport);
-		}
-		return this.#page;
-	}
+	try {
+		throwIfAborted(context.signal);
+		const timeoutSeconds = clampTimeout("browser", parsed.timeout, session.settings.get("tools.maxTimeout"));
+		const timeoutMs = timeoutSeconds * 1000;
+		const name = parsed.name ?? DEFAULT_TAB_NAME;
+		const details: BrowserPreludeDetails = { action: parsed.action, name };
 
-	async #applyViewport(page: Page, viewport?: BrowserParams["viewport"]): Promise<void> {
-		if (!viewport) {
-			await page.setViewport(DEFAULT_VIEWPORT);
-			return;
+		switch (parsed.action) {
+			case "open":
+				return await openBrowser(session, name, parsed, details, timeoutMs, context.signal);
+			case "close":
+				return await closeBrowser(name, parsed, details, timeoutMs, context.signal);
+			case "run":
+			case "call":
+				return await runBrowser(session, name, parsed, details, timeoutMs, context.signal);
 		}
-		await page.setViewport({
-			width: viewport.width,
-			height: viewport.height,
-			deviceScaleFactor: viewport.device_scale_factor ?? DEFAULT_VIEWPORT.deviceScaleFactor,
-		});
+	} catch (error) {
+		if (error instanceof ToolAbortError) throw error;
+		if (error instanceof Error && error.name === "AbortError") {
+			throw new ToolAbortError();
+		}
+		throw error;
 	}
+}
 
-	async #clearElementCache(): Promise<void> {
-		if (this.#elementCache.size === 0) {
-			this.#elementIdCounter = 0;
-			return;
-		}
-		const handles = Array.from(this.#elementCache.values());
-		this.#elementCache.clear();
-		this.#elementIdCounter = 0;
-		await Promise.all(
-			handles.map(async handle => {
-				try {
-					await handle.dispose();
-				} catch {
-					return;
-				}
-			}),
+async function openBrowser(
+	session: ToolSession,
+	name: string,
+	params: BrowserParams,
+	details: BrowserPreludeDetails,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+	const kind = resolveBrowserKind(params, session);
+	details.browser = kind.kind;
+
+	// If a tab with this name already exists on a different browser kind, fail fast — caller must close first.
+	const existing = getTab(name);
+	if (existing && browserKey(existing.browser.kind) !== browserKey(kind)) {
+		throw new ToolError(
+			`Tab ${JSON.stringify(name)} is bound to a different browser (${describeKind(existing.browser.kind)}). Close it first.`,
 		);
 	}
 
-	async #resolveCachedHandle(id: number): Promise<ElementHandle> {
-		const handle = this.#elementCache.get(id);
-		if (!handle) {
-			throw new ToolError(`Unknown element_id ${id}. Run observe to refresh the element list.`);
-		}
-		try {
-			const isConnected = (await handle.evaluate(el => el.isConnected)) as boolean;
-			if (!isConnected) {
-				await this.#clearElementCache();
-				throw new ToolError(`Element_id ${id} is stale. Run observe again.`);
-			}
-		} catch {
-			await this.#clearElementCache();
-			throw new ToolError(`Element_id ${id} is stale. Run observe again.`);
-		}
-		return handle;
-	}
+	// First browser use may have to download Chrome for Testing (~180 MB).
+	// That is a one-time install, not part of the open, so it runs before the
+	// deadline below starts: charged against the 30s default it timed out on
+	// connections where installation alone exceeds that budget.
+	// The download promise is module-cached, so a caller abort here leaves it
+	// finishing in the background and the next open picks up the result.
+	if (kind.kind === "headless") await untilAborted(signal, () => ensureChromiumExecutable());
 
-	#isInteractiveNode(node: SerializedAXNode): boolean {
-		if (INTERACTIVE_AX_ROLES.has(node.role)) return true;
-		return (
-			node.checked !== undefined ||
-			node.pressed !== undefined ||
-			node.selected !== undefined ||
-			node.expanded !== undefined ||
-			node.focused === true
-		);
-	}
-
-	async #collectObservationEntries(
-		node: SerializedAXNode,
-		entries: ObservationEntry[],
-		options: { viewportOnly: boolean; includeAll: boolean },
-	): Promise<void> {
-		if (options.includeAll || this.#isInteractiveNode(node)) {
-			const handle = await node.elementHandle();
-			if (handle) {
-				let inViewport = true;
-				if (options.viewportOnly) {
-					try {
-						inViewport = await handle.isIntersectingViewport();
-					} catch {
-						inViewport = false;
-					}
-				}
-				if (inViewport) {
-					const id = ++this.#elementIdCounter;
-					const states: string[] = [];
-					if (node.disabled) states.push("disabled");
-					if (node.checked !== undefined) states.push(`checked=${String(node.checked)}`);
-					if (node.pressed !== undefined) states.push(`pressed=${String(node.pressed)}`);
-					if (node.selected !== undefined) states.push(`selected=${String(node.selected)}`);
-					if (node.expanded !== undefined) states.push(`expanded=${String(node.expanded)}`);
-					if (node.required) states.push("required");
-					if (node.readonly) states.push("readonly");
-					if (node.multiselectable) states.push("multiselectable");
-					if (node.multiline) states.push("multiline");
-					if (node.modal) states.push("modal");
-					if (node.focused) states.push("focused");
-					this.#elementCache.set(id, handle);
-					entries.push({
-						id,
-						role: node.role,
-						name: node.name,
-						value: node.value,
-						description: node.description,
-						keyshortcuts: node.keyshortcuts,
-						states,
-					});
-				} else {
-					await handle.dispose();
-				}
-			}
-		}
-		for (const child of node.children ?? []) {
-			await this.#collectObservationEntries(child, entries, options);
-		}
-	}
-
-	#formatObservation(observation: Observation): string {
-		const viewport = `${observation.viewport.width}x${observation.viewport.height}`;
-		const scroll = `x=${observation.scroll.x} y=${observation.scroll.y} viewport=${observation.scroll.width}x${observation.scroll.height} doc=${observation.scroll.scrollWidth}x${observation.scroll.scrollHeight}`;
-		const lines = [
-			`URL: ${observation.url}`,
-			observation.title ? `Title: ${observation.title}` : "Title:",
-			`Viewport: ${viewport}`,
-			`Scroll: ${scroll}`,
-			"Elements:",
-		];
-		for (const entry of observation.elements) {
-			const name = entry.name ? ` "${entry.name}"` : "";
-			const value = entry.value !== undefined ? ` value=${JSON.stringify(entry.value)}` : "";
-			const description = entry.description ? ` desc=${JSON.stringify(entry.description)}` : "";
-			const shortcuts = entry.keyshortcuts ? ` shortcuts=${JSON.stringify(entry.keyshortcuts)}` : "";
-			const state = entry.states.length ? ` (${entry.states.join(", ")})` : "";
-			lines.push(`${entry.id}. ${entry.role}${name}${value}${description}${shortcuts}${state}`);
-		}
-		return lines.join("\n");
-	}
-
-	/**
-	 * Restart the browser to apply changes like headless mode.
-	 */
-	async restartForModeChange(): Promise<void> {
-		await this.#resetBrowser();
-	}
-
-	async #applyStealthPatches(page: Page): Promise<void> {
-		this.#patchSourceUrl(page);
-		await this.#applyUserAgentOverride(page);
-		await this.#injectStealthScripts(page);
-	}
-
-	async #applyUserAgentOverride(page: Page): Promise<void> {
-		const client = resolvePageClient(page);
-		if (!client) return;
-		const override = await this.#resolveUserAgentOverride(page);
-		await this.#sendUserAgentOverride(client, override);
-		await this.#configureUserAgentTargets(override);
-	}
-
-	async #resolveUserAgentOverride(page: Page): Promise<UserAgentOverride> {
-		if (this.#userAgentOverride) return this.#userAgentOverride;
-		const rawUserAgent = await page.browser().userAgent();
-		let userAgent = rawUserAgent.replace("HeadlessChrome/", "Chrome/");
-		if (userAgent.includes("Linux") && !userAgent.includes("Android")) {
-			userAgent = userAgent.replace(/\(([^)]+)\)/, "(Windows NT 10.0; Win64; x64)");
-		}
-
-		const uaVersionMatch = userAgent.match(/Chrome\/([\d|.]+)/);
-		const fallbackVersionMatch = uaVersionMatch ?? (await page.browser().version()).match(/\/([\d|.]+)/);
-		const uaVersion = fallbackVersionMatch?.[1] ?? "0";
-		const majorVersion = Number.parseInt(uaVersion.split(".")[0] ?? "0", 10) || 0;
-		const isAndroid = userAgent.includes("Android");
-		const platform = userAgent.includes("Mac OS X")
-			? "MacIntel"
-			: isAndroid
-				? "Android"
-				: userAgent.includes("Linux")
-					? "Linux"
-					: "Win32";
-		const platformFull = userAgent.includes("Mac OS X")
-			? "Mac OS X"
-			: isAndroid
-				? "Android"
-				: userAgent.includes("Linux")
-					? "Linux"
-					: "Windows";
-		const platformVersion = userAgent.includes("Mac OS X ")
-			? (userAgent.match(/Mac OS X ([^)]+)/)?.[1] ?? "")
-			: userAgent.includes("Android ")
-				? (userAgent.match(/Android ([^;]+)/)?.[1] ?? "")
-				: userAgent.includes("Windows ")
-					? (userAgent.match(/Windows .*?([\d|.]+);?/)?.[1] ?? "")
-					: "";
-		const architecture = isAndroid ? "" : "x86";
-		const model = isAndroid ? (userAgent.match(/Android.*?;\s([^)]+)/)?.[1] ?? "") : "";
-
-		const brandOrders = [
-			[0, 1, 2],
-			[0, 2, 1],
-			[1, 0, 2],
-			[1, 2, 0],
-			[2, 0, 1],
-			[2, 1, 0],
-		];
-		const order = brandOrders[majorVersion % brandOrders.length] ?? brandOrders[0];
-		const escapedChars = [" ", " ", ";"];
-		const greaseyBrand = `${escapedChars[order[0]]}Not${escapedChars[order[1]]}A${escapedChars[order[2]]}Brand`;
-		const brands: { brand: string; version: string }[] = [];
-		brands[order[0]] = { brand: greaseyBrand, version: "99" };
-		brands[order[1]] = { brand: "Chromium", version: String(majorVersion) };
-		brands[order[2]] = { brand: "Google Chrome", version: String(majorVersion) };
-
-		this.#userAgentOverride = {
-			userAgent,
-			platform,
-			acceptLanguage: STEALTH_ACCEPT_LANGUAGE,
-			userAgentMetadata: {
-				brands,
-				fullVersion: uaVersion,
-				platform: platformFull,
-				platformVersion,
-				architecture,
-				model,
-				mobile: isAndroid,
-			},
-		};
-		return this.#userAgentOverride;
-	}
-
-	async #configureUserAgentTargets(override: UserAgentOverride): Promise<void> {
-		if (!this.#browser) return;
-		if (!this.#browserSession) {
-			this.#browserSession = await this.#browser.target().createCDPSession();
-			await this.#browserSession.send("Target.setAutoAttach", {
-				autoAttach: true,
-				waitForDebuggerOnStart: false,
-				flatten: true,
-			});
-			this.#browserSession.on("Target.attachedToTarget", async (event: { sessionId: string }) => {
-				const connection = this.#browserSession?.connection();
-				const session = connection?.session(event.sessionId);
-				if (!session || !this.#userAgentOverride) return;
-				await this.#sendUserAgentOverride(this.#wrapSession(session), this.#userAgentOverride);
-			});
-		}
-
-		const targets = this.#browser.targets();
-		await Promise.all(
-			targets.map(async target => {
-				const session = await target.createCDPSession();
-				await this.#sendUserAgentOverride(this.#wrapSession(session), override);
-			}),
-		);
-	}
-
-	#wrapSession(session: CDPSession): PuppeteerCdpClient {
-		return {
-			send: async (method, params) => session.send(method as never, params as never),
-		};
-	}
-
-	async #sendUserAgentOverride(client: PuppeteerCdpClient, override: UserAgentOverride): Promise<void> {
-		try {
-			await client.send("Network.enable");
-		} catch {}
-		try {
-			await client.send("Network.setUserAgentOverride", override);
-		} catch (error) {
-			logger.debug("Failed to apply Network user agent override", {
-				error: error instanceof Error ? error.message : String(error),
-			});
-		}
-		try {
-			await client.send("Emulation.setUserAgentOverride", override);
-		} catch (error) {
-			logger.debug("Failed to apply Emulation user agent override", {
-				error: error instanceof Error ? error.message : String(error),
-			});
-		}
-	}
-
-	#patchSourceUrl(page: Page): void {
-		const client = resolvePageClient(page);
-		if (!client) return;
-		const clientKey = client as object;
-		if (this.#patchedClients.has(clientKey)) return;
-		this.#patchedClients.add(clientKey);
-		const originalSend = client.send.bind(client);
-		client.send = async (method: string, params?: Record<string, unknown>) => {
-			const next = async (payload?: Record<string, unknown>) => {
-				try {
-					return await originalSend(method, payload);
-				} catch (error) {
-					if (
-						error instanceof Error &&
-						error.message.includes(
-							"Protocol error (Network.getResponseBody): No resource with given identifier found",
-						)
-					) {
-						return undefined;
-					}
-					throw error;
-				}
-			};
-			if (!method || !params) {
-				return next(params);
-			}
-			const key =
-				method === "Runtime.evaluate"
-					? "expression"
-					: method === "Runtime.callFunctionOn"
-						? "functionDeclaration"
-						: null;
-			if (!key) {
-				return next(params);
-			}
-			const value = params[key];
-			if (typeof value !== "string" || !value.includes(PUPPETEER_SOURCE_URL_SUFFIX)) {
-				return next(params);
-			}
-			const patchedParams = { ...params, [key]: value.replace(PUPPETEER_SOURCE_URL_SUFFIX, "") };
-			return next(patchedParams);
-		};
-	}
-
-	/** Injects stealth scripts that cover common puppeteer detection surfaces. */
-	async #injectStealthScripts(page: Page): Promise<void> {
-		const scripts = [
-			stealthTamperingScript,
-			stealthActivityScript,
-			stealthHairlineScript,
-			stealthBotdScript,
-			stealthIframeScript,
-			stealthWebglScript,
-			stealthScreenScript,
-			stealthFontsScript,
-			stealthAudioScript,
-			stealthLocaleScript,
-			stealthPluginsScript,
-			stealthHardwareScript,
-			stealthCodecsScript,
-			stealthWorkerScript,
-		];
-
-		const joint = scripts
-			.map(
-				script => `
-		try {
-			${script};
-		} catch (e) {}
-	`,
-			)
-			.join(";\n");
-
-		await page.evaluateOnNewDocument(`(() => {
-				// Native function cache - captured before any tampering
-				const iframe = document.createElement("iframe");
-				iframe.style.display = "none";
-				document.head.appendChild(iframe);
-				const nativeWindow = iframe.contentWindow;
-				if (!nativeWindow) return;
-
-				// Cache pristine native functions
-				const Function_toString = nativeWindow.Function.prototype.toString;
-				const Object_getOwnPropertyDescriptor = nativeWindow.Object.getOwnPropertyDescriptor;
-				const Object_getOwnPropertyDescriptors = nativeWindow.Object.getOwnPropertyDescriptors;
-				const Object_getPrototypeOf = nativeWindow.Object.getPrototypeOf;
-				const Object_defineProperty = nativeWindow.Object.defineProperty;
-				const Object_getOwnPropertyDescriptorOriginal = nativeWindow.Object.getOwnPropertyDescriptor;
-				const Object_create = nativeWindow.Object.create;
-				const Object_keys = nativeWindow.Object.keys;
-				const Object_getOwnPropertyNames = nativeWindow.Object.getOwnPropertyNames;
-				const Object_entries = nativeWindow.Object.entries;
-				const Object_setPrototypeOf = nativeWindow.Object.setPrototypeOf;
-				const Object_assign = nativeWindow.Object.assign;
-				const Window_setTimeout = nativeWindow.setTimeout;
-				const Math_random = nativeWindow.Math.random;
-				const Math_floor = nativeWindow.Math.floor;
-				const Math_max = nativeWindow.Math.max;
-				const Math_min = nativeWindow.Math.min;
-				const Window_Event = nativeWindow.Event;
-				const Promise_resolve = nativeWindow.Promise.resolve.bind(nativeWindow.Promise);
-				const Window_Blob = nativeWindow.Blob;
-				const Window_Proxy = nativeWindow.Proxy;
-				const Intl_DateTimeFormat = nativeWindow.Intl.DateTimeFormat;
-				const Date_constructor = nativeWindow.Date;
-
-				
-				${joint}
-
-				document.head.removeChild(iframe);})();`);
-	}
-
-	async execute(
-		_toolCallId: string,
-		params: BrowserParams,
-		signal?: AbortSignal,
-		_onUpdate?: AgentToolUpdateCallback<BrowserToolDetails>,
-		_ctx?: AgentToolContext,
-	): Promise<AgentToolResult<BrowserToolDetails>> {
-		try {
-			throwIfAborted(signal);
-			const timeoutSeconds = clampTimeout("browser", params.timeout);
-			const timeoutMs = timeoutSeconds * 1000;
-			const details: BrowserToolDetails = { action: params.action };
-
-			switch (params.action) {
-				case "open": {
-					const page = await untilAborted(signal, () => this.#resetBrowser(params));
-					const viewport = page.viewport();
-					details.viewport = viewport ?? DEFAULT_VIEWPORT;
-					return toolResult(details).text("Opened headless browser session").done();
-				}
-				case "close": {
-					await untilAborted(signal, () => this.#closeBrowser());
-					return toolResult(details).text("Closed headless browser session").done();
-				}
-				case "goto": {
-					const url = ensureParam(params.url, "url", params.action);
-					details.url = url;
-					const page = await this.#ensurePage(params);
-					const waitUntil = params.wait_until ?? "networkidle2";
-					await this.#clearElementCache();
-					await untilAborted(signal, () => page.goto(url, { waitUntil, timeout: timeoutMs }));
-					const finalUrl = page.url();
-					const title = (await untilAborted(signal, () => page.title())) as string;
-					details.url = finalUrl;
-					details.result = title;
-					return toolResult(details)
-						.text(`Navigated to ${finalUrl}${title ? `\nTitle: ${title}` : ""}`)
-						.done();
-				}
-				case "observe": {
-					const page = await this.#ensurePage(params);
-					const timeoutSignal = AbortSignal.timeout(timeoutMs);
-					const observeSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
-					await this.#clearElementCache();
-					const snapshot = (await untilAborted(observeSignal, () =>
-						page.accessibility.snapshot({ interestingOnly: !(params.include_all ?? false) }),
-					)) as SerializedAXNode | null;
-					if (!snapshot) {
-						throw new ToolError("Accessibility snapshot unavailable");
-					}
-					const entries: ObservationEntry[] = [];
-					await this.#collectObservationEntries(snapshot, entries, {
-						viewportOnly: params.viewport_only ?? false,
-						includeAll: params.include_all ?? false,
-					});
-					const scroll = (await untilAborted(observeSignal, () =>
-						page.evaluate(() => {
-							const win = globalThis as unknown as {
-								scrollX: number;
-								scrollY: number;
-								innerWidth: number;
-								innerHeight: number;
-								document: { documentElement: { scrollWidth: number; scrollHeight: number } };
-							};
-							const doc = win.document.documentElement;
-							return {
-								x: win.scrollX,
-								y: win.scrollY,
-								width: win.innerWidth,
-								height: win.innerHeight,
-								scrollWidth: doc.scrollWidth,
-								scrollHeight: doc.scrollHeight,
-							};
-						}),
-					)) as Observation["scroll"];
-					const url = page.url();
-					const title = (await untilAborted(observeSignal, () => page.title())) as string;
-					const viewport = page.viewport() ?? DEFAULT_VIEWPORT;
-					const observation: Observation = {
-						url,
-						title,
-						viewport,
-						scroll,
-						elements: entries,
-					};
-					details.url = url;
-					details.viewport = viewport;
-					details.observation = observation;
-					details.result = `${entries.length} elements`;
-					return toolResult(details).text(this.#formatObservation(observation)).done();
-				}
-				case "click": {
-					const selector = ensureParam(params.selector, "selector", params.action);
-					details.selector = selector;
-					const page = await this.#ensurePage(params);
-					const resolvedSelector = normalizeSelector(selector);
-					if (resolvedSelector.startsWith("text/")) {
-						await clickQueryHandlerText(page, resolvedSelector, timeoutMs, signal);
-					} else {
-						const locator = page.locator(resolvedSelector).setTimeout(timeoutMs);
-						await untilAborted(signal, () => locator.click());
-					}
-					return toolResult(details).text(`Clicked ${selector}`).done();
-				}
-				case "click_id": {
-					const elementId = ensureParam(params.element_id, "element_id", params.action);
-					details.elementId = elementId;
-					const handle = await this.#resolveCachedHandle(elementId);
-					try {
-						await untilAborted(signal, () => handle.click());
-					} catch {
-						await this.#clearElementCache();
-						throw new ToolError(`Element_id ${elementId} is stale. Run observe again.`);
-					}
-					return toolResult(details).text(`Clicked element ${elementId}`).done();
-				}
-				case "type": {
-					const selector = ensureParam(params.selector, "selector", params.action);
-					const text = ensureParam(params.text, "text", params.action);
-					details.selector = selector;
-					const page = await this.#ensurePage(params);
-					const resolvedSelector = normalizeSelector(selector);
-					const locator = page.locator(resolvedSelector).setTimeout(timeoutMs);
-					const handle = (await untilAborted(signal, () => locator.waitHandle())) as ElementHandle;
-					await untilAborted(signal, () => handle.type(text, { delay: 0 }));
-					await handle.dispose();
-					return toolResult(details).text(`Typed into ${selector}`).done();
-				}
-				case "type_id": {
-					const elementId = ensureParam(params.element_id, "element_id", params.action);
-					const text = ensureParam(params.text, "text", params.action);
-					details.elementId = elementId;
-					const page = await this.#ensurePage(params);
-					const handle = await this.#resolveCachedHandle(elementId);
-					try {
-						await untilAborted(signal, () => handle.focus());
-						await untilAborted(signal, () => page.keyboard.type(text, { delay: 0 }));
-					} catch {
-						await this.#clearElementCache();
-						throw new ToolError(`Element_id ${elementId} is stale. Run observe again.`);
-					}
-					return toolResult(details).text(`Typed into element ${elementId}`).done();
-				}
-				case "fill": {
-					const selector = ensureParam(params.selector, "selector", params.action);
-					const value = ensureParam(params.value, "value", params.action);
-					details.selector = selector;
-					const page = await this.#ensurePage(params);
-					const resolvedSelector = normalizeSelector(selector);
-					const locator = page.locator(resolvedSelector).setTimeout(timeoutMs);
-					await untilAborted(signal, () => locator.fill(value));
-					return toolResult(details).text(`Filled ${selector}`).done();
-				}
-				case "fill_id": {
-					const elementId = ensureParam(params.element_id, "element_id", params.action);
-					const value = ensureParam(params.value, "value", params.action);
-					details.elementId = elementId;
-					const handle = await this.#resolveCachedHandle(elementId);
-					try {
-						await untilAborted(signal, () =>
-							handle.evaluate((el, inputValue) => {
-								const element = el as { value?: string; dispatchEvent: (event: Event) => boolean };
-								if (!("value" in element)) {
-									throw new Error("Target element is not a form input");
-								}
-								element.value = String(inputValue);
-								element.dispatchEvent(new Event("input", { bubbles: true }));
-								element.dispatchEvent(new Event("change", { bubbles: true }));
-							}, value),
-						);
-					} catch {
-						await this.#clearElementCache();
-						throw new ToolError(`Element_id ${elementId} is stale. Run observe again.`);
-					}
-					return toolResult(details).text(`Filled element ${elementId}`).done();
-				}
-				case "press": {
-					const key = ensureParam(params.key, "key", params.action) as KeyInput;
-					const page = await this.#ensurePage(params);
-					if (params.selector) {
-						const resolvedSelector = normalizeSelector(params.selector as string);
-						await untilAborted(signal, () => page.focus(resolvedSelector));
-					}
-					await untilAborted(signal, () => page.keyboard.press(key));
-					return toolResult(details).text(`Pressed ${key}`).done();
-				}
-				case "scroll": {
-					const deltaY = ensureParam(params.delta_y, "delta_y", params.action);
-					const deltaX = params.delta_x ?? 0;
-					const page = await this.#ensurePage(params);
-					await untilAborted(signal, () => page.mouse.wheel({ deltaX, deltaY }));
-					return toolResult(details).text(`Scrolled by ${deltaX}, ${deltaY}`).done();
-				}
-				case "drag": {
-					const fromSelector = ensureParam(params.from_selector, "from_selector", params.action);
-					const toSelector = ensureParam(params.to_selector, "to_selector", params.action);
-					const page = await this.#ensurePage(params);
-					const resolvedFromSelector = normalizeSelector(fromSelector);
-					const resolvedToSelector = normalizeSelector(toSelector);
-					const fromHandle = (await untilAborted(signal, () =>
-						page.$(resolvedFromSelector),
-					)) as ElementHandle | null;
-					const toHandle = (await untilAborted(signal, () => page.$(resolvedToSelector))) as ElementHandle | null;
-					if (!fromHandle || !toHandle) {
-						throw new ToolError("Drag selectors did not resolve to elements");
-					}
-					const fromBox = (await untilAborted(signal, () => fromHandle.boundingBox())) as {
-						x: number;
-						y: number;
-						width: number;
-						height: number;
-					} | null;
-					const toBox = (await untilAborted(signal, () => toHandle.boundingBox())) as {
-						x: number;
-						y: number;
-						width: number;
-						height: number;
-					} | null;
-					await fromHandle.dispose();
-					await toHandle.dispose();
-					if (!fromBox || !toBox) {
-						throw new ToolError("Drag elements are not visible");
-					}
-					const startX = fromBox.x + fromBox.width / 2;
-					const startY = fromBox.y + fromBox.height / 2;
-					const endX = toBox.x + toBox.width / 2;
-					const endY = toBox.y + toBox.height / 2;
-					await untilAborted(signal, () => page.mouse.move(startX, startY));
-					await untilAborted(signal, () => page.mouse.down());
-					await untilAborted(signal, () => page.mouse.move(endX, endY, { steps: 12 }));
-					await untilAborted(signal, () => page.mouse.up());
-					return toolResult(details).text(`Dragged from ${fromSelector} to ${toSelector}`).done();
-				}
-				case "wait_for_selector": {
-					const selector = ensureParam(params.selector, "selector", params.action);
-					details.selector = selector;
-					const page = await this.#ensurePage(params);
-					const resolvedSelector = normalizeSelector(selector);
-					const locator = page.locator(resolvedSelector).setTimeout(timeoutMs);
-					await untilAborted(signal, () => locator.wait());
-					return toolResult(details).text(`Selector ready: ${selector}`).done();
-				}
-				case "evaluate": {
-					const script = ensureParam(params.script, "script", params.action);
-					const page = await this.#ensurePage(params);
-					const value = (await untilAborted(signal, () =>
-						page.evaluate(async (source: string) => {
-							try {
-								return await new Function(`return (async () => (${source}))();`)();
-							} catch {
-								return await new Function(`return (async () => { ${source} })();`)();
-							}
-						}, script),
-					)) as unknown;
-					const output = formatEvaluateResult(value);
-					details.result = output;
-					return toolResult(details).text(output).done();
-				}
-				case "get_text": {
-					const page = await this.#ensurePage(params);
-					if (params.args?.length) {
-						const values = (await Promise.all(
-							params.args.map((arg, index) => {
-								const selector = ensureParam(arg.selector, `args[${index}].selector`, params.action);
-								const resolvedSelector = normalizeSelector(selector);
-								return untilAborted(signal, () =>
-									page.$eval(resolvedSelector, (el: Element) => (el as HTMLElement).innerText),
-								);
-							}),
-						)) as string[];
-						details.result = values;
-						return toolResult(details)
-							.text(JSON.stringify(values, null, 2))
-							.done();
-					}
-					const selector = ensureParam(params.selector, "selector", params.action);
-					details.selector = selector;
-					const resolvedSelector = normalizeSelector(selector);
-					const value = (await untilAborted(signal, () =>
-						page.$eval(resolvedSelector, (el: Element) => (el as HTMLElement).innerText),
-					)) as string;
-					details.result = value;
-					return toolResult(details).text(value).done();
-				}
-				case "get_html": {
-					const page = await this.#ensurePage(params);
-					if (params.args?.length) {
-						const values = (await Promise.all(
-							params.args.map((arg, index) => {
-								const selector = ensureParam(arg.selector, `args[${index}].selector`, params.action);
-								const resolvedSelector = normalizeSelector(selector);
-								return untilAborted(signal, () =>
-									page.$eval(resolvedSelector, (el: Element) => (el as HTMLElement).innerHTML),
-								);
-							}),
-						)) as string[];
-						details.result = values;
-						return toolResult(details)
-							.text(JSON.stringify(values, null, 2))
-							.done();
-					}
-					const selector = ensureParam(params.selector, "selector", params.action);
-					details.selector = selector;
-					const resolvedSelector = normalizeSelector(selector);
-					const value = (await untilAborted(signal, () =>
-						page.$eval(resolvedSelector, (el: Element) => (el as HTMLElement).innerHTML),
-					)) as string;
-					details.result = value;
-					return toolResult(details).text(value).done();
-				}
-				case "get_attribute": {
-					const page = await this.#ensurePage(params);
-					if (params.args?.length) {
-						const values = (await Promise.all(
-							params.args.map((arg, index) => {
-								const selector = ensureParam(arg.selector, `args[${index}].selector`, params.action);
-								const attribute = ensureParam(arg.attribute, `args[${index}].attribute`, params.action);
-								const resolvedSelector = normalizeSelector(selector);
-								return untilAborted(signal, () =>
-									page.$eval(
-										resolvedSelector,
-										(el: Element, attr: string) => (el as HTMLElement).getAttribute(String(attr)),
-										attribute,
-									),
-								);
-							}),
-						)) as string[];
-						details.result = values;
-						return toolResult(details)
-							.text(JSON.stringify(values, null, 2))
-							.done();
-					}
-					const selector = ensureParam(params.selector, "selector", params.action);
-					const attribute = ensureParam(params.attribute, "attribute", params.action);
-					details.selector = selector;
-					const resolvedSelector = normalizeSelector(selector);
-					const value = (await untilAborted(signal, () =>
-						page.$eval(
-							resolvedSelector,
-							(el: { getAttribute: (name: string) => string | null }, attr: string) =>
-								el.getAttribute(String(attr)),
-							attribute,
-						),
-					)) as string | null;
-					const output = value ?? "";
-					details.result = output;
-					return toolResult(details).text(output).done();
-				}
-				case "extract_readable": {
-					const page = await this.#ensurePage(params);
-					const format = params.format ?? "markdown";
-					const html = (await untilAborted(signal, () => page.content())) as string;
-					const url = page.url();
-					const { document } = parseHTML(html);
-					const reader = new Readability(document);
-					const article = reader.parse();
-					if (!article) {
-						throw new ToolError("Readable content not found");
-					}
-					const markdown = format === "markdown" ? htmlToBasicMarkdown(article.content ?? "") : undefined;
-					const text = format === "text" ? (article.textContent ?? "") : undefined;
-					const readable: ReadableResult = {
-						url,
-						title: article.title ?? undefined,
-						byline: article.byline ?? undefined,
-						excerpt: article.excerpt ?? undefined,
-						contentLength: article.length ?? article.textContent?.length ?? 0,
-						text,
-						markdown,
-					};
-					details.url = url;
-					details.readable = readable;
-					details.result = format === "markdown" ? (markdown ?? "") : (text ?? "");
-					return toolResult(details)
-						.text(JSON.stringify(readable, null, 2))
-						.done();
-				}
-				case "screenshot": {
-					const page = await this.#ensurePage(params);
-					const fullPage = params.selector ? false : (params.full_page ?? false);
-					let buffer: Buffer;
-
-					if (params.selector) {
-						const resolvedSelector = normalizeSelector(params.selector as string);
-						const handle = (await untilAborted(signal, () => page.$(resolvedSelector))) as ElementHandle | null;
-						if (!handle) {
-							throw new ToolError("Screenshot selector did not resolve to an element");
+	// The requested timeout must cover the *entire* open — browser
+	// acquisition (CDP discovery/connect), queued tab acquisition, worker
+	// creation, and navigation — not only `acquireTab`. Compose one deadline
+	// from the caller signal and `params.timeout` and thread it through both
+	// stages so a stalled acquisition rejects at the requested boundary.
+	// Capture the deadline start as well: `acquireTab` counts its
+	// worker-init time against this same budget via `deadlineStartMs`
+	// instead of restarting the clock after acquisition.
+	const deadlineStart = performance.now();
+	const timeoutSignal = AbortSignal.timeout(timeoutMs);
+	const openSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+	try {
+		const browser = await untilAborted(openSignal, () =>
+			acquireBrowser(kind, {
+				cwd: session.cwd,
+				viewport: params.viewport
+					? {
+							width: params.viewport.width,
+							height: params.viewport.height,
+							deviceScaleFactor: params.viewport.scale,
 						}
-						buffer = (await untilAborted(signal, () => handle.screenshot({ type: "png" }))) as Buffer;
-						await handle.dispose();
-						details.selector = params.selector;
-					} else {
-						buffer = (await untilAborted(signal, () => page.screenshot({ type: "png", fullPage }))) as Buffer;
-					}
+					: undefined,
+				signal: openSignal,
+			}),
+		);
 
-					// Compress for API content (same as pasted images)
-					// NOTE: screenshots can be deceptively large (especially PNG) even at modest resolutions,
-					// and tool results are immediately embedded in the next LLM request.
-					// Use a tighter budget than the global per-image limit to avoid 413 request_too_large.
-					const resized = await resizeImage(
-						{ type: "image", data: buffer.toBase64(), mimeType: "image/png" },
-						{ maxBytes: 0.75 * 1024 * 1024 },
-					);
-					const dimensionNote = formatDimensionNote(resized);
-					const tempFile = path.join(os.tmpdir(), `omp-sshots-${Snowflake.next()}.png`);
-					await Bun.write(tempFile, resized.buffer);
-					details.screenshotPath = tempFile;
-					details.mimeType = resized.mimeType;
-					details.bytes = resized.buffer.length;
-
-					// Show both raw bytes (saved to disk) and compressed bytes (sent to model).
-					const lines = [
-						"Screenshot captured",
-						`Format: ${resized.mimeType} (${(resized.buffer.length / 1024).toFixed(2)} KB)`,
-						`Dimensions: ${resized.width}x${resized.height}`,
-					];
-					if (dimensionNote) {
-						lines.push(dimensionNote);
-					}
-
-					return toolResult(details)
-						.content([
-							{ type: "text", text: lines.join("\n") },
-							{ type: "image", data: resized.data, mimeType: resized.mimeType },
-						])
-						.done();
-				}
-				default:
-					throw new ToolError(`Unsupported action: ${params.action}`);
-			}
+		// Hold one open-acquisition lease across the whole tab acquisition.
+		// A freshly-created browser sits in the registry at refCount 0 until a
+		// tab takes a hold; without this lease an abort/timeout mid-acquisition
+		// (or a sibling open of a different tab name on the same browser that
+		// fails) could dispose it out from under this operation. The lease is
+		// released exactly once — the success and failure paths are mutually
+		// exclusive — transferring ownership to the published tab on success or
+		// rolling the fresh browser back on failure.
+		holdBrowser(browser);
+		let result: AcquireTabResult;
+		try {
+			result = await untilAborted(openSignal, () =>
+				acquireTab(name, browser, {
+					url: params.url,
+					waitUntil: params.wait_until,
+					viewport: params.viewport
+						? {
+								width: params.viewport.width,
+								height: params.viewport.height,
+								deviceScaleFactor: params.viewport.scale,
+							}
+						: undefined,
+					target: params.app?.target,
+					timeoutMs,
+					deadlineStartMs: deadlineStart,
+					dialogs: params.dialogs,
+					signal: openSignal,
+					ownerSessionId: session.getSessionId?.() ?? undefined,
+					// Omitted stays undefined: creation defaults it to false
+					// while reuse by the owner leaves a set value alone.
+					persist: params.persist,
+				}),
+			);
 		} catch (error) {
-			if (error instanceof ToolAbortError) throw error;
-			if (error instanceof Error && error.name === "AbortError") {
-				throw new ToolAbortError();
-			}
+			await releaseBrowser(browser, {
+				kill: "subprocess" in browser && browser.subprocess !== undefined,
+			});
 			throw error;
 		}
+		await releaseBrowser(browser, { kill: false });
+		// Opportunistic idle-close sweep for long turns that rarely settle:
+		// close owned tabs idle past the timeout. Detached by design (same
+		// as the orphan-target sweep on attach) — failures only log. Freeze
+		// is deliberately NOT done here: freezing a sibling with an
+		// in-flight run would stall it mid-execution, while turn_end is
+		// race-free by construction (all tool results are paired).
+		void sweepIdleOwnedTabs(session);
+
+		const tab = result.tab;
+		const url = tab.info.url;
+		const title = tab.info.title ?? "";
+		details.url = url;
+		details.viewport = tab.info.viewport;
+		const verb = result.created ? "Opened" : "Reused";
+		const lines = [
+			`${verb} tab ${JSON.stringify(name)} on ${describeBrowser(browser)}`,
+			`URL: ${url}`,
+			title ? `Title: ${title}` : null,
+		].filter((line): line is string => typeof line === "string");
+		return toolResult(details).text(lines.join("\n")).done();
+	} catch (error) {
+		// Caller cancellation stays a ToolAbortError; the requested timeout
+		// becomes a timeout ToolError; anything else passes through unchanged.
+		if (signal?.aborted) throw error instanceof ToolAbortError ? error : new ToolAbortError();
+		if (timeoutSignal.aborted) throw new ToolError(`Browser open timed out after ${timeoutMs}ms`);
+		throw error;
+	}
+}
+
+async function closeBrowser(
+	name: string,
+	params: BrowserParams,
+	details: BrowserPreludeDetails,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+	const kill = !!params.kill;
+	if (params.all) {
+		const count = await untilAborted(signal, () => releaseAllTabs({ kill, timeoutMs }));
+		const text = `Released ${count} managed tab${count === 1 ? "" : "s"}`;
+		return toolResult(details).text(text).done();
+	}
+	const closed = await untilAborted(signal, () => releaseTab(name, { kill, timeoutMs }));
+	const text = closed ? `Released managed tab ${JSON.stringify(name)}` : `No tab named ${JSON.stringify(name)}`;
+	return toolResult(details).text(text).done();
+}
+
+function resolveBrowserRunCode(params: BrowserParams): string {
+	if (params.action === "call") return renderTabCall(params.chain ?? []);
+	const code = params.code?.trim();
+	const fn = params.fn?.trim();
+	if ((code === undefined || code.length === 0) === (fn === undefined || fn.length === 0)) {
+		throw new ToolError("Action 'run' requires exactly one of 'code' or 'fn'.");
+	}
+	if (fn !== undefined && fn.length > 0) {
+		return renderFunctionRun(fn, BROWSER_RUN_SCOPE, params.args ?? []);
+	}
+	return code ?? "";
+}
+
+async function runBrowser(
+	session: ToolSession,
+	name: string,
+	params: BrowserParams,
+	details: BrowserPreludeDetails,
+	timeoutMs: number,
+	signal?: AbortSignal,
+): Promise<AgentToolResult<unknown>> {
+	const code = resolveBrowserRunCode(params);
+	const tab = getTab(name);
+	if (tab) {
+		details.browser = tab.browser.kind.kind;
+		details.url = tab.info.url;
+	}
+
+	const { displays, returnValue, screenshots } = await runInTab(name, {
+		code,
+		timeoutMs,
+		signal,
+		session,
+	});
+
+	if (screenshots.length) details.screenshots = screenshots;
+
+	if (returnValue !== undefined) details.value = returnValue;
+	const content = [...displays];
+	const textOnly = content
+		.filter((part): part is { type: "text"; text: string } => part.type === "text")
+		.map(part => part.text)
+		.join("\n");
+	// Final defense at the host-result boundary: a single run can display
+	// tens of KB (large JSON returns, dumped observations). Cap the combined
+	// text inline; the full text stays recoverable via the artifact footer
+	// when allocation succeeds.
+	const cappedText = await enforceInlineByteCap(textOnly, {
+		saveArtifact: full => saveBrowserOutputArtifact(session, full),
+	});
+	const nonText = content.filter(part => part.type !== "text");
+	if (cappedText.length === 0) return toolResult(details).content(nonText).done();
+	return toolResult(details)
+		.content([...nonText, { type: "text", text: cappedText }])
+		.done();
+}
+
+/** Persist over-cap browser run output as a session artifact; mirrors the bash minimizer's save path. */
+async function saveBrowserOutputArtifact(session: ToolSession, fullText: string): Promise<string | undefined> {
+	try {
+		const alloc = await session.allocateOutputArtifact?.("browser-original");
+		if (!alloc?.path || !alloc.id) return undefined;
+		await Bun.write(alloc.path, fullText);
+		return alloc.id;
+	} catch {
+		return undefined;
+	}
+}
+
+function describeBrowser(handle: BrowserHandle): string {
+	if (!("browser" in handle)) {
+		return `cmux browser (${handle.kind.surface ?? "split"})`;
+	}
+	switch (handle.kind.kind) {
+		case "headless":
+			return `headless browser (${handle.kind.headless ? "hidden" : "visible"}${handle.sharedDaemon ? ", shared" : ""})`;
+		case "spawned":
+			return `spawned ${handle.kind.path} (pid ${handle.pid ?? "?"})`;
+		case "connected":
+			return `connected ${handle.cdpUrl ?? handle.kind.cdpUrl}`;
+		case "relay":
+			return `relay ${handle.cdpUrl ?? handle.kind.cdpUrl}`;
+	}
+}
+
+function describeKind(kind: BrowserKind): string {
+	switch (kind.kind) {
+		case "headless":
+			return `headless ${kind.headless ? "hidden" : "visible"}`;
+		case "spawned":
+			return `spawned:${kind.path}`;
+		case "connected":
+			return `connected:${kind.cdpUrl}`;
+		case "relay":
+			return `relay:${kind.cdpUrl}`;
+		case "cmux":
+			return `cmux:${kind.surface ?? "split"}`;
 	}
 }

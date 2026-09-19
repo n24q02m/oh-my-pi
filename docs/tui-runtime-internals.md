@@ -1,215 +1,120 @@
 # TUI runtime internals
 
-This document maps the non-theme runtime path from terminal input to rendered output in interactive mode. It focuses on behavior in `packages/tui` and its integration from `packages/coding-agent` controllers.
+This document maps terminal input and rendering ownership in interactive mode. See [`tui-core-renderer.md`](./tui-core-renderer.md) for terminal-write invariants.
 
-## Runtime layers and ownership
+## Ownership
 
-- **`packages/tui` engine**: terminal lifecycle, stdin normalization, focus routing, render scheduling, differential painting, overlay composition, hardware cursor placement.
-- **`packages/coding-agent` interactive mode**: builds component tree, binds editor callbacks and keymaps, reacts to agent/session events, and translates domain state (streaming, tool execution, retries, plan mode) into UI components.
+- **`packages/tui`** owns terminal lifecycle, input normalization, focus, overlays, image protocols, cursor placement, scheduling, explicit history writes, and mutable viewport painting.
+- **`packages/coding-agent`** owns transcript order, block finality, tool allocation, editor/status chrome, and the `TerminalFrameProvider` implementation in `modes/composer.ts`.
 
-Boundary rule: the TUI engine is message-agnostic. It only knows `Component.render(width)`, `handleInput(data)`, focus, and overlays. Agent semantics stay in interactive controllers.
+The terminal core never interprets messages, tools, transcript blocks, or finality.
 
-## Implementation files
+## Boot and root composition
 
-- [`../src/modes/interactive-mode.ts`](../packages/coding-agent/src/modes/interactive-mode.ts)
-- [`../src/modes/controllers/event-controller.ts`](../packages/coding-agent/src/modes/controllers/event-controller.ts)
-- [`../src/modes/controllers/input-controller.ts`](../packages/coding-agent/src/modes/controllers/input-controller.ts)
-- [`../src/modes/components/custom-editor.ts`](../packages/coding-agent/src/modes/components/custom-editor.ts)
-- [`../../tui/src/tui.ts`](../packages/tui/src/tui.ts)
-- [`../../tui/src/terminal.ts`](../packages/tui/src/terminal.ts)
-- [`../../tui/src/editor-component.ts`](../packages/tui/src/editor-component.ts)
-- [`../../tui/src/stdin-buffer.ts`](../packages/tui/src/stdin-buffer.ts)
-- [`../../tui/src/components/loader.ts`](../packages/tui/src/components/loader.ts)
+`Composer` creates the `TUI`, welcome header, editor, and status host. Once `InteractiveMode` is ready it mounts the session containers, with `TranscriptContainer` as the transcript root.
 
-## Boot and component tree assembly
+Each normal frame:
 
-`InteractiveMode` constructs `TUI(new ProcessTerminal(), showHardwareCursor)` and creates persistent containers:
+1. Render mandatory editor, status, HUD, and overlay chrome.
+2. Subtract those rows from the physical viewport.
+3. Offer a history batch only under capacity pressure: the settled prefix that must retire for the live tail to fit the remainder.
+4. Ask `TranscriptContainer` for the live rows within the exact remainder.
+5. Return one bounded `TerminalFramePlan`.
 
-- `chatContainer`
-- `pendingMessagesContainer`
-- `statusContainer`
-- `todoContainer`
-- `statusLine`
-- `editorContainer` (holds `CustomEditor`)
+Graceful shutdown switches the provider to Flush policy and synchronously drains
+every currently eligible finalized prefix before terminal handoff.
 
-`init()` wires the tree in that order, focuses the editor, registers input handlers via `InputController`, starts TUI, and requests a forced render.
+The welcome header follows the same ordered retirement model but is composer-owned: it stays live viewport chrome while its intro animates and while the screen has room, then retires once — before any transcript batch — when content first overflows.
 
-A forced render (`requestRender(true)`) resets previous-line caches and cursor bookkeeping before repainting.
-
-## Terminal lifecycle and stdin normalization
-
-`ProcessTerminal.start()`:
-
-1. Enables raw mode and bracketed paste.
-2. Attaches resize handler.
-3. Creates a `StdinBuffer` to split partial escape chunks into complete sequences.
-4. Queries Kitty keyboard protocol support (`CSI ? u`), then enables protocol flags if supported.
-5. On Windows, attempts VT input enablement via `kernel32` mode flags.
-
-`StdinBuffer` behavior:
-
-- Buffers fragmented escape sequences (CSI/OSC/DCS/APC/SS3).
-- Emits `data` only when a sequence is complete or timeout-flushed.
-- Detects bracketed paste and emits a `paste` event with raw pasted text.
-
-This prevents partial escape chunks from being misinterpreted as normal keypresses.
-
-## Input routing and focus model
+## Input and focus
 
 Input path:
 
 `stdin -> ProcessTerminal -> StdinBuffer -> TUI.#handleInput -> focusedComponent.handleInput`
 
-Routing details:
+`StdinBuffer` assembles fragmented CSI/OSC/DCS/APC/SS3 sequences and bracketed paste before dispatch. TUI input listeners may consume or transform input first. Key releases are filtered unless the focused component opts in.
 
-1. TUI runs registered input listeners first (`addInputListener`), allowing consume/transform behavior.
-2. TUI handles global debug shortcut (`shift+ctrl+d`) before component dispatch.
-3. If focused component belongs to an overlay that is now hidden/invisible, TUI reassigns focus to next visible overlay or saved pre-overlay focus.
-4. Key release events are filtered unless focused component sets `wantsKeyRelease = true`.
-5. After dispatch, TUI schedules render.
+`setFocus()` updates `Focusable.focused`; focused components emit `CURSOR_MARKER`, which the frame writer strips while recording the physical cursor target.
 
-`setFocus()` also toggles `Focusable.focused`, which controls whether components emit `CURSOR_MARKER` for hardware cursor placement.
+Optimistic user submissions call `renderNow()` before agent dispatch so synchronous startup/model work cannot delay the visible user row.
 
-## Key handling split: editor vs controller
+## Explicit transcript lifecycle
 
-`CustomEditor` intercepts high-priority combos first (escape, ctrl-c/d/z, ctrl-v, ctrl-p variants, ctrl-t, alt-up, extension custom keys) and delegates the rest to base `Editor` behavior (text editing, history, autocomplete, cursor movement).
+`TranscriptContainer` keeps blocks in semantic order:
 
-`InputController.setupKeyHandlers()` then binds editor callbacks to mode actions:
+- **active** — mutable and viewport-resident;
+- **settled** — finalized but still live: it re-renders at the current width every frame (so resizes reflow it) until capacity pressure retires it;
+- **committed** — acknowledged by the terminal writer and released from render caches.
 
-- cancellation / mode exits on `Escape`
-- shutdown on double `Ctrl+C` or empty-editor `Ctrl+D`
-- suspend/resume on `Ctrl+Z`
-- slash-command and selector hotkeys
-- follow-up/dequeue toggles and expansion toggles
+Finalizing a later block never bypasses an active predecessor. `peekFinalizedBatch(width, capacity)` retires the shortest settled prefix that lets the remaining live tail fit `capacity`, stops at the first active block, and reoffers the same id until `acknowledgeFinalizedBatch()` succeeds. `peekFlushBatch(width)` takes the whole eligible prefix during graceful shutdown. While the screen has room nothing retires during ordinary operation, so a submitted message is visible immediately and recent blocks keep reflowing on resize.
 
-This keeps key parsing/editor mechanics in `packages/tui` and mode semantics in coding-agent controllers.
+Display replay has an independent cursor over committed entries. It never changes
+`committed` states or the logical frontier, and an offered replay never removes
+the active tail from the projected viewport.
 
-## Render loop and diffing strategy
+Every emitted transcript block owns one trailing separator row. This preserves spacing between a finalized user/tool block and the next active assistant/tool row without duplicating separators across batches.
 
-`TUI.requestRender()` is debounced to one render per tick using `process.nextTick`. Multiple state changes in the same turn coalesce.
+## Viewport allocation and tool collapse
 
-`#doRender()` pipeline:
+The product root reserves chrome first, gives every active block one row, then allocates surplus to newer blocks. When active count exceeds available rows, it uses a bounded aggregate rather than committing or cancelling work.
 
-1. Render root component tree to `newLines`.
-2. Composite visible overlays (if any).
-3. Extract and strip `CURSOR_MARKER` from visible viewport lines.
-4. Append segment reset suffixes for non-image lines.
-5. Choose full repaint vs differential patch:
-   - first frame
-   - width change
-   - shrink with `clearOnShrink` enabled and no overlays
-   - edits above previous viewport
-6. For differential updates, patch only changed line range and clear stale trailing lines when needed.
-7. Reposition hardware cursor for IME support.
+`ToolExecutionComponent` owns generic compact presentation:
 
-Render writes use synchronized output mode (`CSI ? 2026 h/l`) to reduce flicker/tearing.
+- three or more rows: full tool renderer;
+- two rows: semantic folded card;
+- one row: stable label/activity line with shared-clock pulse;
+- zero rows: finalized and hidden.
 
-## Render safety constraints
+Built-in and extension tools use the same wrapper. Renderers may provide semantic activity data; otherwise the wrapper derives command/path/input text and falls back to `tool · running`.
 
-Critical safety checks in `TUI`:
+## Terminal write path
 
-- Non-image rendered lines must not exceed terminal width; overflow throws and writes crash diagnostics.
-- Overlay compositing includes defensive truncation and post-composite width verification.
-- Width changes force full redraw because wrapping semantics change.
-- Cursor position is clamped before movement.
+A provider frame contains two channels:
 
-These constraints are runtime enforcement, not just conventions.
+```ts
+interface TerminalFramePlan {
+	history?: { id: number; rows: readonly string[] };
+	viewport: readonly string[];
+}
+```
 
-## Resize handling
+The writer:
 
-Resize events are event-driven from `ProcessTerminal` to `TUI.requestRender()`.
+1. Normalizes and width-fits every row with autowrap disabled.
+2. Appends only an unacknowledged history id.
+3. Repaints the anchored mutable viewport in place.
+4. Clears stale rows below the viewport.
+5. Restores autowrap, synchronized-output state, and cursor state.
+6. Acknowledges the exact history id only after the write is accepted in-process.
 
-Effects:
+Viewport-only frames cannot create history. Theme changes leave native history terminal-owned; settled resizes may replay it according to `ResizeScrollbackMode`.
 
-- Any width change triggers full redraw.
-- Viewport/top tracking (`#previousViewportTop`, `#maxLinesRendered`) avoids invalid relative cursor math when content or terminal size changes.
-- Overlay visibility can depend on terminal dimensions (`OverlayOptions.visible`); focus is corrected when overlays become non-visible after resize.
+## Resize
 
-## Streaming and incremental UI updates
+During resize, TUI borrows the alternate buffer. The frame provider supplies a full semantic viewport tail for that transient buffer; history offers are never acknowledged there. After a short quiet window TUI restores the normal buffer — which the terminal has reflowed — and recovers the viewport anchor with a DSR (CSI 6n) round trip: every normal paint parks the hardware cursor at a known viewport offset, terminals keep that cursor attached to its logical line through width rewrap, and the settled anchor is `min(reported − parkOffset, height − staleReflowedRows)`. The second bound reconstructs height-shrink scrollback pushes that clamp the cursor instead of scrolling it (bottom-preserving resize guarantees the stale viewport ends on the last screen row whenever a push happened); multiplexers clip instead of rewrapping, so the stale-row measure counts one row per row there. The repaint waits for the CPR reply (200 ms timeout falls back to the bounded retained anchor); `packages/tui/test/resize-anchor-recovery.test.ts` validates the formula against kitty's real core.
 
-`EventController` subscribes to `AgentSessionEvent` and updates UI incrementally:
+Warp is the exception: it re-reports size on `CSI ?1049h` / `CSI ?1049l`, so borrowing that buffer loops. Warp (and `PI_TUI_RESIZE_IN_PLACE=1`) repaint in place outside multiplexers; inside one the mux owns the grid and consumes the toggles itself, so an inherited Warp marker keeps the mux-tuned borrow path. `PI_TUI_RESIZE_IN_PLACE=0` forces the borrow even on Warp. The first Warp height-only ±1 SIGWINCH after a toggle write is consumed as that echo: while a borrow owns the alt buffer it is swallowed without probing (a CPR issued now would snapshot the alternate grid); otherwise the in-flight anchor probe is retired and reissued at the echoed size so a predating CPR reply cannot anchor it. A later real one-row resize still restarts the transaction.
 
-- `agent_start`: starts loader in `statusContainer`.
-- `message_start` assistant: creates `streamingComponent` and mounts it.
-- `message_update`: updates streaming assistant content; creates/updates tool execution components as tool calls appear.
-- `tool_execution_update/end`: updates tool result components and completion state.
-- `message_end`: finalizes assistant stream, handles aborted/error annotations, marks pending tool args complete on normal stop.
-- `agent_end`: stops loaders, clears transient stream state, flushes deferred model switch, issues completion notification if backgrounded.
+A ConPTY host is excluded from in-place resize for the same reason as a multiplexer: conhost owns the grid the application writes to, so `Terminal.hostOwnsGridOnResize` routes those sessions to the borrow. Measured on conhost, resizing the pseudoconsole makes it re-emit its whole viewport from `CSI H` with absolute addressing while the application writes nothing, and it re-homes the cursor, so a DSR reply after a resize reports column 1 instead of the parked tag column and can never be attributed. In-place resize has neither of its preconditions there — a recoverable anchor and a grid nobody else repaints — so the anchor probe is skipped outright (an unattributable reply would only burn a tag column for the session and stall the settled repaint for the full timeout), the settled repaint anchors on the fallback, and the `ResizeScrollbackMode` rebuild erases conhost's stale copy. Two exemptions keep the probe: inside a multiplexer the mux, not conhost, answers the DSR from its own grid, so the reply is attributable and the width-reflow and hidden-grow logic still needs it; and `PI_TUI_RESIZE_IN_PLACE=1` forces in-place there, which restores the CPR round trip along with it.
 
-Read-tool grouping is intentionally stateful (`#lastReadGroup`) to coalesce consecutive read tool calls into one visual block until a non-read break occurs.
+Warp drags therefore only re-arm the settle window and paint nothing until it goes quiet; each drag event blanks the live viewport up front (the alt path's pre-erase, without the borrow) so shrink reflows can only push committed rows or blanks into scrollback. The single settled repaint runs the same CPR anchor probe and skips the `ResizeScrollbackMode` replay, so native scrollback keeps whatever width it reflowed at instead of an ED3 rewrap. A toggle echo that arrives while a fullscreen overlay owns the alt buffer repaints the modal instead of probing the normal anchor against the alternate grid.
 
-## Status and loader orchestration
+A settled resize then applies `ResizeScrollbackMode`. `rebuild` clears native history with ED3 and asks the provider to replay the complete committed transcript under fresh monotonic ids. `append` performs the same independent replay below retained history. `preserve` skips replay and only repaints the anchored viewport. The raw TUI default is `preserve`; the coding agent sets `rebuild`.
 
-Status lane ownership:
+A shrink can make the terminal itself push live viewport rows into scrollback before the app hears about the resize; those rows are unreachable to an inline app and may remain above the repainted frame at their old width. The screen itself always converges to exactly one copy. Likewise, when a history append overflows the screen, the writer first erases the old live viewport region so a scroll can only push committed rows and blanks into scrollback, never an unfinished frame.
 
-- `statusContainer` holds transient loaders (`loadingAnimation`, `autoCompactionLoader`, `retryLoader`).
-- `statusLine` renders persistent status/hooks/plan indicators and drives editor top border updates.
+## Explicit display reset
 
-Loader behavior:
+`resetDisplay()` is destructive and user-driven. It is reserved for session replacement, tree/resume replacement, Ctrl+L, and settings that rebuild the semantic transcript. Before ED3, the provider resets retirement state so the complete finalized prefix is reoffered under new monotonic history ids. The same reset-and-reoffer transaction serves settled resizes in `rebuild` mode; ordinary rendering, animation, and tool finalization cannot reach it.
 
-- `Loader` updates every 80ms via interval and requests render each frame.
-- Escape handlers are temporarily overridden during auto-compaction and auto-retry to cancel those operations.
-- On end/cancel paths, controllers restore prior escape handlers and stop/clear loader components.
+Theme or visibility changes that affect only current/future output repaint the mutable viewport; already-retired history remains immutable.
 
-## Mode transitions and backgrounding
+## Overlays and images
 
-### Bash/Python input modes
+Fullscreen overlays use the alternate buffer and never append history. Normal overlays composite over the mutable viewport only.
 
-Input text prefixes toggle editor border mode flags:
+Inline image data and purge commands are emitted before row placements. Active images may remain graphical in the viewport; finalized history uses textual fallback unless the protocol can account for stable physical rows.
 
-- `!` -> bash mode
-- `$` (non-template literal prefix) -> python mode
+## Shutdown
 
-Escape exits inactive mode by clearing editor text and restoring border color; when execution is active, escape aborts the running task instead.
-
-### Plan mode
-
-`InteractiveMode` tracks plan mode flags, status-line state, active tools, and model switching. Enter/exit updates session mode entries and status/UI state, including deferred model switch if streaming is active.
-
-### Suspend/resume (`Ctrl+Z`)
-
-`InputController.handleCtrlZ()`:
-
-1. Registers one-shot `SIGCONT` handler to restart TUI and force render.
-2. Stops TUI before suspend.
-3. Sends `SIGTSTP` to process group.
-
-### Background mode (`/background` or `/bg`)
-
-`handleBackgroundCommand()`:
-
-- Rejects when idle.
-- Switches tool UI context to non-interactive (`hasUI=false`) so interactive UI tools fail fast.
-- Stops loaders/status line and unsubscribes foreground event handler.
-- Subscribes background event handler (primarily waits for `agent_end`).
-- Stops TUI and sends `SIGTSTP` (POSIX job control path).
-
-On `agent_end` in background with no queued work, controller sends completion notification and shuts down.
-
-## Cancellation paths
-
-Primary cancellation inputs:
-
-- `Escape` during active stream loader: restores queued messages to editor and aborts agent.
-- `Escape` during bash/python execution: aborts running command.
-- `Escape` during auto-compaction/retry: invokes dedicated abort methods through temporary escape handlers.
-- `Ctrl+C` single press: clear editor; double press within 500ms: shutdown.
-
-Cancellation is state-conditional; same key can mean abort, mode-exit, selector trigger, or no-op depending on runtime state.
-
-## Event-driven vs throttled behavior
-
-Event-driven updates:
-
-- Agent session events (`EventController`)
-- Key input callbacks (`InputController`)
-- terminal resize callback
-- theme/branch watchers in `InteractiveMode`
-
-Throttled/debounced paths:
-
-- TUI rendering is tick-debounced (`requestRender` coalescing).
-- Loader animation is fixed-interval (80ms), each frame requesting render.
-- Editor autocomplete updates (inside `Editor`) use debounce timers, reducing recompute churn during typing.
-
-The runtime therefore mixes event-driven state transitions with bounded render cadence to keep interactivity responsive without repaint storms.
+Interactive shutdown disposes session-owned work, drains terminal input, restores title/protocol state, and calls `TUI.stop()`. TUI exits any alternate buffer, asks the provider to Flush all eligible finalized history, cancels render/resize timers, preserves terminal-owned image state, places the shell cursor directly after visible TUI content, restores cursor visibility, then delegates terminal-mode restoration to `ProcessTerminal.stop()`.

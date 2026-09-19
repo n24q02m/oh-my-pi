@@ -5,24 +5,7 @@
  * The agent loop catches and renders them appropriately.
  */
 
-/**
- * Base error for tool execution failures.
- * Override render() for custom LLM-facing formatting.
- */
-export class ToolError extends Error {
-	constructor(
-		message: string,
-		readonly context?: Record<string, unknown>,
-	) {
-		super(message);
-		this.name = "ToolError";
-	}
-
-	/** Render error for LLM consumption. Override for custom formatting. */
-	render(): string {
-		return this.message;
-	}
-}
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 
 /**
  * Error thrown when a tool operation is aborted (e.g., via AbortSignal).
@@ -30,8 +13,8 @@ export class ToolError extends Error {
 export class ToolAbortError extends Error {
 	static readonly MESSAGE = "Operation aborted";
 
-	constructor(message: string = ToolAbortError.MESSAGE) {
-		super(message);
+	constructor(message: string = ToolAbortError.MESSAGE, options?: ErrorOptions) {
+		super(message, options);
 		this.name = "ToolAbortError";
 	}
 }
@@ -43,7 +26,7 @@ export class ToolAbortError extends Error {
 export function throwIfAborted(signal?: AbortSignal): void {
 	if (signal?.aborted) {
 		const reason = signal.reason instanceof Error ? signal.reason : undefined;
-		throw reason instanceof ToolAbortError ? reason : new ToolAbortError();
+		throw reason instanceof ToolAbortError ? reason : new ToolAbortError(undefined, { cause: signal.reason });
 	}
 }
 

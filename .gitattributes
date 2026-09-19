@@ -33,6 +33,16 @@
 *.class -text
 *.jar -text
 
+# Lock files are binary (machine-generated, should not be manually edited)
+*.lock -text
+Cargo.lock -text
+package-lock.json -text
+bun.lock -text
+bun.lockb -text
+yarn.lock -text
+pnpm-lock.yaml -text
+poetry.lock -text
+
 # Executed by Linux
 *.sh text eol=lf
 *.py text eol=lf
@@ -41,4 +51,11 @@
 *.ps1 text eol=lf
 *.cmd text eol=crlf
 *.bat text eol=crlf
+
+# Changelogs are append-mostly; auto-merge by unioning both sides.
+packages/*/CHANGELOG.md merge=union
+
+# Generated, minified catalog artifacts: regenerate instead of diffing/merging.
+packages/catalog/src/models.json binary
+packages/catalog/src/compat/rules.json binary
 

@@ -1,9 +1,9 @@
-import { Type } from "@sinclair/typebox";
-import type { ControlledGit } from "../../../commit/git";
+import { type } from "@oh-my-pi/omptype";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import type { CustomTool } from "../../../extensibility/custom-tools/types";
 
-const recentCommitsSchema = Type.Object({
-	count: Type.Optional(Type.Number({ description: "Number of commits to fetch", minimum: 1, maximum: 50 })),
+const recentCommitsSchema = type({
+	"count?": type("1 <= number <= 50").describe("commit count"),
 });
 
 interface RecentCommitStats {
@@ -25,7 +25,8 @@ function extractScope(subject: string): string | null {
 	return match?.[1]?.trim() ?? null;
 }
 
-export function createRecentCommitsTool(git: ControlledGit): CustomTool<typeof recentCommitsSchema> {
+export function createRecentCommitsTool(cwd: string): CustomTool<typeof recentCommitsSchema> {
+	const repo = vcs.require(cwd);
 	return {
 		name: "recent_commits",
 		label: "Recent Commits",
@@ -33,7 +34,7 @@ export function createRecentCommitsTool(git: ControlledGit): CustomTool<typeof r
 		parameters: recentCommitsSchema,
 		async execute(_toolCallId, params) {
 			const count = params.count ?? 8;
-			const commits = await git.getRecentCommits(count);
+			const commits = await repo.logSubjects(count);
 			const verbs: Record<string, number> = {};
 			const scopes: Record<string, number> = {};
 			const lengths: number[] = [];

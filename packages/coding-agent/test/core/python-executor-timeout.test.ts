@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
-import { executePythonWithKernel, type PythonKernelExecutor } from "@oh-my-pi/pi-coding-agent/ipy/executor";
-import type { KernelExecuteOptions, KernelExecuteResult } from "@oh-my-pi/pi-coding-agent/ipy/kernel";
+import { executePythonWithKernel, type PythonKernelExecutor } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
+import type { KernelExecuteOptions, KernelExecuteResult } from "@oh-my-pi/pi-coding-agent/eval/py/kernel";
 
 class FakeKernel implements PythonKernelExecutor {
 	private result: KernelExecuteResult;
@@ -30,6 +30,6 @@ describe("executePythonWithKernel cancellation", () => {
 
 		expect(result.cancelled).toBe(true);
 		expect(result.exitCode).toBeUndefined();
-		expect(result.output).toContain("Command timed out after 5 seconds");
+		expect(result.output).toContain("eval cell timed out after 5s");
 	});
 });

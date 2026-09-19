@@ -1,8 +1,19 @@
-import { BracketedPasteHandler } from "../bracketed-paste";
-import { getEditorKeybindings } from "../keybindings";
+import { BracketedPasteHandler, decodeReencodedPasteControls } from "../bracketed-paste";
+import { getKeybindings } from "../keybindings";
+import { extractPrintableText } from "../keys";
 import { KillRing } from "../kill-ring";
 import { type Component, CURSOR_MARKER, type Focusable } from "../tui";
-import { getSegmenter, isPunctuationChar, isWhitespaceChar, padding, visibleWidth } from "../utils";
+import { cursorColumnWindow } from "./scroll-viewport";
+import {
+	getSegmenter,
+	getWordNavKind,
+	moveWordLeft,
+	moveWordRight,
+	padding,
+	replaceTabs,
+	sliceWithWidth,
+	visibleWidth,
+} from "../utils";
 
 const segmenter = getSegmenter();
 
@@ -17,6 +28,11 @@ interface InputState {
 export class Input implements Component, Focusable {
 	#value: string = "";
 	#cursor: number = 0; // Cursor position in the value
+	#useTerminalCursor = false;
+	/** Rendered before the editable area; set to "" for chrome-less embedding. */
+	prompt = "> ";
+	/** Render the editable value as bullets while retaining the real value internally. */
+	mask = false;
 	onSubmit?: (value: string) => void;
 	onEscape?: () => void;
 
@@ -36,10 +52,32 @@ export class Input implements Component, Focusable {
 	getValue(): string {
 		return this.#value;
 	}
+	/** Return bounded input content and cursor state for debug inspection. */
+	debugState(): Record<string, unknown> {
+		return {
+			textPreview: this.mask ? "********" : this.#value.slice(0, 120),
+			textLength: this.#value.length,
+			previewTruncated: this.#value.length > 120,
+			cursor: this.#cursor,
+			cursorLine: 0,
+			selection: null,
+			placeholderActive: false,
+			masked: this.mask,
+		};
+	}
 
 	setValue(value: string): void {
 		this.#value = value;
-		this.#cursor = Math.min(this.#cursor, value.length);
+		// Callers seed or replace the value wholesale; typing continues at the end.
+		this.#cursor = value.length;
+	}
+
+	setUseTerminalCursor(useTerminalCursor: boolean): void {
+		this.#useTerminalCursor = useTerminalCursor;
+	}
+
+	getUseTerminalCursor(): boolean {
+		return this.#useTerminalCursor;
 	}
 
 	handleInput(data: string): void {
@@ -55,69 +93,69 @@ export class Input implements Component, Focusable {
 			return;
 		}
 
-		const kb = getEditorKeybindings();
+		const kb = getKeybindings();
 
 		// Escape/Cancel
-		if (kb.matches(data, "selectCancel")) {
+		if (kb.matches(data, "tui.select.cancel")) {
 			if (this.onEscape) this.onEscape();
 			return;
 		}
 
 		// Undo
-		if (kb.matches(data, "undo")) {
+		if (kb.matches(data, "tui.editor.undo")) {
 			this.#undo();
 			return;
 		}
 
 		// Submit
-		if (kb.matches(data, "submit") || data === "\n") {
+		if (kb.matches(data, "tui.input.submit") || data === "\n") {
 			if (this.onSubmit) this.onSubmit(this.#value);
 			return;
 		}
 
 		// Deletion
-		if (kb.matches(data, "deleteCharBackward")) {
+		if (kb.matches(data, "tui.editor.deleteCharBackward")) {
 			this.#handleBackspace();
 			return;
 		}
 
-		if (kb.matches(data, "deleteCharForward")) {
+		if (kb.matches(data, "tui.editor.deleteCharForward")) {
 			this.#handleForwardDelete();
 			return;
 		}
 
-		if (kb.matches(data, "deleteWordBackward")) {
+		if (kb.matches(data, "tui.editor.deleteWordBackward")) {
 			this.#deleteWordBackwards();
 			return;
 		}
 
-		if (kb.matches(data, "deleteWordForward")) {
+		if (kb.matches(data, "tui.editor.deleteWordForward")) {
 			this.#deleteWordForward();
 			return;
 		}
 
-		if (kb.matches(data, "deleteToLineStart")) {
+		if (kb.matches(data, "tui.editor.deleteToLineStart")) {
 			this.#deleteToLineStart();
 			return;
 		}
 
-		if (kb.matches(data, "deleteToLineEnd")) {
+		if (kb.matches(data, "tui.editor.deleteToLineEnd")) {
 			this.#deleteToLineEnd();
 			return;
 		}
 
 		// Kill ring actions
-		if (kb.matches(data, "yank")) {
+		if (kb.matches(data, "tui.editor.yank")) {
 			this.#yank();
 			return;
 		}
-		if (kb.matches(data, "yankPop")) {
+		if (kb.matches(data, "tui.editor.yankPop")) {
 			this.#yankPop();
 			return;
 		}
 
 		// Cursor movement
-		if (kb.matches(data, "cursorLeft")) {
+		if (kb.matches(data, "tui.editor.cursorLeft")) {
 			this.#lastAction = null;
 			if (this.#cursor > 0) {
 				const beforeCursor = this.#value.slice(0, this.#cursor);
@@ -128,7 +166,7 @@ export class Input implements Component, Focusable {
 			return;
 		}
 
-		if (kb.matches(data, "cursorRight")) {
+		if (kb.matches(data, "tui.editor.cursorRight")) {
 			this.#lastAction = null;
 			if (this.#cursor < this.#value.length) {
 				const afterCursor = this.#value.slice(this.#cursor);
@@ -139,41 +177,43 @@ export class Input implements Component, Focusable {
 			return;
 		}
 
-		if (kb.matches(data, "cursorLineStart")) {
+		if (kb.matches(data, "tui.editor.cursorLineStart")) {
 			this.#lastAction = null;
 			this.#cursor = 0;
 			return;
 		}
 
-		if (kb.matches(data, "cursorLineEnd")) {
+		if (kb.matches(data, "tui.editor.cursorLineEnd")) {
 			this.#lastAction = null;
 			this.#cursor = this.#value.length;
 			return;
 		}
 
-		if (kb.matches(data, "cursorWordLeft")) {
+		if (kb.matches(data, "tui.editor.cursorWordLeft")) {
 			this.#moveWordBackwards();
 			return;
 		}
 
-		if (kb.matches(data, "cursorWordRight")) {
+		if (kb.matches(data, "tui.editor.cursorWordRight")) {
 			this.#moveWordForwards();
 			return;
 		}
 
-		// Regular character input - accept printable characters including Unicode,
-		// but reject control characters (C0: 0x00-0x1F, DEL: 0x7F, C1: 0x80-0x9F)
-		const hasControlChars = [...data].some(ch => {
-			const code = ch.charCodeAt(0);
-			return code < 32 || code === 0x7f || (code >= 0x80 && code <= 0x9f);
-		});
-		if (!hasControlChars) {
-			this.#insertCharacter(data);
+		// Regular character input, including Kitty CSI-u text-producing sequences.
+		const printableText = extractPrintableText(data);
+		if (printableText) {
+			this.#insertCharacter(printableText);
 		}
 	}
 
+	/** Apply terminal paste semantics to text from non-bracketed paste transports
+	 *  (e.g. kitty's OSC 5522 enhanced clipboard read). Mirrors `Editor.pasteText`. */
+	pasteText(text: string): void {
+		this.#handlePaste(text);
+	}
+
 	#insertCharacter(text: string): void {
-		const isWordChunk = [...text].every(ch => !isWhitespaceChar(ch));
+		const isWordChunk = [...segmenter.segment(text)].every(seg => getWordNavKind(seg.segment) !== "whitespace");
 		// Undo coalescing: consecutive word typing coalesces into one undo unit.
 		if (!isWordChunk || this.#lastAction !== "type-word") {
 			this.#pushUndo();
@@ -336,76 +376,42 @@ export class Input implements Component, Focusable {
 			return;
 		}
 		this.#lastAction = null;
-
-		const textBeforeCursor = this.#value.slice(0, this.#cursor);
-		const graphemes = [...segmenter.segment(textBeforeCursor)];
-
-		// Skip trailing whitespace
-		while (graphemes.length > 0 && isWhitespaceChar(graphemes[graphemes.length - 1]?.segment || "")) {
-			this.#cursor -= graphemes.pop()?.segment.length || 0;
-		}
-
-		if (graphemes.length > 0) {
-			const lastGrapheme = graphemes[graphemes.length - 1]?.segment || "";
-			if (isPunctuationChar(lastGrapheme)) {
-				// Skip punctuation run
-				while (graphemes.length > 0 && isPunctuationChar(graphemes[graphemes.length - 1]?.segment || "")) {
-					this.#cursor -= graphemes.pop()?.segment.length || 0;
-				}
-			} else {
-				// Skip word run
-				while (
-					graphemes.length > 0 &&
-					!isWhitespaceChar(graphemes[graphemes.length - 1]?.segment || "") &&
-					!isPunctuationChar(graphemes[graphemes.length - 1]?.segment || "")
-				) {
-					this.#cursor -= graphemes.pop()?.segment.length || 0;
-				}
-			}
-		}
+		this.#cursor = moveWordLeft(this.#value, this.#cursor);
 	}
 
 	#moveWordForwards(): void {
 		if (this.#cursor >= this.#value.length) {
 			return;
 		}
-
 		this.#lastAction = null;
-		const textAfterCursor = this.#value.slice(this.#cursor);
-		const segments = segmenter.segment(textAfterCursor);
-		const iterator = segments[Symbol.iterator]();
-		let next = iterator.next();
-
-		// Skip leading whitespace
-		while (!next.done && isWhitespaceChar(next.value.segment)) {
-			this.#cursor += next.value.segment.length;
-			next = iterator.next();
-		}
-
-		if (!next.done) {
-			const firstGrapheme = next.value.segment;
-			if (isPunctuationChar(firstGrapheme)) {
-				// Skip punctuation run
-				while (!next.done && isPunctuationChar(next.value.segment)) {
-					this.#cursor += next.value.segment.length;
-					next = iterator.next();
-				}
-			} else {
-				// Skip word run
-				while (!next.done && !isWhitespaceChar(next.value.segment) && !isPunctuationChar(next.value.segment)) {
-					this.#cursor += next.value.segment.length;
-					next = iterator.next();
-				}
-			}
-		}
+		this.#cursor = moveWordRight(this.#value, this.#cursor);
 	}
 
 	#handlePaste(pastedText: string): void {
 		this.#lastAction = null;
 		this.#pushUndo();
 
-		// Clean the pasted text - remove newlines and carriage returns
-		const cleanText = pastedText.replace(/\r\n/g, "").replace(/\r/g, "").replace(/\n/g, "");
+		// Clean the pasted text — decode tmux's re-encoded control bytes (both
+		// extended-keys formats, e.g. Ctrl+J → "\n") back to literal bytes so the escape
+		// tail does not leak in, remove newlines/carriage returns, expand tabs, NFC-normalize,
+		// then strip any remaining control bytes. The decoder can synthesize Ctrl+A..Ctrl+Z
+		// (0x01..0x1A) from a paste, and a single-line value must hold none of them — newlines
+		// are already gone and tabs are already spaces by the time the C0/DEL strip runs.
+		//
+		// NFC normalization rationale: macOS Finder drag-drops file paths in NFD
+		// (Conjoining Jamo, U+1100..U+11FF). `Bun.stringWidth` counts each
+		// conjoining jamo as a separate cell — a Korean syllable like `화` is
+		// 1 char and 2 cells in NFC, but 2 chars and 3 cells in NFD (ᄒ=2 cells
+		// + ᅪ=1 cell). The terminal renders the NFD sequence as a single
+		// combined syllable (2 cells visible), so the width mismatch shows up
+		// as cursor drift past the visible filename — N×~1.5 cells for a path
+		// with N Korean syllables. NFC normalization at paste time stores the
+		// value in the same form everything else in the codebase assumes.
+		const cleanText = replaceTabs(
+			decodeReencodedPasteControls(pastedText).replace(/\r\n/g, "").replace(/\r/g, "").replace(/\n/g, ""),
+		)
+			.normalize("NFC")
+			.replace(/[\x00-\x1F\x7F]/g, "");
 
 		// Insert at cursor position
 		this.#value = this.#value.slice(0, this.#cursor) + cleanText + this.#value.slice(this.#cursor);
@@ -416,91 +422,53 @@ export class Input implements Component, Focusable {
 		// No cached state to invalidate currently
 	}
 
-	render(width: number): string[] {
+	render(width: number): readonly string[] {
+		width = Number.isFinite(width) ? Math.max(0, Math.trunc(width)) : 0;
 		// Calculate visible window
-		const prompt = "> ";
-		const availableWidth = width - prompt.length;
+		const prompt = this.prompt;
+		const availableWidth = width - visibleWidth(prompt);
 
 		if (availableWidth <= 0) {
-			return [prompt];
+			return [sliceWithWidth(prompt, 0, width, true).text];
 		}
 
-		let visibleText = "";
-		let cursorDisplay = this.#cursor;
-
-		if (this.#value.length < availableWidth) {
-			// Everything fits (leave room for cursor at end)
-			visibleText = this.#value;
-		} else {
-			// Need horizontal scrolling
-			// Reserve one character for cursor if it's at the end
-			const scrollWidth = this.#cursor === this.#value.length ? availableWidth - 1 : availableWidth;
-			const halfWidth = Math.floor(scrollWidth / 2);
-
-			const findValidStart = (start: number) => {
-				while (start < this.#value.length) {
-					const charCode = this.#value.charCodeAt(start);
-					// this is low surrogate, not a valid start
-					if (charCode >= 0xdc00 && charCode < 0xe000) {
-						start++;
-						continue;
-					}
-					break;
-				}
-				return start;
-			};
-
-			const findValidEnd = (end: number) => {
-				while (end > 0) {
-					const charCode = this.#value.charCodeAt(end - 1);
-					// this is high surrogate, might be split.
-					if (charCode >= 0xd800 && charCode < 0xdc00) {
-						end--;
-						continue;
-					}
-					break;
-				}
-				return end;
-			};
-
-			if (this.#cursor < halfWidth) {
-				// Cursor near start
-				visibleText = this.#value.slice(0, findValidEnd(scrollWidth));
-				cursorDisplay = this.#cursor;
-			} else if (this.#cursor > this.#value.length - halfWidth) {
-				// Cursor near end
-				const start = findValidStart(this.#value.length - scrollWidth);
-				visibleText = this.#value.slice(start);
-				cursorDisplay = this.#cursor - start;
-			} else {
-				// Cursor in middle
-				const start = findValidStart(this.#cursor - halfWidth);
-				visibleText = this.#value.slice(start, findValidEnd(start + scrollWidth));
-				cursorDisplay = this.#cursor - start;
-			}
+		let cursorIndex = this.#cursor;
+		// Ensure we always have a grapheme to invert at the cursor (space at end).
+		let visibleValue = this.#value;
+		if (this.mask) {
+			const graphemes = [...segmenter.segment(this.#value)];
+			visibleValue = "•".repeat(graphemes.length);
+			cursorIndex = graphemes.filter(grapheme => grapheme.index < this.#cursor).length;
 		}
+		const displayValue = this.#cursor >= this.#value.length ? `${visibleValue} ` : visibleValue;
 
-		// Build line with fake cursor
-		// Insert cursor character at cursor position
+		const window = cursorColumnWindow(displayValue, cursorIndex, availableWidth);
+		const visibleText = window.text;
+		const cursorDisplay = window.cursorIndex;
+
+		// Build the visible line and insert the cursor marker at the buffer cursor.
 		const graphemes = [...segmenter.segment(visibleText.slice(cursorDisplay))];
 		const cursorGrapheme = graphemes[0];
 
 		const beforeCursor = visibleText.slice(0, cursorDisplay);
-		const atCursor = cursorGrapheme?.segment ?? " ";
+		const atCursor = cursorGrapheme?.segment ?? "";
 		const afterCursor = visibleText.slice(cursorDisplay + atCursor.length);
 
-		// Hardware cursor marker (zero-width, emitted before fake cursor for IME positioning)
+		// Hardware cursor marker (zero-width, emitted before the cursor cell for IME positioning)
 		const marker = this.focused ? CURSOR_MARKER : "";
+		const cursorChar = this.#useTerminalCursor ? atCursor : `\x1b[7m${atCursor || " "}\x1b[27m`;
 
-		// Use inverse video to show cursor
-		const cursorChar = `\x1b[7m${atCursor}\x1b[27m`; // ESC[7m = reverse video, ESC[27m = normal
-		const textWithCursor = beforeCursor + marker + cursorChar + afterCursor;
+		// Clamp only the trailing text (measured in terminal cells), keeping the cursor marker intact.
+		const beforeWidth = visibleWidth(beforeCursor);
+		const cursorWidth = this.#useTerminalCursor ? visibleWidth(atCursor) : visibleWidth(atCursor || " ");
+		const remainingAfterWidth = Math.max(0, availableWidth - beforeWidth - cursorWidth);
+		const clampedAfterCursor = sliceWithWidth(afterCursor, 0, remainingAfterWidth, true).text;
+		const renderedNoMarker = beforeCursor + cursorChar + clampedAfterCursor;
+		const textWithCursor = beforeCursor + marker + cursorChar + clampedAfterCursor;
 
-		// Calculate visual width
-		const visualLength = visibleWidth(textWithCursor);
+		const visualLength = visibleWidth(renderedNoMarker);
 		const pad = padding(Math.max(0, availableWidth - visualLength));
 		const line = prompt + textWithCursor + pad;
-
 		return [line];
 	}
 }

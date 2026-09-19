@@ -1,4 +1,5 @@
-import { Type } from "@sinclair/typebox";
+import { type } from "@oh-my-pi/omptype";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import type { CommitAgentState, SplitCommitGroup, SplitCommitPlan } from "../../../commit/agentic/state";
 import { computeDependencyOrder } from "../../../commit/agentic/topo-sort";
 import {
@@ -10,36 +11,27 @@ import {
 	validateTypeConsistency,
 } from "../../../commit/agentic/validation";
 import { validateScope } from "../../../commit/analysis/validation";
-import type { ControlledGit } from "../../../commit/git";
-import type { ConventionalDetail } from "../../../commit/types";
+import { normalizeDetails } from "../../../commit/utils";
 import type { CustomTool } from "../../../extensibility/custom-tools/types";
 import { commitTypeSchema, detailSchema } from "./schemas.js";
 
-const hunkSelectorSchema = Type.Union([
-	Type.Object({ type: Type.Literal("all") }),
-	Type.Object({ type: Type.Literal("indices"), indices: Type.Array(Type.Number(), { minItems: 1 }) }),
-	Type.Object({ type: Type.Literal("lines"), start: Type.Number(), end: Type.Number() }),
-]);
+const fileChangeSchema = type({ path: "string", kind: "'all'" })
+	.or({ path: "string", kind: "'indices'", indices: "number[]" })
+	.or({ path: "string", kind: "'lines'", start: "number", end: "number" });
 
-const fileChangeSchema = Type.Object({
-	path: Type.String(),
-	hunks: hunkSelectorSchema,
+const commitItemSchema = type({
+	changes: fileChangeSchema.array(),
+	type: commitTypeSchema,
+	scope: type("string").or("null"),
+	summary: "string",
+	"details?": detailSchema.array(),
+	"issue_refs?": "string[]",
+	"rationale?": "string",
+	"dependencies?": "number[]",
 });
 
-const splitCommitSchema = Type.Object({
-	commits: Type.Array(
-		Type.Object({
-			changes: Type.Array(fileChangeSchema, { minItems: 1 }),
-			type: commitTypeSchema,
-			scope: Type.Union([Type.String(), Type.Null()]),
-			summary: Type.String(),
-			details: Type.Optional(Type.Array(detailSchema)),
-			issue_refs: Type.Optional(Type.Array(Type.String())),
-			rationale: Type.Optional(Type.String()),
-			dependencies: Type.Optional(Type.Array(Type.Number())),
-		}),
-		{ minItems: 2 },
-	),
+const splitCommitSchema = type({
+	commits: commitItemSchema.array(),
 });
 
 interface SplitCommitResponse {
@@ -49,38 +41,25 @@ interface SplitCommitResponse {
 	proposal?: SplitCommitPlan;
 }
 
-function normalizeDetails(
-	details: Array<{
-		text: string;
-		changelog_category?: ConventionalDetail["changelogCategory"];
-		user_visible?: boolean;
-	}>,
-): ConventionalDetail[] {
-	return details.map(detail => ({
-		text: detail.text.trim(),
-		changelogCategory: detail.user_visible ? detail.changelog_category : undefined,
-		userVisible: detail.user_visible ?? false,
-	}));
-}
-
 export function createSplitCommitTool(
-	git: ControlledGit,
+	cwd: string,
 	state: CommitAgentState,
 	changelogTargets: string[],
 ): CustomTool<typeof splitCommitSchema> {
+	const repo = vcs.requireGit(cwd);
 	return {
 		name: "split_commit",
 		label: "Split Commit",
 		description: "Propose multiple atomic commits for unrelated changes.",
 		parameters: splitCommitSchema,
 		async execute(_toolCallId, params) {
-			const stagedFiles = state.overview?.files ?? (await git.getStagedFiles());
+			const stagedFiles = state.overview?.files ?? (await repo.changedFiles({ cached: true }));
 			const stagedSet = new Set(stagedFiles);
 			const changelogSet = new Set(changelogTargets);
 			const usedFiles = new Set<string>();
 			const errors: string[] = [];
 			const warnings: string[] = [];
-			const diffText = await git.getDiff(true);
+			const diffText = await repo.diffText({ cached: true });
 
 			const commits: SplitCommitGroup[] = params.commits.map((commit, index) => {
 				const scope = commit.scope?.trim() || null;
@@ -92,7 +71,10 @@ export function createSplitCommitTool(
 				const dependencies = (commit.dependencies ?? []).map(dep => Math.floor(dep));
 				const changes = commit.changes.map(change => ({
 					path: change.path,
-					hunks: change.hunks,
+					kind: change.kind,
+					indices: change.kind === "indices" ? change.indices : undefined,
+					start: change.kind === "lines" ? change.start : undefined,
+					end: change.kind === "lines" ? change.end : undefined,
 				}));
 				const files = changes.map(change => change.path);
 
@@ -115,7 +97,7 @@ export function createSplitCommitTool(
 				}
 				warnings.push(...summaryValidation.warnings.map(warning => `Commit ${index + 1}: ${warning}`));
 				warnings.push(...typeValidation.warnings.map(warning => `Commit ${index + 1}: ${warning}`));
-				const hunkValidation = validateHunkSelectors(index, changes, files);
+				const hunkValidation = validateHunkSelectors(index, changes, files, diffText);
 				warnings.push(...hunkValidation.warnings);
 				errors.push(...hunkValidation.errors);
 				errors.push(...validateDependencies(index, dependencies, params.commits.length));
@@ -199,6 +181,7 @@ function validateHunkSelectors(
 	commitIndex: number,
 	changes: SplitCommitGroup["changes"],
 	files: string[],
+	rawDiff: string,
 ): { errors: string[]; warnings: string[] } {
 	const errors: string[] = [];
 	const warnings: string[] = [];
@@ -208,24 +191,28 @@ function validateHunkSelectors(
 		return { errors, warnings };
 	}
 	for (const change of changes) {
-		if (change.hunks.type === "indices") {
-			const invalid = change.hunks.indices.filter(
-				value => !Number.isFinite(value) || Math.floor(value) !== value || value < 1,
-			);
+		if (change.kind === "indices") {
+			const invalid =
+				change.indices?.filter(value => !Number.isFinite(value) || Math.floor(value) !== value || value < 1) ?? [];
 			if (invalid.length > 0) {
 				errors.push(`${prefix}: invalid hunk indices for ${change.path}`);
 			}
 			continue;
 		}
-		if (change.hunks.type === "lines") {
-			const { start, end } = change.hunks;
-			if (!Number.isFinite(start) || !Number.isFinite(end)) {
+		if (change.kind === "lines") {
+			const { start, end } = change;
+			if (typeof start !== "number" || typeof end !== "number" || !Number.isFinite(start) || !Number.isFinite(end)) {
 				errors.push(`${prefix}: invalid line range for ${change.path}`);
 				continue;
 			}
 			if (Math.floor(start) !== start || Math.floor(end) !== end || start < 1 || end < start) {
 				errors.push(`${prefix}: invalid line range for ${change.path}`);
 			}
+		}
+	}
+	if (errors.length === 0) {
+		for (const error of vcs.validateHunkSelections(rawDiff, changes)) {
+			errors.push(`${prefix}: ${error.message}`);
 		}
 	}
 	return { errors, warnings };

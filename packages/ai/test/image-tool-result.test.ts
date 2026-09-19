@@ -1,10 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import type { Api, Context, Model, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai";
-import { complete, getBundledModel } from "@oh-my-pi/pi-ai";
+import { complete } from "@oh-my-pi/pi-ai";
 import type { OptionsForApi } from "@oh-my-pi/pi-ai/types";
-import { Type } from "@sinclair/typebox";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
@@ -37,7 +38,7 @@ async function handleToolWithImageResult<TApi extends Api>(model: Model<TApi>, o
 	const base64Image = imageBuffer.toBase64();
 
 	// Define a tool that returns only an image (no text)
-	const getImageSchema = Type.Object({});
+	const getImageSchema = type({});
 	const getImageTool: Tool<typeof getImageSchema> = {
 		name: "get_circle",
 		description: "Returns a circle image for visualization",
@@ -45,7 +46,7 @@ async function handleToolWithImageResult<TApi extends Api>(model: Model<TApi>, o
 	};
 
 	const context: Context = {
-		systemPrompt: "You are a helpful assistant that uses tools when asked.",
+		systemPrompt: ["You are a helpful assistant that uses tools when asked."],
 		messages: [
 			{
 				role: "user",
@@ -63,7 +64,7 @@ async function handleToolWithImageResult<TApi extends Api>(model: Model<TApi>, o
 	// Find the tool call
 	const toolCall = firstResponse.content.find(b => b.type === "toolCall");
 	expect(toolCall).toBeTruthy();
-	if (!toolCall || toolCall.type !== "toolCall") {
+	if (toolCall?.type !== "toolCall") {
 		throw new Error("Expected tool call");
 	}
 	expect(toolCall.name).toBe("get_circle");
@@ -125,7 +126,7 @@ async function handleToolWithTextAndImageResult<TApi extends Api>(model: Model<T
 	const base64Image = imageBuffer.toBase64();
 
 	// Define a tool that returns both text and an image
-	const getImageSchema = Type.Object({});
+	const getImageSchema = type({});
 	const getImageTool: Tool<typeof getImageSchema> = {
 		name: "get_circle_with_description",
 		description: "Returns a circle image with a text description",
@@ -133,7 +134,7 @@ async function handleToolWithTextAndImageResult<TApi extends Api>(model: Model<T
 	};
 
 	const context: Context = {
-		systemPrompt: "You are a helpful assistant that uses tools when asked.",
+		systemPrompt: ["You are a helpful assistant that uses tools when asked."],
 		messages: [
 			{
 				role: "user",
@@ -152,7 +153,7 @@ async function handleToolWithTextAndImageResult<TApi extends Api>(model: Model<T
 	// Find the tool call
 	const toolCall = firstResponse.content.find(b => b.type === "toolCall");
 	expect(toolCall).toBeTruthy();
-	if (!toolCall || toolCall.type !== "toolCall") {
+	if (toolCall?.type !== "toolCall") {
 		throw new Error("Expected tool call");
 	}
 	expect(toolCall.name).toBe("get_circle_with_description");
@@ -443,18 +444,18 @@ describe("Tool Results with Images", () => {
 
 	describe("OpenAI Codex Provider", () => {
 		it.skipIf(!openaiCodexToken)(
-			"gpt-5.2-codex - should handle tool result with only image",
+			"gpt-5.5 - should handle tool result with only image",
 			async () => {
-				const llm = getBundledModel("openai-codex", "gpt-5.2-codex");
+				const llm = getBundledModel("openai-codex", "gpt-5.5");
 				await handleToolWithImageResult(llm, { apiKey: openaiCodexToken });
 			},
 			{ retry: 3, timeout: 30000 },
 		);
 
 		it.skipIf(!openaiCodexToken)(
-			"gpt-5.2-codex - should handle tool result with text and image",
+			"gpt-5.5 - should handle tool result with text and image",
 			async () => {
-				const llm = getBundledModel("openai-codex", "gpt-5.2-codex");
+				const llm = getBundledModel("openai-codex", "gpt-5.5");
 				await handleToolWithTextAndImageResult(llm, { apiKey: openaiCodexToken });
 			},
 			{ retry: 3, timeout: 30000 },

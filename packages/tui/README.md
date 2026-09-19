@@ -51,6 +51,7 @@ tui.removeChild(component);
 tui.start();
 tui.stop();
 tui.requestRender(); // Request a re-render
+tui.requestComponentRender(component); // Re-render only the root subtree containing `component` when safe (falls back to a full render on resize, overlays, images, or concurrent full requests)
 
 // Global debug key handler (Shift+Ctrl+D)
 tui.onDebug = () => console.log("Debug triggered");
@@ -62,7 +63,7 @@ All components implement:
 
 ```typescript
 interface Component {
-	render(width: number): string[];
+	render(width: number): readonly string[];
 	handleInput?(data: string): void;
 	invalidate?(): void;
 }
@@ -70,11 +71,54 @@ interface Component {
 
 | Method               | Description                                                                                                                                                        |
 | -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `render(width)`      | Returns an array of strings, one per line. Each line **must not exceed `width`** or the TUI will error. Use `truncateToWidth()` or manual wrapping to ensure this. |
+| `render(width)`      | Returns an array of strings, one per line. Each line **must not exceed `width`** or the TUI will error. Use `truncateToWidth()` or manual wrapping to ensure this. The result is component-owned and immutable to callers; return the same array reference when unchanged (enables renderer memoization) and a new array when content changed. |
 | `handleInput?(data)` | Called when the component has focus and receives keyboard input. The `data` string contains raw terminal input (may include ANSI escape sequences).                |
 | `invalidate?()`      | Called to clear any cached render state. Components should re-render from scratch on the next `render()` call.                                                     |
 
 ## Built-in Components
+
+### Composition
+
+Build screens from persistent components and update their data, selection, expansion, or size through setters. Layouts own child bounds and mouse-coordinate translation; controllers retain domain workflows and asynchronous operations. Propagate `invalidate()` after theme changes and `dispose()` when removing an owned component tree.
+
+| Family | Components | Import |
+| --- | --- | --- |
+| Layout | `Stack`, `Row`, `SplitPane` | package root |
+| Panels | `OverlayPanel`, `PanelRows`, `PanelDivider` | `/chrome` |
+| Menus | `SelectList`, `MenuSelection` | package root |
+| Forms | `Form`, `FormField`, `TextFormField`, `SelectFormField`, `SettingsFormField` | package root |
+| Wizard steps | `WizardStep` | package root |
+| Viewports | `ScrollView`, including child rendering, follow-tail, and keyed range anchoring | package root |
+| Trees | `TreeView` | package root |
+| Disclosure | `Disclosure`, with lazy summary/detail children | package root |
+| Messages | `FramedMessageComponent`, `MessageNoticeComponent`, `MessageDividerComponent` | `/chrome` |
+| Tool output | `ToolCard`, `framedToolCard`, `plainToolCard`, `OutputPane` | `/render` |
+| Transcripts | `TranscriptBrowser` | package root |
+| Data | `MetricRow`, `ProgressBar`, `Table`, `KeyValueList`, `Section` | package root |
+
+```typescript
+import { Disclosure, SplitPane, Text } from "@oh-my-pi/pi-tui";
+
+const diagnostics = new Disclosure({
+	summary: new Text("2 build diagnostics", 0, 0),
+	body: () => new Text("src/index.ts:12 — unused import\nsrc/config.ts:8 — missing property", 0, 0),
+});
+
+const view = new SplitPane({
+	left: new Text("Build diagnostics", 0, 0),
+	right: diagnostics,
+	leftSize: { fixed: 24 },
+	rightMinWidth: 30,
+	splitAt: 60,
+	narrowPane: "right",
+	height: 12,
+});
+
+diagnostics.setExpanded(true);
+view.setHeight(16);
+```
+
+`ScrollView.revealRange()` preserves manual scrolling while a selection is unchanged; `mode: "once"` supports asynchronously arriving initial selections. `OutputPane.append()` accepts incremental terminal output, including carriage-return updates; call `finish()` when the stream ends.
 
 ### Container
 
@@ -411,7 +455,7 @@ const spacer = new Spacer(2); // 2 empty lines (default: 1)
 
 ### Image
 
-Renders images inline for terminals that support the Kitty graphics protocol (Kitty, Ghostty, WezTerm) or iTerm2 inline images. Falls back to a text placeholder on unsupported terminals.
+Renders images inline for terminals that support the Kitty graphics protocol (Kitty, Ghostty, WezTerm, and Warp on macOS/Linux) or iTerm2 inline images. Falls back to a text placeholder on unsupported terminals.
 
 ```typescript
 interface ImageTheme {
@@ -513,7 +557,7 @@ The TUI uses three rendering strategies:
 2. **Width Changed or Change Above Viewport**: Clear screen and full re-render
 3. **Normal Update**: Move cursor to first changed line, clear to end, render changed lines
 
-All updates are wrapped in **synchronized output** (`\x1b[?2026h` ... `\x1b[?2026l`) for atomic, flicker-free rendering.
+All updates are wrapped in **synchronized output** (`\x1b[?2026h` ... `\x1b[?2026l`) for atomic, flicker-free rendering unless `PI_NO_SYNC_OUTPUT=1` is set. The opt-out removes only the DEC 2026 wrapper; paint writes still guard terminal autowrap to avoid pending-wrap cursor artifacts.
 
 ## Terminal Interface
 
@@ -521,14 +565,14 @@ The TUI works with any object implementing the `Terminal` interface:
 
 ```typescript
 interface Terminal {
-	start(onInput: (data: string) => void, onResize: () => void): void;
+	start(onInput: (data: string) => void, onResize: () => void, onDisconnect?: () => void): void;
 	stop(): void;
 	write(data: string): void;
 	get columns(): number;
 	get rows(): number;
 	moveBy(lines: number): void;
-	hideCursor(): void;
-	showCursor(): void;
+	hideCursor(force?: boolean): void;
+	showCursor(force?: boolean): void;
 	clearLine(): void;
 	clearFromCursor(): void;
 	clearScreen(): void;
@@ -538,7 +582,7 @@ interface Terminal {
 **Built-in implementations:**
 
 - `ProcessTerminal` - Uses `process.stdin/stdout`
-- `VirtualTerminal` - For testing (uses `@xterm/headless`)
+- `VirtualTerminal` - For testing (uses kitty-vt-wasm)
 
 ## Utilities
 
@@ -590,7 +634,7 @@ class MyInteractiveComponent implements Component {
 		}
 	}
 
-	render(width: number): string[] {
+	render(width: number): readonly string[] {
 		return this.items.map((item, i) => {
 			const prefix = i === this.selectedIndex ? "> " : "  ";
 			return truncateToWidth(prefix + item, width);
@@ -614,7 +658,7 @@ class MyComponent implements Component {
 		this.text = text;
 	}
 
-	render(width: number): string[] {
+	render(width: number): readonly string[] {
 		// Option 1: Truncate long lines
 		return [truncateToWidth(this.text, width)];
 
@@ -639,7 +683,7 @@ class MyComponent implements Component {
 - `wrapTextWithAnsi()` preserves ANSI codes while word-wrapping and trimming line ends
 
 ```typescript
-import chalk from "chalk";
+import chalk from "@oh-my-pi/pi-utils/chalk";
 
 const styled = chalk.red("Hello") + " " + chalk.blue("World");
 const width = visibleWidth(styled); // 11 (not counting ANSI codes)
@@ -656,7 +700,7 @@ class CachedComponent implements Component {
 	private cachedWidth?: number;
 	private cachedLines?: string[];
 
-	render(width: number): string[] {
+	render(width: number): readonly string[] {
 		if (this.cachedLines && this.cachedWidth === width) {
 			return this.cachedLines;
 		}

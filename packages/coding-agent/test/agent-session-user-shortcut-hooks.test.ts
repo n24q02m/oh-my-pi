@@ -1,26 +1,31 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
-import * as path from "node:path";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { getBundledModel } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import * as pythonExecutor from "@oh-my-pi/pi-coding-agent/eval/py/executor";
 import * as bashExecutor from "@oh-my-pi/pi-coding-agent/exec/bash-executor";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
-import * as pythonExecutor from "@oh-my-pi/pi-coding-agent/ipy/executor";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
+
+const sharedAuthStorage = createInMemoryAuthStorage();
+const sharedModelRegistry = new ModelRegistry(sharedAuthStorage);
+
+afterAll(() => {
+	sharedAuthStorage.close();
+});
 
 describe("AgentSession user shortcut hooks", () => {
 	let tempDir: TempDir;
 	let session: AgentSession;
 	let modelRegistry: ModelRegistry;
 
-	beforeEach(async () => {
+	beforeEach(() => {
 		tempDir = TempDir.createSync("@pi-user-shortcut-hooks-");
-		const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
-		modelRegistry = new ModelRegistry(authStorage);
+		modelRegistry = sharedModelRegistry;
 	});
 
 	afterEach(async () => {
@@ -28,6 +33,7 @@ describe("AgentSession user shortcut hooks", () => {
 		if (session) {
 			await session.dispose();
 		}
+		await pythonExecutor.disposeAllKernelSessions();
 		tempDir.removeSync();
 	});
 
@@ -38,7 +44,7 @@ describe("AgentSession user shortcut hooks", () => {
 		const agent = new Agent({
 			initialState: {
 				model,
-				systemPrompt: "Test",
+				systemPrompt: ["Test"],
 				tools: [],
 				messages: [],
 			},
@@ -46,7 +52,7 @@ describe("AgentSession user shortcut hooks", () => {
 
 		session = new AgentSession({
 			agent,
-			sessionManager: SessionManager.inMemory(),
+			sessionManager: SessionManager.inMemory(tempDir.path()),
 			settings: Settings.isolated({ "compaction.enabled": false }),
 			modelRegistry,
 			extensionRunner,
@@ -173,5 +179,22 @@ describe("AgentSession user shortcut hooks", () => {
 		expect(
 			session.messages.some(message => message.role === "pythonExecution" && message.excludeFromContext === false),
 		).toBe(true);
+	});
+
+	it("shares Python state between eval and user shortcut execution", async () => {
+		createSession();
+		const evalSessionId = session.getEvalSessionId();
+		if (!evalSessionId) throw new Error("Expected eval session ID");
+
+		await pythonExecutor.executePython("shared_value = 123", {
+			cwd: tempDir.path(),
+			sessionId: `python:${evalSessionId}`,
+			kernelMode: "session",
+		});
+
+		const result = await session.executePython("print(shared_value)");
+
+		expect(result.exitCode).toBe(0);
+		expect(result.output.trim()).toBe("123");
 	});
 });

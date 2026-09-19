@@ -1,12 +1,12 @@
 import { describe, expect, it } from "bun:test";
-import { getBundledModel } from "@oh-my-pi/pi-ai/models";
+import { type } from "@oh-my-pi/omptype";
 import { complete } from "@oh-my-pi/pi-ai/stream";
 import type { Api, Context, Model, OptionsForApi, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
-import { Type } from "@sinclair/typebox";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
 // Empty schema for test tools - must be proper OBJECT type for Cloud Code Assist
-const emptySchema = Type.Object({});
+const emptySchema = type({});
 
 // Resolve OAuth tokens at module level (async, runs before tests)
 const oauthTokens = await Promise.all([
@@ -32,7 +32,7 @@ const [anthropicOAuthToken, githubCopilotToken, geminiCliToken, antigravityToken
 async function testEmojiInToolResults<TApi extends Api>(llm: Model<TApi>, options: OptionsForApi<TApi> = {}) {
 	// Simulate a tool that returns emoji
 	const context: Context = {
-		systemPrompt: "You are a helpful assistant.",
+		systemPrompt: ["You are a helpful assistant."],
 		messages: [
 			{
 				role: "user",
@@ -117,7 +117,7 @@ async function testEmojiInToolResults<TApi extends Api>(llm: Model<TApi>, option
 
 async function testRealWorldLinkedInData<TApi extends Api>(llm: Model<TApi>, options: OptionsForApi<TApi> = {}) {
 	const context: Context = {
-		systemPrompt: "You are a helpful assistant.",
+		systemPrompt: ["You are a helpful assistant."],
 		messages: [
 			{
 				role: "user",
@@ -205,7 +205,7 @@ Unanswered Comments: 2
 
 async function testUnpairedHighSurrogate<TApi extends Api>(llm: Model<TApi>, options: OptionsForApi<TApi> = {}) {
 	const context: Context = {
-		systemPrompt: "You are a helpful assistant.",
+		systemPrompt: ["You are a helpful assistant."],
 		messages: [
 			{
 				role: "user",

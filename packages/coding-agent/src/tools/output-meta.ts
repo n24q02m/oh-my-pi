@@ -12,85 +12,50 @@ import type {
 	AgentToolUpdateCallback,
 } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import type { Theme } from "../modes/theme/theme";
-import type { OutputSummary, TruncationResult } from "../session/streaming-output";
-import { formatBytes, wrapBrackets } from "./render-utils";
+import { isRecord, logger } from "@oh-my-pi/pi-utils";
+import { getDefault, type Settings } from "../config/settings";
+import {
+	type OutputSummary,
+	type TruncationResult,
+	truncateMiddle,
+	truncateTail,
+} from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { formatOutputNotice, type OutputMeta, type TruncationMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
 import { renderError } from "./tool-errors";
 
-/**
- * Truncation metadata for the output notice.
- */
-export interface TruncationMeta {
-	direction: "head" | "tail";
-	truncatedBy: "lines" | "bytes";
-	totalLines: number;
-	totalBytes: number;
-	outputLines: number;
-	outputBytes: number;
-	maxBytes?: number;
-	/** Line range shown (1-indexed, inclusive) */
-	shownRange?: { start: number; end: number };
-	/** Artifact ID if full output was saved */
-	artifactId?: string;
-	/** Next offset for pagination (head truncation only) */
-	nextOffset?: number;
-}
-
-/**
- * Source resolution info for the output.
- */
-export type SourceMeta =
-	| { type: "path"; value: string }
-	| { type: "url"; value: string }
-	| { type: "internal"; value: string };
-
-/**
- * LSP diagnostic info (for edit/write tools).
- */
-export interface DiagnosticMeta {
-	summary: string;
-	messages: string[];
-}
-
-/**
- * Limit-specific notices.
- */
-export interface LimitsMeta {
-	matchLimit?: { reached: number; suggestion: number };
-	resultLimit?: { reached: number; suggestion: number };
-	headLimit?: { reached: number; suggestion: number };
-	columnTruncated?: { maxColumn: number };
-}
-
-/**
- * Structured metadata for tool outputs.
- */
-export interface OutputMeta {
-	truncation?: TruncationMeta;
-	source?: SourceMeta;
-	diagnostics?: DiagnosticMeta;
-	limits?: LimitsMeta;
+/** Input for {@link OutputMetaBuilder.limits}. `columnUnit` defaults to `chars`. */
+export interface LimitsInput {
+	matchLimit?: number;
+	resultLimit?: number;
+	headLimit?: number;
+	columnMax?: number;
+	columnUnit?: "bytes" | "chars";
 }
 
 // =============================================================================
 // OutputMetaBuilder - Fluent API for building OutputMeta
 // =============================================================================
 
-export interface TruncationOptions {
-	direction: "head" | "tail";
+/** Metadata supplied when recording a truncated tool result. */
+export interface TruncationMetaInput {
+	direction: "head" | "tail" | "middle";
 	startLine?: number;
 	totalFileLines?: number;
 	artifactId?: string;
+	/** Byte budget that stopped the read, when truncation is byte-limited. */
+	maxBytes?: number;
+	/** Override the derived continuation line; `null` suppresses an unsafe continuation hint. */
+	nextOffset?: number | null;
 }
 
 export interface TruncationSummaryOptions {
-	direction: "head" | "tail";
+	direction: "head" | "tail" | "middle";
 	startLine?: number;
 	totalFileLines?: number;
 }
 
 export interface TruncationTextOptions {
-	direction: "head" | "tail";
+	direction: "head" | "tail" | "middle";
 	totalLines?: number;
 	totalBytes?: number;
 	maxBytes?: number;
@@ -112,44 +77,142 @@ export class OutputMetaBuilder {
 	#meta: OutputMeta = {};
 
 	/** Add truncation info from TruncationResult. No-op if not truncated. */
-	truncation(result: TruncationResult, options: TruncationOptions): this {
+	truncation(result: TruncationResult, options: TruncationMetaInput): this {
 		if (!result.truncated) return this;
 
-		const { direction, startLine = 1, totalFileLines, artifactId } = options;
+		const { direction, startLine = 1, totalFileLines, artifactId, maxBytes } = options;
+		const outputLines = result.outputLines ?? result.totalLines;
+		const outputBytes = result.outputBytes ?? result.totalBytes;
+		const isMiddle = direction === "middle" || result.truncatedBy === "middle";
+		const truncatedBy: "lines" | "bytes" | "middle" = isMiddle
+			? "middle"
+			: result.truncatedBy === "lines"
+				? "lines"
+				: "bytes";
+
+		const effectiveTotalLines = totalFileLines ?? result.totalLines;
+
+		if (result.firstLineExceedsLimit) {
+			// The window collected no complete line; the body is a byte-capped
+			// preview of one oversized line. Describe that partial line instead of
+			// deriving an empty range that renders "Showing 0 of N lines".
+			this.#meta.truncation = {
+				direction,
+				truncatedBy: "bytes",
+				totalLines: effectiveTotalLines,
+				totalBytes: result.totalBytes,
+				outputLines,
+				outputBytes,
+				shownRange: { start: startLine, end: startLine },
+				partialLine: true,
+				artifactId,
+			};
+			return this;
+		}
+
+		if (isMiddle) {
+			const elidedLines = result.elidedLines ?? Math.max(0, effectiveTotalLines - outputLines);
+			const elidedBytes = result.elidedBytes ?? Math.max(0, result.totalBytes - outputBytes);
+			// Reconstruct head/tail line ranges. The kept output spans the first
+			// `headLines` lines and the last `tailLines` lines of the source; lines
+			// in the middle (count == elidedLines) are dropped.
+			const keptLines = Math.max(0, outputLines - 1); // -1 for marker line
+			const headLines = result.headLines ?? Math.ceil(keptLines / 2);
+			const tailLines = result.tailLines ?? keptLines - headLines;
+			this.#meta.truncation = {
+				direction: "middle",
+				truncatedBy: "middle",
+				totalLines: effectiveTotalLines,
+				totalBytes: result.totalBytes,
+				outputLines,
+				outputBytes,
+				...(effectiveTotalLines > 1 && !result.partialByteWindows
+					? {
+							headRange: headLines > 0 ? { start: 1, end: headLines } : undefined,
+							tailRange:
+								tailLines > 0
+									? { start: effectiveTotalLines - tailLines + 1, end: effectiveTotalLines }
+									: undefined,
+						}
+					: {}),
+				elidedLines,
+				elidedBytes,
+				artifactId,
+			};
+			return this;
+		}
 
 		let shownStart: number;
 		let shownEnd: number;
 
 		if (direction === "tail") {
-			shownStart = result.totalLines - result.outputLines + 1;
+			shownStart = result.totalLines - outputLines + 1;
 			shownEnd = result.totalLines;
 		} else {
 			shownStart = startLine;
-			shownEnd = startLine + result.outputLines - 1;
+			shownEnd = startLine + outputLines - 1;
 		}
 
 		this.#meta.truncation = {
 			direction,
-			truncatedBy: result.truncatedBy!,
-			totalLines: totalFileLines ?? result.totalLines,
+			truncatedBy,
+			totalLines: effectiveTotalLines,
 			totalBytes: result.totalBytes,
-			outputLines: result.outputLines,
-			outputBytes: result.outputBytes,
-			maxBytes: result.maxBytes,
+			outputLines,
+			outputBytes,
+			maxBytes,
 			shownRange: { start: shownStart, end: shownEnd },
 			artifactId,
-			nextOffset: direction === "head" ? shownEnd + 1 : undefined,
+			nextOffset:
+				direction === "head"
+					? options.nextOffset === null
+						? undefined
+						: (options.nextOffset ?? shownEnd + 1)
+					: undefined,
 		};
 
 		return this;
 	}
 
-	/** Add truncation info from OutputSummary. No-op if not truncated. */
+	/** Add truncation, column limits, and capture failures from OutputSummary. */
 	truncationFromSummary(summary: OutputSummary, options: TruncationSummaryOptions): this {
+		if (summary.artifactError) this.#meta.artifactError = summary.artifactError;
+		// A per-line column cap only trims individual lines (with a `…` marker);
+		// it is not a window/byte truncation, so surface it as its own limit
+		// notice rather than a "Showing lines X-Y … limit" range. This runs even
+		// when the output is otherwise complete (`truncated === false`). The sink
+		// enforces the cap in UTF-8 bytes, so the notice must say "bytes".
+		if (summary.columnMax != null && summary.columnMax > 0 && (summary.columnTruncatedLines ?? 0) > 0) {
+			this.columnTruncated(summary.columnMax, "bytes", summary.artifactId);
+		}
 		if (!summary.truncated) return this;
 
 		const { direction, startLine = 1, totalFileLines } = options;
 		const totalLines = totalFileLines ?? summary.totalLines;
+		const artifactId = summary.artifactError ? undefined : summary.artifactId;
+
+		// Middle elision: the sink retained head + tail with an elision marker.
+		if (summary.elidedBytes != null && summary.elidedBytes > 0) {
+			const elidedLines = summary.elidedLines ?? Math.max(0, totalLines - summary.outputLines);
+			const keptLines = Math.max(0, summary.outputLines - 1); // -1 for marker line
+			const headLines = Math.ceil(keptLines / 2);
+			const tailLines = keptLines - headLines;
+			this.#meta.truncation = {
+				direction: "middle",
+				truncatedBy: "middle",
+				totalLines,
+				totalBytes: summary.totalBytes,
+				outputLines: summary.outputLines,
+				outputBytes: summary.outputBytes,
+				headRange: headLines > 0 ? { start: 1, end: headLines } : undefined,
+				tailRange: tailLines > 0 ? { start: totalLines - tailLines + 1, end: totalLines } : undefined,
+				elidedBytes: summary.elidedBytes,
+				elidedLines,
+				artifactId,
+			};
+			return this;
+		}
+
 		const truncatedBy: "lines" | "bytes" =
 			summary.outputBytes < summary.totalBytes
 				? "bytes"
@@ -176,7 +239,7 @@ export class OutputMetaBuilder {
 			outputLines: summary.outputLines,
 			outputBytes: summary.outputBytes,
 			shownRange: { start: shownStart, end: shownEnd },
-			artifactId: summary.artifactId,
+			artifactId,
 			nextOffset: direction === "head" ? shownEnd + 1 : undefined,
 		};
 
@@ -236,7 +299,7 @@ export class OutputMetaBuilder {
 	}
 
 	/** Add limit notices in one call. */
-	limits(limits: { matchLimit?: number; resultLimit?: number; headLimit?: number; columnMax?: number }): this {
+	limits(limits: LimitsInput): this {
 		if (limits.matchLimit !== undefined) {
 			this.matchLimit(limits.matchLimit);
 		}
@@ -247,7 +310,7 @@ export class OutputMetaBuilder {
 			this.headLimit(limits.headLimit);
 		}
 		if (limits.columnMax !== undefined) {
-			this.columnTruncated(limits.columnMax);
+			this.columnTruncated(limits.columnMax, limits.columnUnit);
 		}
 		return this;
 	}
@@ -266,10 +329,18 @@ export class OutputMetaBuilder {
 		return this;
 	}
 
-	/** Add column truncation notice. No-op if maxColumn <= 0. */
-	columnTruncated(maxColumn: number): this {
+	/**
+	 * Add column truncation notice. No-op if maxColumn <= 0. `unit` names the
+	 * unit the producer enforced the cap in — `"bytes"` for the streaming sink
+	 * and grep's UTF-8 caps, `"chars"` (UTF-16 code units) for the read path.
+	 *
+	 * When `artifactId` is supplied the sink mirrored the raw, uncapped stream
+	 * into that artifact; the rendered notice then advertises it as a recovery
+	 * pointer (see {@link formatOutputNotice}), matching the tail-truncation notice.
+	 */
+	columnTruncated(maxColumn: number, unit: "bytes" | "chars" = "chars", artifactId?: string): this {
 		if (maxColumn <= 0) return this;
-		this.#meta.limits = { ...this.#meta.limits, columnTruncated: { maxColumn } };
+		this.#meta.limits = { ...this.#meta.limits, columnTruncated: { maxColumn, unit, artifactId } };
 		return this;
 	}
 
@@ -313,96 +384,6 @@ export function outputMeta(): OutputMetaBuilder {
 // Notice formatting
 // =============================================================================
 
-export function formatFullOutputReference(artifactId: string): string {
-	return `Full output: artifact://${artifactId}`;
-}
-
-export function formatTruncationMetaNotice(truncation: TruncationMeta): string {
-	const range = truncation.shownRange;
-	let notice: string;
-
-	if (range && range.end >= range.start) {
-		notice = `Showing lines ${range.start}-${range.end} of ${truncation.totalLines}`;
-	} else {
-		notice = `Showing ${truncation.outputLines} of ${truncation.totalLines} lines`;
-	}
-
-	if (truncation.truncatedBy === "bytes") {
-		const maxBytes = truncation.maxBytes ?? truncation.outputBytes;
-		notice += ` (${formatBytes(maxBytes)} limit)`;
-	}
-
-	if (truncation.nextOffset != null) {
-		notice += `. Use offset=${truncation.nextOffset} to continue`;
-	}
-
-	if (truncation.artifactId != null) {
-		notice += `. ${formatFullOutputReference(truncation.artifactId)}`;
-	}
-
-	return notice;
-}
-
-/**
- * Format styled artifact reference with warning color and brackets.
- * For TUI rendering of truncation warnings.
- */
-export function formatStyledArtifactReference(artifactId: string, theme: Theme): string {
-	return theme.fg("warning", formatFullOutputReference(artifactId));
-}
-
-/**
- * Format notices from OutputMeta for LLM consumption.
- * Returns empty string if no notices needed.
- */
-export function formatOutputNotice(meta: OutputMeta | undefined): string {
-	if (!meta) return "";
-
-	const parts: string[] = [];
-
-	// Truncation notice
-	if (meta.truncation) {
-		parts.push(formatTruncationMetaNotice(meta.truncation));
-	}
-
-	// Limit notices
-	if (meta.limits?.matchLimit) {
-		const l = meta.limits.matchLimit;
-		parts.push(`${l.reached} matches limit reached. Use limit=${l.suggestion} for more`);
-	}
-	if (meta.limits?.resultLimit) {
-		const l = meta.limits.resultLimit;
-		parts.push(`${l.reached} results limit reached. Use limit=${l.suggestion} for more`);
-	}
-	if (meta.limits?.headLimit) {
-		const l = meta.limits.headLimit;
-		parts.push(`${l.reached} results limit reached. Use limit=${l.suggestion} for more`);
-	}
-	if (meta.limits?.columnTruncated) {
-		parts.push(`Some lines truncated to ${meta.limits.columnTruncated.maxColumn} chars`);
-	}
-
-	// Diagnostics
-	let diagnosticsNotice = "";
-	if (meta.diagnostics && meta.diagnostics.messages.length > 0) {
-		const d = meta.diagnostics;
-		diagnosticsNotice = `\n\nLSP Diagnostics (${d.summary}):\n  ${d.messages.join("\n  ")}`;
-	}
-
-	const notice = parts.length ? `\n\n[${parts.join(". ")}]` : "";
-	return notice + diagnosticsNotice;
-}
-
-/**
- * Format a styled truncation warning message.
- * Returns null if no truncation metadata present.
- */
-export function formatStyledTruncationWarning(meta: OutputMeta | undefined, theme: Theme): string | null {
-	if (!meta?.truncation) return null;
-	const message = formatTruncationMetaNotice(meta.truncation);
-	return theme.fg("warning", wrapBrackets(message, theme));
-}
-
 // =============================================================================
 // Tool wrapper
 // =============================================================================
@@ -411,16 +392,17 @@ export function formatStyledTruncationWarning(meta: OutputMeta | undefined, them
  * Append output notice to tool result content if meta is present.
  */
 function appendOutputNotice(
-	content: Array<{ type: string; text?: string }>,
+	content: (TextContent | ImageContent)[],
 	meta: OutputMeta | undefined,
-): Array<{ type: string; text?: string }> {
+): (TextContent | ImageContent)[] {
 	const notice = formatOutputNotice(meta);
 	if (!notice) return content;
 
 	const result = [...content];
 	for (let i = result.length - 1; i >= 0; i--) {
-		if (result[i].type === "text" && result[i].text != null) {
-			result[i] = { ...result[i], text: result[i].text + notice };
+		const item = result[i];
+		if (item.type === "text") {
+			result[i] = { ...item, text: item.text + notice };
 			return result;
 		}
 	}
@@ -430,6 +412,258 @@ function appendOutputNotice(
 }
 
 const kUnwrappedExecute = Symbol("OutputMeta.UnwrappedExecute");
+
+// =============================================================================
+// Centralized artifact spill for large tool results
+// =============================================================================
+
+/** Resolved artifact spill config sourced from the session settings (or schema defaults). */
+function getSpillConfig(s: Settings | undefined) {
+	type Path =
+		| "tools.artifactSpillThreshold"
+		| "tools.artifactTailBytes"
+		| "tools.artifactTailLines"
+		| "tools.artifactHeadBytes";
+	const get = <P extends Path>(path: P) => s?.get(path) ?? getDefault(path);
+	return {
+		threshold: get("tools.artifactSpillThreshold") * 1024,
+		tailBytes: get("tools.artifactTailBytes") * 1024,
+		tailLines: get("tools.artifactTailLines"),
+		headBytes: get("tools.artifactHeadBytes") * 1024,
+	};
+}
+
+/**
+ * Resolve the OutputSink `headBytes` budget from session settings.
+ * Exposed so streaming executors (bash/python/ssh/eval) can opt into
+ * middle elision with the same per-user configuration.
+ */
+export function resolveOutputSinkHeadBytes(s: Settings | undefined): number {
+	return getSpillConfig(s).headBytes;
+}
+
+/**
+ * Slack on top of the configured spill threshold before the final-defense
+ * inline byte cap fires. The OutputSink already bounds inline bodies to the
+ * threshold; only notice slop (wall time, exit code, elision marker,
+ * `[raw output: artifact://N]` footer) rides above it. The slack keeps the
+ * cap a genuine last resort for paths that bypass the sink (e.g. ACP
+ * client-bridge terminals) instead of re-truncating — and re-saving — every
+ * sink-elided result (the double-artifact `Artifact: N+1` vs `artifact://N`
+ * mismatch).
+ */
+const INLINE_CAP_SLACK_BYTES = 2 * 1024;
+
+/**
+ * Resolve the `enforceInlineByteCap` budget for streaming tools (bash/ssh)
+ * from session settings: the user's spill threshold plus notice slack.
+ */
+export function resolveInlineByteCapBudget(s: Settings | undefined): number {
+	return getSpillConfig(s).threshold + INLINE_CAP_SLACK_BYTES;
+}
+
+/**
+ * Resolve the per-line column cap from session settings. Shared by streaming
+ * executors (bash/python/ssh/eval via OutputSink) and the `read` tool's
+ * line-buffer post-processing, so one setting controls both surfaces.
+ */
+export function resolveOutputMaxColumns(s: Settings | undefined): number {
+	return s?.get("tools.outputMaxColumns") ?? getDefault("tools.outputMaxColumns");
+}
+
+/**
+ * If the tool result text exceeds the spill threshold, save the full output
+ * as a session artifact and replace the content with a head+tail (middle
+ * elision) view plus an artifact reference. When `tools.artifactHeadBytes`
+ * is 0, falls back to tail-only truncation. Skips when the tool already
+ * saved its own artifact (e.g. bash/python via OutputSink).
+ */
+async function spillLargeResultToArtifact(
+	result: AgentToolResult,
+	toolName: string,
+	context: AgentToolContext | undefined,
+): Promise<AgentToolResult> {
+	const sessionManager = context?.sessionManager;
+	if (!sessionManager) return result;
+	const { threshold, tailBytes, tailLines, headBytes } = getSpillConfig(context?.settings);
+
+	// Skip if tool already saved an artifact
+	const existingMeta: OutputMeta | undefined = result.details?.meta;
+	if (existingMeta?.truncation?.artifactId) return result;
+
+	// Reading an artifact already addresses recoverable full output. Spilling that
+	// read would only create a redundant artifact containing another artifact's
+	// page (and can repeat indefinitely on subsequent reads).
+	if (
+		toolName === "read" &&
+		existingMeta?.source?.type === "internal" &&
+		existingMeta.source.value.startsWith("artifact://")
+	) {
+		return result;
+	}
+
+	// Measure total text content
+	const textParts: string[] = [];
+	for (const block of result.content) {
+		if (block.type === "text" && block.text) {
+			textParts.push(block.text);
+		}
+	}
+	if (textParts.length === 0) return result;
+
+	const fullText = textParts.length === 1 ? textParts[0] : textParts.join("\n");
+	const totalBytes = Buffer.byteLength(fullText, "utf-8");
+	if (totalBytes <= threshold) return result;
+
+	// Save the full output as an artifact so the elided bytes stay recoverable.
+	// In a persistent session this hits `Bun.write`, which can throw (disk full,
+	// permissions). The spill wraps arbitrary tools (built-in, MCP, extension,
+	// RPC-host); a save failure must never convert a successful call into an
+	// error, nor re-expose the full (possibly context-blowing) output. Mirror
+	// `enforceInlineByteCap`: always truncate past the threshold, and only
+	// attach the `artifact://` recovery link when the save actually succeeded.
+	let artifactId: string | undefined;
+	// A failed stream capture only left a preview here. Saving that preview
+	// would invent a misleading full-output recovery link, not recover the log.
+	if (!existingMeta?.artifactError) {
+		try {
+			artifactId = await sessionManager.saveArtifact(fullText, toolName);
+		} catch (error) {
+			logger.warn("Failed to spill large tool result to artifact", {
+				tool: toolName,
+				error: error instanceof Error ? error.message : String(error),
+			});
+		}
+	}
+
+	// Truncate: middle elision when a head budget is configured, otherwise tail-only.
+	const useMiddle = headBytes > 0;
+	const truncated = useMiddle
+		? truncateMiddle(fullText, {
+				maxBytes: headBytes + tailBytes,
+				maxLines: tailLines * 2,
+				maxHeadBytes: headBytes,
+				maxHeadLines: tailLines,
+			})
+		: truncateTail(fullText, {
+				maxBytes: tailBytes,
+				maxLines: tailLines,
+			});
+
+	// Replace text blocks with single truncated block, keep images
+	const newContent: (TextContent | ImageContent)[] = [];
+	for (const block of result.content) {
+		if (block.type !== "text") {
+			newContent.push(block);
+		}
+	}
+	newContent.push({ type: "text", text: truncated.content });
+
+	// Build truncation meta
+	const outputLines = truncated.outputLines ?? truncated.totalLines;
+	const outputBytes = truncated.outputBytes ?? truncated.totalBytes;
+	let truncationMeta: TruncationMeta;
+	if (truncated.truncatedBy === "middle") {
+		const elidedLines = truncated.elidedLines ?? Math.max(0, truncated.totalLines - outputLines);
+		const elidedBytes = truncated.elidedBytes ?? Math.max(0, truncated.totalBytes - outputBytes);
+		const keptLines = Math.max(0, outputLines - 1); // -1 for marker line
+		const headLines = truncated.headLines ?? Math.ceil(keptLines / 2);
+		const tailLineCount = truncated.tailLines ?? keptLines - headLines;
+		truncationMeta = {
+			direction: "middle",
+			truncatedBy: "middle",
+			totalLines: truncated.totalLines,
+			totalBytes: truncated.totalBytes,
+			outputLines,
+			outputBytes,
+			maxBytes: headBytes + tailBytes,
+			...(truncated.totalLines > 1 && !truncated.partialByteWindows
+				? {
+						headRange: headLines > 0 ? { start: 1, end: headLines } : undefined,
+						tailRange:
+							tailLineCount > 0
+								? { start: truncated.totalLines - tailLineCount + 1, end: truncated.totalLines }
+								: undefined,
+					}
+				: {}),
+			elidedLines,
+			elidedBytes,
+			artifactId,
+			nextOffset: existingMeta?.truncation?.nextOffset,
+		};
+	} else {
+		const shownStart = truncated.totalLines - outputLines + 1;
+		truncationMeta = {
+			direction: "tail",
+			truncatedBy: truncated.truncatedBy ?? "bytes",
+			totalLines: truncated.totalLines,
+			totalBytes: truncated.totalBytes,
+			outputLines,
+			outputBytes,
+			maxBytes: tailBytes,
+			shownRange: { start: shownStart, end: truncated.totalLines },
+			artifactId,
+			nextOffset: existingMeta?.truncation?.nextOffset,
+		};
+	}
+
+	const newMeta: OutputMeta = { ...existingMeta, truncation: truncationMeta };
+	const newDetails = { ...result.details, meta: newMeta };
+
+	// Prune the raw payload only MCP results duplicate into `details.rawContent`.
+	// Identify them by the required `serverName` + `mcpToolName` markers (the same
+	// signature the MCP renderer uses) so a property-name collision on an
+	// SDK/extension tool's intentionally unconstrained details can never trigger
+	// this transformation. Everything already stored elsewhere is dropped so
+	// `rawContent` cannot re-inflate the on-disk size: text blocks and
+	// `resource.text` are captured verbatim by the artifact, and image data
+	// survives on the result content (and eval's `images`). Resource URI/MIME/blob
+	// metadata has no other home, so it is retained.
+	if (
+		typeof newDetails.serverName === "string" &&
+		typeof newDetails.mcpToolName === "string" &&
+		Array.isArray(newDetails.rawContent)
+	) {
+		const structuredContent: unknown[] = [];
+		for (const block of newDetails.rawContent) {
+			if (!isRecord(block)) {
+				structuredContent.push(block);
+				continue;
+			}
+			// Text and image payloads live in the artifact / result content.
+			if (block.type === "text" || block.type === "image") continue;
+			// Resource text is folded into the artifact; keep the rest of the resource.
+			if (block.type === "resource" && isRecord(block.resource) && "text" in block.resource) {
+				const resource = { ...block.resource };
+				delete resource.text;
+				structuredContent.push({ ...block, resource });
+				continue;
+			}
+			structuredContent.push(block);
+		}
+		if (structuredContent.length > 0) {
+			newDetails.rawContent = structuredContent;
+		} else {
+			delete newDetails.rawContent;
+		}
+	}
+
+	return { ...result, content: newContent, details: newDetails };
+}
+
+// =============================================================================
+// Tool wrapper
+// =============================================================================
+
+export async function postProcessToolResult(
+	result: AgentToolResult,
+	toolName: string,
+	context?: AgentToolContext,
+): Promise<AgentToolResult> {
+	const processed = await spillLargeResultToArtifact(result, toolName, context);
+	const meta: OutputMeta | undefined = processed.details?.meta;
+	return meta ? { ...processed, content: appendOutputNotice(processed.content, meta) } : processed;
+}
 
 async function wrappedExecute(
 	this: AgentTool & { [kUnwrappedExecute]: AgentToolExecFn },
@@ -442,13 +676,17 @@ async function wrappedExecute(
 	const originalExecute = this[kUnwrappedExecute];
 
 	try {
+		let result = await originalExecute.call(this, toolCallId, params, signal, onUpdate, context);
+
+		// Spill large results to artifact, truncate to tail
+		result = await spillLargeResultToArtifact(result, this.name, context);
+
 		// Append notices from meta
-		const result = await originalExecute.call(this, toolCallId, params, signal, onUpdate, context);
-		const meta = (result.details as { meta?: OutputMeta } | undefined)?.meta;
+		const meta: OutputMeta | undefined = result.details?.meta;
 		if (meta) {
 			return {
 				...result,
-				content: appendOutputNotice(result.content, meta) as (TextContent | ImageContent)[],
+				content: appendOutputNotice(result.content, meta),
 			};
 		}
 		return result;

@@ -1,4 +1,5 @@
-import { Type } from "@sinclair/typebox";
+import { type } from "@oh-my-pi/omptype";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import type { CommitAgentState } from "../../../commit/agentic/state";
 import {
 	capDetails,
@@ -9,17 +10,17 @@ import {
 	validateTypeConsistency,
 } from "../../../commit/agentic/validation";
 import { validateAnalysis } from "../../../commit/analysis/validation";
-import type { ControlledGit } from "../../../commit/git";
 import type { CommitType, ConventionalAnalysis, ConventionalDetail } from "../../../commit/types";
+import { normalizeDetails } from "../../../commit/utils";
 import type { CustomTool } from "../../../extensibility/custom-tools/types";
 import { commitTypeSchema, detailSchema } from "./schemas.js";
 
-const proposeCommitSchema = Type.Object({
+const proposeCommitSchema = type({
 	type: commitTypeSchema,
-	scope: Type.Union([Type.String(), Type.Null()]),
-	summary: Type.String(),
-	details: Type.Array(detailSchema),
-	issue_refs: Type.Array(Type.String()),
+	scope: type("string").or("null"),
+	summary: "string",
+	details: detailSchema.array(),
+	issue_refs: "string[]",
 });
 
 interface ProposalResponse {
@@ -35,24 +36,8 @@ interface ProposalResponse {
 	};
 }
 
-function normalizeDetails(
-	details: Array<{
-		text: string;
-		changelog_category?: ConventionalDetail["changelogCategory"];
-		user_visible?: boolean;
-	}>,
-): ConventionalDetail[] {
-	return details.map(detail => ({
-		text: detail.text.trim(),
-		changelogCategory: detail.user_visible ? detail.changelog_category : undefined,
-		userVisible: detail.user_visible ?? false,
-	}));
-}
-
-export function createProposeCommitTool(
-	git: ControlledGit,
-	state: CommitAgentState,
-): CustomTool<typeof proposeCommitSchema> {
+export function createProposeCommitTool(cwd: string, state: CommitAgentState): CustomTool<typeof proposeCommitSchema> {
+	const repo = vcs.requireGit(cwd);
 	return {
 		name: "propose_commit",
 		label: "Propose Commit",
@@ -72,8 +57,8 @@ export function createProposeCommitTool(
 
 			const summaryValidation = validateSummaryRules(summary);
 			const analysisValidation = validateAnalysis(analysis);
-			const stagedFiles = state.overview?.files ?? (await git.getStagedFiles());
-			const diffText = state.diffText ?? (await git.getDiff(true));
+			const stagedFiles = state.overview?.files ?? (await repo.changedFiles({ cached: true }));
+			const diffText = state.diffText ?? (await repo.diffText({ cached: true }));
 			const typeValidation = validateTypeConsistency(params.type, stagedFiles, {
 				diffText,
 				summary,

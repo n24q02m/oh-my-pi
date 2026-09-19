@@ -1,26 +1,32 @@
 /**
  * CustomToolAdapter wraps CustomTool instances into AgentTool for use with the agent.
  */
-import type { AgentTool, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import type { Static, TSchema } from "@sinclair/typebox";
-import type { Theme } from "../../modes/theme/theme";
+import type { AgentTool, AgentToolUpdateCallback, ToolLoadMode } from "@oh-my-pi/pi-agent-core";
+import type { Static, TSchema } from "@oh-my-pi/pi-ai";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import { defaultLoadModeForToolName } from "../../tools/essential-tools";
 import { applyToolProxy } from "../tool-proxy";
 import type { CustomTool, CustomToolContext } from "./types";
 
-export class CustomToolAdapter<TParams extends TSchema = TSchema, TDetails = any, TTheme extends Theme = Theme>
-	implements AgentTool<TParams, TDetails, TTheme>
-{
+export class CustomToolAdapter<
+	TParams extends TSchema = TSchema,
+	TDetails = any,
+	TTheme extends Theme = Theme,
+> implements AgentTool<TParams, TDetails, TTheme> {
 	declare name: string;
 	declare label: string;
 	declare description: string;
 	declare parameters: TParams;
-	readonly strict = true;
+	readonly strict: boolean | undefined;
+	readonly loadMode: ToolLoadMode;
 
 	constructor(
 		private tool: CustomTool<TParams, TDetails>,
 		private getContext: () => CustomToolContext,
 	) {
 		applyToolProxy(tool, this);
+		this.strict = tool.strict;
+		this.loadMode = defaultLoadModeForToolName(tool.name, tool.loadMode);
 	}
 
 	execute(

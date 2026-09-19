@@ -1,4 +1,16 @@
+import { retryResetTimezoneOffsetFor } from "@oh-my-pi/pi-catalog/compat/behavior";
+import { extractRetryHint } from "@oh-my-pi/pi-utils";
+
 export type HeadersLike = Headers | Record<string, string | undefined> | undefined | null;
+
+/** Extracts retry timing using the provider's catalog-declared timestamp timezone. */
+export function extractProviderRetryHint(
+	provider: string | undefined,
+	message: string | undefined,
+): number | undefined {
+	const naiveResetTimezoneOffset = provider === undefined ? undefined : retryResetTimezoneOffsetFor(provider);
+	return extractRetryHint(undefined, message, { naiveResetTimezoneOffset });
+}
 
 const RETRY_AFTER_HINT = "retry-after-ms=";
 
@@ -19,16 +31,19 @@ export function formatErrorMessageWithRetryAfter(error: unknown, headers?: Heade
 export function getRetryAfterMsFromHeaders(headers: HeadersLike): number | undefined {
 	if (!headers) return undefined;
 
+	const retryAfterMs = parseRetryAfterMsHeader(getHeaderValue(headers, "retry-after-ms"));
 	const retryAfter = parseRetryAfterHeader(getHeaderValue(headers, "retry-after"));
 	const resetMs = parseResetHeader(getHeaderValue(headers, "x-ratelimit-reset-ms"), "ms");
 	const resetSeconds = parseResetHeader(getHeaderValue(headers, "x-ratelimit-reset"), "s");
 
-	const candidates = [retryAfter, resetMs, resetSeconds].filter((value): value is number => value !== undefined);
+	const candidates = [retryAfterMs, retryAfter, resetMs, resetSeconds].filter(
+		(value): value is number => value !== undefined,
+	);
 	if (candidates.length === 0) return undefined;
 	return Math.max(...candidates);
 }
 
-function getHeadersFromError(error: unknown): HeadersLike {
+export function getHeadersFromError(error: unknown): HeadersLike {
 	if (!error || typeof error !== "object") return undefined;
 	const record = error as { headers?: unknown; response?: { headers?: unknown }; cause?: unknown };
 	const direct = extractHeaders(record.headers) ?? extractHeaders(record.response?.headers);
@@ -57,6 +72,14 @@ function getHeaderValue(headers: Headers | Record<string, string | undefined>, n
 		}
 	}
 	return undefined;
+}
+
+/** `retry-after-ms` (Anthropic-style): a plain millisecond delta. */
+function parseRetryAfterMsHeader(value: string | undefined): number | undefined {
+	if (!value) return undefined;
+	const ms = Number(value.trim());
+	if (!Number.isFinite(ms) || ms <= 0) return undefined;
+	return Math.ceil(ms);
 }
 
 function parseRetryAfterHeader(value: string | undefined): number | undefined {

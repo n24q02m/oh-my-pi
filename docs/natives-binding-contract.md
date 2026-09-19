@@ -1,221 +1,103 @@
-# Natives Binding Contract (TypeScript Side)
+# Natives Binding Contract (JavaScript/TypeScript Side)
 
-This document defines the TypeScript-side contract that sits between `@oh-my-pi/pi-natives` callers and the loaded N-API addon.
+This page defines the public JS/TS boundary between `@oh-my-pi/pi-natives` callers and its N-API addon. The authoritative public root surface is `packages/natives/native/index.d.ts` plus the explicit ESM exports in `native/index.js`; Rust internals not present there are not package API.
 
-It focuses on three pieces:
+## Contract layers
 
-1. contract shape (`NativeBindings` + module augmentation),
-2. wrapper behavior (`src/<module>/index.ts`),
-3. public export surface (`src/index.ts`).
+1. `crates/pi-natives/src/**/*.rs` defines `#[napi]` functions, classes, objects, and enums.
+2. `bun --cwd=packages/natives run build:bindings` runs napi-rs, installs the host addon and generated `native/index.d.ts`, then runs `gen-enums.ts`.
+3. `gen-enums.ts` reads the declarations, rewrites napi-rs `const enum` declarations to runtime-usable declarations, and replaces the marked block in `native/index.js` with explicit class/function exports and literal enum objects.
+4. `native/index.js` loads the addon and binds that generated root surface.
 
-## Implementation files
+There is no `NativeBindings` declaration-merging lifecycle or `packages/natives/src/<module>` wrapper convention. The loader validates only a release-version sentinel for install/compiled loads, not every public symbol.
 
-- `packages/natives/src/bindings.ts`
-- `packages/natives/src/native.ts`
-- `packages/natives/src/index.ts`
-- `packages/natives/src/clipboard/types.ts`
-- `packages/natives/src/clipboard/index.ts`
-- `packages/natives/src/glob/types.ts`
-- `packages/natives/src/glob/index.ts`
-- `packages/natives/src/grep/types.ts`
-- `packages/natives/src/grep/index.ts`
-- `packages/natives/src/highlight/types.ts`
-- `packages/natives/src/highlight/index.ts`
-- `packages/natives/src/html/types.ts`
-- `packages/natives/src/html/index.ts`
-- `packages/natives/src/image/types.ts`
-- `packages/natives/src/image/index.ts`
-- `packages/natives/src/keys/types.ts`
-- `packages/natives/src/keys/index.ts`
-- `packages/natives/src/ps/types.ts`
-- `packages/natives/src/ps/index.ts`
-- `packages/natives/src/pty/types.ts`
-- `packages/natives/src/pty/index.ts`
-- `packages/natives/src/shell/types.ts`
-- `packages/natives/src/shell/index.ts`
-- `packages/natives/src/system-info/types.ts`
-- `packages/natives/src/system-info/index.ts`
-- `packages/natives/src/text/types.ts`
-- `packages/natives/src/text/index.ts`
-- `packages/natives/src/work/types.ts`
-- `packages/natives/src/work/index.ts`
+## Public entrypoints
 
-## Contract model
+`packages/natives/package.json` exports:
 
-`packages/natives/src/bindings.ts` defines the base contract:
+| Entry                            | Public values                                                                                                                   |
+| -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `@oh-my-pi/pi-natives`           | Generated root classes, functions, and enum objects from `native/index.js` / `index.d.ts`. Importing is eager.                  |
+| `@oh-my-pi/pi-natives/desktop`   | `createDesktopSession(options): DesktopSession`; addon load is deferred until invocation.                                       |
+| `@oh-my-pi/pi-natives/clipboard` | `copyToClipboard(text)` and `readImageFromClipboard()` plus the `ClipboardImage` type; addon load is deferred until invocation. |
 
-- `NativeBindings` (base interface, currently includes `cancelWork(id: number): void`)
-- `Cancellable` (`timeoutMs?: number`, `signal?: AbortSignal`)
-- `TsFunc<T>` callback shape used by N-API threadsafe callbacks
+Do not import unexported `native/*` implementation paths from package consumers.
 
-Each module adds its own fields by declaration merging:
+## Current root surface by owner
 
-```ts
-// packages/natives/src/<module>/types.ts
-declare module "../bindings" {
-	interface NativeBindings {
-		grep(options: GrepOptions, onMatch?: TsFunc<GrepMatch>): Promise<GrepResult>;
-	}
-}
-```
+| Category                 | Representative public exports                                                                                                                                     | Rust owner                                                            | Call style           |
+| ------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------- | -------------------- |
+| Search and workspace     | `grep`, `search`, `hasMatch`, `fuzzyFind`, `glob`, `invalidateFsScanCache`, `listWorkspace`                                                                       | `grep.rs`, `fd.rs`, `glob.rs`, `iofs.rs`, `workspace.rs`              | mixed sync/promise   |
+| AST and code structure   | `astGrep`, `astMatch`, `astEdit`, `blockRangeAt`, `nodeChainAt`, `enclosingBlockBoundaries`, `summarizeCode`                                                       | `ast.rs`, `block.rs`, `summary.rs`                                    | mixed sync/promise   |
+| Diff and vectors         | `diffLines`, `diffWords`, `diffLineRuns`, `structuredPatchHunks`, `DiffStream`, `cosineSimilarityPairs`, `mmrRerankIndices`, `vectorIndexTopK`                     | `diff.rs`, `vectors.rs`                                               | sync                 |
+| Shell and PTY            | `executeShell`, `Shell`, `PtySession`                                                                                                                             | `shell.rs`, `pty.rs`                                                  | classes/promises     |
+| Process and files        | `Process`, `FileLock`, `execReplace`                                                                                                                              | `ps.rs`, `file_lock/mod.rs`                                           | classes/mixed        |
+| Desktop and clipboard    | `DesktopSession`, `copyToClipboard`, `readImageFromClipboard`                                                                                                     | `desktop/mod.rs`, `clipboard.rs`                                      | class, sync, promise |
+| Audio and live media     | `AudioCapture`, `AudioPlayback`, `LiveWebRtcPeer`                                                                                                                 | `audio.rs`, `live.rs`                                                 | classes/mixed        |
+| Text and highlighting    | `wrapTextWithAnsi`, `truncateToWidth`, `sliceWithWidth`, `extractSegments`, `visibleWidth`, `setHangulCompatJamoWidthOverride`, `highlightCode`, `HighlightStream`, language queries | `text.rs`, `highlight.rs`                                             | sync                 |
+| Conversion and rendering | `htmlToMarkdown`, `pdfToMarkdown`, `rasterizeSvg`, `encodeSixel`, `renderSnapcompactPng`, `snapcompactSupportedChars`                                              | `html.rs`, `pdf.rs`, `svg.rs`, `sixel.rs`, `snapcompact.rs`           | mixed sync/promise   |
+| Tokens and system        | `countTokens`, macOS appearance, cross-platform power exports, `getWorkProfile`, `deviceCheckGenerateToken`                                                                       | `tokens.rs`, `appearance.rs`, `power.rs`, `prof.rs`, `devicecheck.rs` | mixed                |
+| Spelling (macOS)         | `macOSCheckSpelling`, `macOSCompleteWord`, `macOSAutocorrectWord`, `macOSSpellingGuesses`, `macOSSpellCheckerAvailable`                                            | `spelling.rs`                                                         | mixed sync/promise   |
+| Version control          | `vcsDiscover`, `vcsGitClone`, `vcsDetachGitDir`, `vcsJoinPatches`, `vcsValidateHunkSelections`, `VcsRepo`, `VcsGitRepo`, `VcsJjWorkspace`                          | `vcs.rs`                                                              | mixed sync/promise   |
+| Terminal output          | `TtyWriter`                                                                                                                                                       | `tty_writer.rs`                                                       | class                |
+| Isolation                | `isoBackend`, `isoProbe`, `isoResolve`, `isoIsUnavailableError`, `isoStart`, `isoStop`, `isoDiff`                                                                 | `iso.rs`                                                              | mixed sync/promise   |
+| Keys                     | `parseKey`, `matchesKey`, Kitty/legacy helpers                                                                                                                    | `keys.rs`                                                             | sync                 |
 
-This keeps one aggregate binding interface without a monolithic central type file.
+Consult `native/index.d.ts` for exact option/result fields and signatures. Notable current signatures include `renderSnapcompactPng(...): Promise<string>`, `readImageFromClipboard(): Promise<ClipboardImage | undefined | null>`, and typed-array vector inputs/results.
 
-## Declaration-merging lifecycle and state transitions
+Newer surface members on existing exports (all present in `native/index.d.ts`):
 
-### 1) Compile-time type assembly
+- `ShellRunResult.workingDir?` — shell working directory after command completion (added 16.3.0), letting hosts sync cwd without a hidden probe command.
+- `GrepOptions.maxCountPerFile?` — per-file content-mode match cap (added 15.10.11). Note `GrepOptions` has no `cache` field; directory grep is always uncached (`FuzzyFindOptions`/`GlobOptions` carry the opt-in `cache` flag).
+- `snapcompactSupportedChars(font, chars)` — font glyph-capability probe (added 16.2.7).
 
-- `bindings.ts` provides the base `NativeBindings` symbol.
-- Every `src/<module>/types.ts` augments `NativeBindings`.
-- `src/native.ts` imports all `./<module>/types` files for side effects so the merged contract is in scope where `NativeBindings` is used.
+## Sync, Promise, and callback rules
 
-State transition: **Base contract** → **Merged contract**.
+The call style is part of the public contract:
 
-### 2) Runtime addon load and validation gate
+- CPU-heavy/blocking APIs generally return promises through napi-rs tasks, including `grep`, `glob`, `fuzzyFind`, AST search/edit, snapcompact rendering, and HTML conversion.
+- Tokio-backed operations such as shell, PTY, isolation lifecycle, device check, desktop operations, and live media use promises where declared.
+- In-memory transforms and direct probes generally remain synchronous: `search`, `hasMatch`, block boundaries, text/layout helpers, diffs, vector ranking, highlighting, key parsing, and isolation probe/resolve helpers.
+- Stateful resources are classes. Their constructors and individual methods can have different sync/async behavior; use the declarations rather than assuming the whole class is asynchronous.
 
-- `src/native.ts` loads candidate `.node` binaries.
-- Loaded object is treated as `NativeBindings` and immediately passed through `validateNative(...)`.
-- `validateNative` verifies required export keys by `typeof bindings[name] === "function"`.
+Changing a public function between synchronous and promise-returning is breaking. `renderSnapcompactPng`, for example, must be awaited even though adjacent snapcompact character probing is synchronous.
 
-State transition: **Untrusted addon object** → **Validated native binding object** (or hard failure).
+Callback parameters generated from napi-rs `ThreadsafeFunction` use an error-first shape such as `(error: Error | null, value) => void`. Streaming callbacks do not replace the owning promise/result. Their exact timing and optionality are declared per export.
 
-### 3) Wrapper invocation
+## Objects, enums, and binary data
 
-- Module wrappers in `src/<module>/index.ts` call `native.<export>`.
-- Wrappers adapt defaults and callback shape (`(err, value)` to value-only callback patterns in JS APIs).
-- `src/index.ts` re-exports module wrappers/types as the public package API.
+`#[napi(object)]` structs become TS interfaces such as search results, AST payloads, shell/PTY results, desktop options/results, audio/live events, and isolation records. napi-rs owns runtime conversion; TypeScript optionality does not provide semantic validation to untyped callers.
 
-State transition: **Validated raw bindings** → **Ergonomic public API**.
+The generated runtime enum objects currently are:
 
-## Wrapper responsibilities
+- `AstMatchStrictness`
+- `DiffSide`
+- `Ellipsis`
+- `Encoding`
+- `FileType`
+- `GrepOutputMode`
+- `IsoBackendKind`
+- `IsoChangeKind`
+- `KeyEventType`
+- `MacOSAppearance`
+- `ProcessStatus`
 
-Wrappers are intentionally thin; they do not re-implement native logic.
+Numeric and string enum declarations constrain TypeScript callers but do not by themselves prove that arbitrary untyped values are semantically valid. Binary APIs use typed arrays (`Uint8Array`, `Float32Array`, `Float64Array`, `Uint32Array`) where declared; do not replace them with ordinary arrays without an explicit conversion.
 
-Primary responsibilities:
+## Import and error behavior
 
-- **Argument normalization/defaulting**
-  - `glob()` resolves `options.path` to absolute path and defaults `hidden`, `gitignore`, `recursive`.
-  - `hasMatch()` fills default flags (`ignoreCase`, `multiline`) before native call.
-- **Callback adaptation**
-  - `grep()`, `glob()`, `executeShell()` convert `TsFunc<T>` (`error, value`) into user callback receiving only successful values.
-- **Environment or policy behavior around native calls**
-  - Clipboard wrapper adds OSC52/Termux/headless handling and treats copy as best effort.
-- **Public naming and re-export curation**
-  - `searchContent()` maps to native export `search`.
+- Importing the root throws if no compatible addon candidate loads. Lazy desktop/clipboard subpaths defer that failure until their wrapper is called.
+- Install and compiled candidates missing the expected version sentinel are rejected during loading. Workspace-development candidates skip sentinel validation.
+- A resident prior-version addon can produce a restart-specific mismatch; a stale file on disk produces a reinstall diagnosis.
+- The loader does not check the full export set. A same-version incomplete build can therefore load and later expose `undefined` members.
+- N-API conversion errors throw or reject before Rust business logic runs. Native task and async failures reject their returned promises.
 
-## Public export surface organization
+## Binding-change checklist
 
-`packages/natives/src/index.ts` is the canonical public barrel. It groups exports by capability domain:
-
-- Search/text: `grep`, `glob`, `text`, `highlight`
-- Execution/process/terminal: `shell`, `pty`, `ps`, `keys`
-- System/media/conversion: `image`, `html`, `clipboard`, `system-info`, `work`
-
-Maintainer rule: if a wrapper is not re-exported from `src/index.ts`, it is not part of the intended public package surface.
-
-## JS API ↔ native export mapping (representative)
-
-The Rust side uses N-API export names (typically via `#[napi(js_name = ...)]`) that must match these binding keys.
-
-| Category | Public JS API (wrapper) | Native binding key | Return type | Async? |
-|---|---|---|---|---|
-| Grep | `grep(options, onMatch?)` | `grep` | `Promise<GrepResult>` | Yes |
-| Grep | `searchContent(content, options)` | `search` | `SearchResult` | No |
-| Grep | `hasMatch(content, pattern, opts?)` | `hasMatch` | `boolean` | No |
-| Grep | `fuzzyFind(options)` | `fuzzyFind` | `Promise<FuzzyFindResult>` | Yes |
-| Glob | `glob(options, onMatch?)` | `glob` | `Promise<GlobResult>` | Yes |
-| Glob | `invalidateFsScanCache(path?)` | `invalidateFsScanCache` | `void` | No |
-| Shell | `executeShell(options, onChunk?)` | `executeShell` | `Promise<ShellExecuteResult>` | Yes |
-| Shell | `Shell` | `Shell` | class constructor | N/A |
-| PTY | `PtySession` | `PtySession` | class constructor | N/A |
-| Text | `truncateToWidth(...)` | `truncateToWidth` | `string` | No |
-| Text | `sliceWithWidth(...)` | `sliceWithWidth` | `SliceWithWidthResult` | No |
-| Text | `visibleWidth(text)` | `visibleWidth` | `number` | No |
-| Highlight | `highlightCode(code, lang, colors)` | `highlightCode` | `string` | No |
-| HTML | `htmlToMarkdown(html, options?)` | `htmlToMarkdown` | `Promise<string>` | Yes |
-| System | `getSystemInfo()` | `getSystemInfo` | `SystemInfo` | No |
-| Work | `getWorkProfile(lastSeconds)` | `getWorkProfile` | `WorkProfile` | No |
-| Process | `killTree(pid, signal)` | `killTree` | `number` | No |
-| Process | `listDescendants(pid)` | `listDescendants` | `number[]` | No |
-| Clipboard | `copyToClipboard(text)` | `copyToClipboard` | `Promise<void>` (best effort wrapper behavior) | Yes |
-| Clipboard | `readImageFromClipboard()` | `readImageFromClipboard` | `Promise<ClipboardImage \| null>` | Yes |
-| Keys | `parseKey(data, kittyProtocolActive)` | `parseKey` | `string \| null` | No |
-
-## Sync vs async contract differences
-
-The contract mixes sync and async APIs; wrappers preserve native call style rather than forcing one model:
-
-- **Promise-based async exports** for I/O or long-running work (`grep`, `glob`, `htmlToMarkdown`, `executeShell`, clipboard, image operations).
-- **Synchronous exports** for deterministic in-memory transforms/parsers (`search`, `hasMatch`, highlighting, text width/slicing, key parsing, process queries).
-- **Constructor exports** for stateful runtime objects (`Shell`, `PtySession`, `PhotonImage`).
-
-Implication for maintainers: changing sync ↔ async for an existing export is a breaking API and contract change across wrappers and callers.
-
-## Object and enum typing patterns
-
-### Object patterns (`#[napi(object)]`-style JS objects)
-
-TS models object-shaped native values as interfaces, for example:
-
-- `GrepResult`, `SearchResult`, `GlobResult`
-- `SystemInfo`, `WorkProfile`
-- `ClipboardImage`, `ParsedKittyResult`
-
-These are structural contracts at compile time; runtime shape correctness is owned by native implementation.
-
-### Enum patterns
-
-Numeric native enums are represented as `const enum` values in TS:
-
-- `FileType` (`1=file`, `2=dir`, `3=symlink`)
-- `ImageFormat` (`0=PNG`, `1=JPEG`, `2=WEBP`, `3=GIF`)
-- `SamplingFilter`, `Ellipsis`, `KeyEventType`
-
-Callers see named enum members; the binding boundary passes numbers.
-
-## How mismatches are caught
-
-Mismatch detection happens at two layers:
-
-1. **Compile-time TypeScript contract checks**
-   - Wrappers call `native.<name>` against merged `NativeBindings`.
-   - Missing/renamed binding keys break TS type-checking in wrappers.
-
-2. **Runtime validation in `validateNative`**
-   - After load, `native.ts` checks required exports and throws if any are missing.
-   - Error message includes missing keys and rebuild instruction.
-
-This catches the common stale-binary drift: wrapper/type exists but loaded `.node` lacks the export.
-
-## Failure behavior and caveats
-
-### Load/validation failures (hard failures)
-
-- Addon load failure or unsupported platform throws during module init in `native.ts`.
-- Missing required exports throws before wrappers are usable.
-
-Effect: package fails fast rather than deferring failure to first call.
-
-### Wrapper-level behavior differences
-
-- Some wrappers intentionally soften failures (`copyToClipboard` is best effort and swallows native failure).
-- Streaming callbacks ignore callback error payloads and only forward successful value events.
-
-### Type-level caveats (runtime stricter than TS)
-
-- TS optional fields do not guarantee semantic validity; native layer can still reject malformed values.
-- `const enum` typing does not prevent out-of-range numeric values from untyped callers at runtime.
-- `validateNative` checks only presence/function-ness of required exports, not deep argument/return-shape compatibility.
-- `bindings.ts` includes `cancelWork(id)` in the base interface, but current runtime validation list does not enforce that key.
-
-## Maintainer checklist for binding changes
-
-When adding/changing an export, update all of:
-
-1. `src/<module>/types.ts` (augmentation + contract types)
-2. `src/<module>/index.ts` (wrapper behavior)
-3. `src/native.ts` imports for the module types (if new module)
-4. `validateNative` required export checks
-5. `src/index.ts` public re-exports
-
-Skipping any step creates either compile-time drift or runtime load-time failure.
+1. Add or change the owning Rust `#[napi]` item; register a new module in `crates/pi-natives/src/lib.rs`.
+2. Run `bun --cwd=packages/natives run build:bindings` when the exported type surface changes. This is the declaration/local-addon path; the normal `build` script is the Bazel shipping-addon path.
+3. Confirm `native/index.d.ts` has the intended JS name, types, optionality, callback shape, and sync/promise return.
+4. Confirm the marked block in `native/index.js` contains the class/function and any enum runtime object.
+5. Add a lazy subpath wrapper only when deferred loading is required, and then add matching `package.json#exports` runtime/types entries.
+6. Update all direct consumers and remove the obsolete implementation when the native path becomes canonical.
+7. Run a focused scenario that imports and invokes the changed export against the newly built addon.

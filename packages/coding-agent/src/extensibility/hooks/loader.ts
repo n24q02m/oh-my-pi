@@ -2,15 +2,17 @@
  * Hook loader - loads TypeScript hook modules using native Bun import.
  */
 import * as path from "node:path";
-import * as piCodingAgent from "@oh-my-pi/pi-coding-agent";
+import { type } from "@oh-my-pi/omptype";
+import * as zod from "@oh-my-pi/omptype/zod";
 import { logger } from "@oh-my-pi/pi-utils";
-import * as typebox from "@sinclair/typebox";
 import { hookCapability } from "../../capability/hook";
 import type { Hook } from "../../discovery";
 import { loadCapability } from "../../discovery";
-import type { HookMessage } from "../../session/messages";
-import type { SessionManager } from "../../session/session-manager";
-import { resolvePath } from "../utils";
+// Runtime self-reference: dereference this namespace only inside loader functions to keep the index.ts cycle safe.
+import * as PiCodingAgent from "../../index";
+import type { CustomMessagePayload } from "../../session/messages";
+import * as typebox from "../legacy-typebox";
+import { resolvePath, withHostGuard } from "../utils";
 import { execCommand } from "./runner";
 import type { ExecOptions, HookAPI, HookFactory, HookMessageRenderer, RegisteredCommand } from "./types";
 
@@ -23,7 +25,7 @@ type HandlerFn = (...args: unknown[]) => Promise<unknown>;
  * Send message handler type for pi.sendMessage().
  */
 export type SendMessageHandler = <T = unknown>(
-	message: Pick<HookMessage<T>, "customType" | "content" | "display" | "details">,
+	message: CustomMessagePayload<T>,
 	options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" },
 ) => void;
 
@@ -32,26 +34,9 @@ export type SendMessageHandler = <T = unknown>(
  */
 export type AppendEntryHandler = <T = unknown>(customType: string, data?: T) => void;
 
-/**
- * New session handler type for ctx.newSession() in HookCommandContext.
- */
-export type NewSessionHandler = (options?: {
-	parentSession?: string;
-	setup?: (sessionManager: SessionManager) => Promise<void>;
-}) => Promise<{ cancelled: boolean }>;
-
-/**
- * Branch handler type for ctx.branch() in HookCommandContext.
- */
-export type BranchHandler = (entryId: string) => Promise<{ cancelled: boolean }>;
-
-/**
- * Navigate tree handler type for ctx.navigateTree() in HookCommandContext.
- */
-export type NavigateTreeHandler = (
-	targetId: string,
-	options?: { summarize?: boolean },
-) => Promise<{ cancelled: boolean }>;
+// Session-lifecycle handler types live once in session-handler-types; re-exported
+// here because hooks/runner.ts imports them from this module.
+export type { BranchHandler, NavigateTreeHandler, NewSessionHandler } from "../session-handler-types";
 
 /**
  * Registered handlers for a loaded hook.
@@ -87,16 +72,16 @@ export interface LoadHooksResult {
  * Create a HookAPI instance that collects handlers, renderers, and commands.
  * Returns the API, maps, and functions to set handlers later.
  */
-function createHookAPI(
+async function createHookAPI(
 	handlers: Map<string, HandlerFn[]>,
 	cwd: string,
-): {
+): Promise<{
 	api: HookAPI;
 	messageRenderers: Map<string, HookMessageRenderer>;
 	commands: Map<string, RegisteredCommand>;
 	setSendMessageHandler: (handler: SendMessageHandler) => void;
 	setAppendEntryHandler: (handler: AppendEntryHandler) => void;
-} {
+}> {
 	let sendMessageHandler: SendMessageHandler | null = null;
 	let appendEntryHandler: AppendEntryHandler | null = null;
 	const messageRenderers = new Map<string, HookMessageRenderer>();
@@ -112,7 +97,7 @@ function createHookAPI(
 			handlers.get(event)!.push(handler);
 		},
 		sendMessage<T = unknown>(
-			message: HookMessage<T>,
+			message: CustomMessagePayload<T>,
 			options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" },
 		): void {
 			if (!sendMessageHandler) {
@@ -137,7 +122,9 @@ function createHookAPI(
 		},
 		logger,
 		typebox,
-		pi: piCodingAgent,
+		arktype: type,
+		zod,
+		pi: PiCodingAgent,
 	} as HookAPI;
 
 	return {
@@ -161,7 +148,7 @@ async function loadHook(hookPath: string, cwd: string): Promise<{ hook: LoadedHo
 
 	try {
 		// Import the module using native Bun import
-		const module = await import(resolvedPath);
+		const module = await withHostGuard(() => import(resolvedPath));
 		const factory = module.default as HookFactory;
 
 		if (typeof factory !== "function") {
@@ -170,13 +157,13 @@ async function loadHook(hookPath: string, cwd: string): Promise<{ hook: LoadedHo
 
 		// Create handlers map and API
 		const handlers = new Map<string, HandlerFn[]>();
-		const { api, messageRenderers, commands, setSendMessageHandler, setAppendEntryHandler } = createHookAPI(
+		const { api, messageRenderers, commands, setSendMessageHandler, setAppendEntryHandler } = await createHookAPI(
 			handlers,
 			cwd,
 		);
 
 		// Call factory to register handlers
-		factory(api);
+		await withHostGuard(async () => factory(api));
 
 		return {
 			hook: {

@@ -1,7 +1,6 @@
-import { parseHTML } from "linkedom";
 import type { RenderResult, SpecialHandler } from "./types";
 import { buildResult, loadPage } from "./types";
-import { convertWithMarkitdown, fetchBinary } from "./utils";
+import { convertWithMarkit, fetchBinary } from "./utils";
 
 /**
  * Handle arXiv URLs via arXiv API
@@ -31,6 +30,7 @@ export const handleArxiv: SpecialHandler = async (
 		if (!result.ok) return null;
 
 		// Parse the Atom feed response
+		const { parseHTML } = await import("@oh-my-pi/pi-utils/dom");
 		const doc = parseHTML(result.content).document;
 		const entry = doc.querySelector("entry");
 
@@ -62,10 +62,10 @@ export const handleArxiv: SpecialHandler = async (
 				notes.push("Fetching PDF for full content...");
 				const pdfResult = await fetchBinary(pdfLink, timeout, signal);
 				if (pdfResult.ok) {
-					const converted = await convertWithMarkitdown(pdfResult.buffer, ".pdf", timeout, signal);
+					const converted = await convertWithMarkit(pdfResult.buffer, ".pdf", timeout, signal);
 					if (converted.ok && converted.content.length > 500) {
 						md += `---\n\n## Full Paper\n\n${converted.content}\n`;
-						notes.push("PDF converted via markitdown");
+						notes.push("PDF converted via markit");
 					}
 				}
 			}

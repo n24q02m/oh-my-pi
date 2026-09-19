@@ -112,7 +112,7 @@ export const handleFirefoxAddons: SpecialHandler = async (
 		const name = getLocalizedText(data.name, defaultLocale) ?? slug;
 		const summary = getLocalizedText(data.summary, defaultLocale);
 		const descriptionRaw = getLocalizedText(data.description, defaultLocale);
-		const description = descriptionRaw ? htmlToBasicMarkdown(descriptionRaw) : undefined;
+		const description = descriptionRaw ? await htmlToBasicMarkdown(descriptionRaw) : undefined;
 
 		const authors = (data.authors ?? [])
 			.map(author => author.name ?? "")
@@ -173,7 +173,7 @@ export const handleFirefoxAddons: SpecialHandler = async (
 				md += `- ${permission}\n`;
 			}
 			if (permissions.length > preview.length) {
-				md += `\n*...and ${permissions.length - preview.length} more*\n`;
+				md += `\n[…${permissions.length - preview.length} permissions elided…]\n`;
 			}
 		}
 

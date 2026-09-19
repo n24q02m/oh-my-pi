@@ -12,7 +12,7 @@ import { registerProvider } from "../capability";
 import { readFile } from "../capability/fs";
 import { type MCPServer, mcpCapability } from "../capability/mcp";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
-import { createSourceMeta, expandEnvVarsDeep } from "./helpers";
+import { createSourceMeta, expandEnvVarsDeep, parseRequestIdFormat } from "./helpers";
 
 const PROVIDER_ID = "mcp-json";
 const DISPLAY_NAME = "MCP Config";
@@ -26,17 +26,29 @@ interface MCPConfigFile {
 		{
 			enabled?: boolean;
 			timeout?: number;
+			requestIdFormat?: "string" | "number";
 			command?: string;
 			args?: string[];
 			env?: Record<string, string>;
+			cwd?: string;
 			url?: string;
 			headers?: Record<string, string>;
 			auth?: {
 				type: "oauth" | "apikey";
 				credentialId?: string;
+				tokenUrl?: string;
+				clientId?: string;
+				clientSecret?: string;
 			};
 			type?: "stdio" | "sse" | "http";
-			oauth?: { clientId?: string; callbackPort?: number };
+			oauth?: {
+				clientId?: string;
+				clientSecret?: string;
+				redirectUri?: string;
+				callbackPort?: number;
+				callbackPath?: string;
+				prompt?: string;
+			};
 		}
 	>;
 }
@@ -64,7 +76,7 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 				if (
 					typeof serverConfig.timeout === "number" &&
 					Number.isFinite(serverConfig.timeout) &&
-					serverConfig.timeout > 0
+					serverConfig.timeout >= 0
 				) {
 					timeout = serverConfig.timeout;
 				} else {
@@ -72,13 +84,23 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 				}
 			}
 
+			const requestIdFormat = parseRequestIdFormat(serverConfig.requestIdFormat);
+			if (requestIdFormat === undefined && serverConfig.requestIdFormat !== undefined) {
+				logger.warn("MCP server has invalid 'requestIdFormat' value, ignoring", {
+					name,
+					value: serverConfig.requestIdFormat,
+				});
+			}
+
 			const server: MCPServer = {
 				name,
 				enabled,
 				timeout,
+				requestIdFormat,
 				command: serverConfig.command,
 				args: serverConfig.args,
 				env: serverConfig.env,
+				cwd: serverConfig.cwd,
 				url: serverConfig.url,
 				headers: serverConfig.headers,
 				auth: serverConfig.auth,
@@ -91,9 +113,11 @@ function transformMCPConfig(config: MCPConfigFile, source: SourceMeta): MCPServe
 			if (server.command) server.command = expandEnvVarsDeep(server.command);
 			if (server.args) server.args = expandEnvVarsDeep(server.args);
 			if (server.env) server.env = expandEnvVarsDeep(server.env);
+			if (server.cwd) server.cwd = expandEnvVarsDeep(server.cwd);
 			if (server.url) server.url = expandEnvVarsDeep(server.url);
 			if (server.headers) server.headers = expandEnvVarsDeep(server.headers);
-
+			if (server.auth) server.auth = expandEnvVarsDeep(server.auth);
+			if (server.oauth) server.oauth = expandEnvVarsDeep(server.oauth);
 			servers.push(server);
 		}
 	}

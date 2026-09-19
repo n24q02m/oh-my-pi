@@ -5,9 +5,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { getBundledModel } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import type { SecretObfuscator } from "@oh-my-pi/pi-coding-agent/secrets/obfuscator";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -16,6 +18,32 @@ import { Snowflake } from "@oh-my-pi/pi-utils";
 import { e2eApiKey } from "../../ai/test/oauth";
 
 export { e2eApiKey };
+
+/**
+ * Options for creating a test session.
+ */
+export interface TestSessionOptions {
+	/** Use in-memory session (no file persistence) */
+	inMemory?: boolean;
+	/** Custom system prompt */
+	systemPrompt?: string | string[];
+	/** Custom settings overrides */
+	settingsOverrides?: Record<string, unknown>;
+	/** Extension runner to wire into the session (e.g. to stub `session_before_tree`/etc. hooks) */
+	extensionRunner?: ExtensionRunner;
+	/** Secret obfuscator to wire into the session (e.g. to test deobfuscation of persisted tool arguments) */
+	obfuscator?: SecretObfuscator;
+}
+
+/**
+ * Resources returned by createTestSession that need cleanup.
+ */
+export interface TestSessionContext {
+	session: AgentSession;
+	sessionManager: SessionManager;
+	tempDir: string;
+	cleanup: () => Promise<void>;
+}
 
 /**
  * Create a minimal user message for testing.
@@ -48,28 +76,6 @@ export function assistantMsg(text: string) {
 }
 
 /**
- * Options for creating a test session.
- */
-export interface TestSessionOptions {
-	/** Use in-memory session (no file persistence) */
-	inMemory?: boolean;
-	/** Custom system prompt */
-	systemPrompt?: string;
-	/** Custom settings overrides */
-	settingsOverrides?: Record<string, unknown>;
-}
-
-/**
- * Resources returned by createTestSession that need cleanup.
- */
-export interface TestSessionContext {
-	session: AgentSession;
-	sessionManager: SessionManager;
-	tempDir: string;
-	cleanup: () => void;
-}
-
-/**
  * Create an AgentSession for testing with proper setup and cleanup.
  * Use this for e2e tests that need real LLM calls.
  */
@@ -91,12 +97,14 @@ export async function createTestSession(options: TestSessionOptions = {}): Promi
 		getApiKey: () => e2eApiKey("ANTHROPIC_API_KEY"),
 		initialState: {
 			model,
-			systemPrompt: options.systemPrompt ?? "You are a helpful assistant. Be extremely concise.",
+			systemPrompt: Array.isArray(options.systemPrompt)
+				? options.systemPrompt
+				: [options.systemPrompt ?? "You are a helpful assistant. Be extremely concise."],
 			tools,
 		},
 	});
 
-	const sessionManager = options.inMemory ? SessionManager.inMemory() : SessionManager.create(tempDir);
+	const sessionManager = options.inMemory ? SessionManager.inMemory() : SessionManager.create(tempDir, tempDir);
 	const settings = Settings.isolated(options.settingsOverrides);
 
 	const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
@@ -106,54 +114,20 @@ export async function createTestSession(options: TestSessionOptions = {}): Promi
 		sessionManager,
 		settings,
 		modelRegistry,
+		extensionRunner: options.extensionRunner,
+		obfuscator: options.obfuscator,
 	});
 
 	// Must subscribe to enable session persistence
 	session.subscribe(() => {});
 
-	const cleanup = () => {
-		session.dispose();
+	const cleanup = async () => {
+		await session.dispose();
+		authStorage.close();
 		if (tempDir && fs.existsSync(tempDir)) {
 			fs.rmSync(tempDir, { recursive: true });
 		}
 	};
 
 	return { session, sessionManager, tempDir, cleanup };
-}
-
-/**
- * Build a session tree for testing using SessionManager.
- * Returns the IDs of all created entries.
- *
- * Example tree structure:
- * ```
- * u1 -> a1 -> u2 -> a2
- *          -> u3 -> a3  (branch from a1)
- * u4 -> a4              (another root)
- * ```
- */
-export function buildTestTree(
-	session: SessionManager,
-	structure: {
-		messages: Array<{ role: "user" | "assistant"; text: string; branchFrom?: string }>;
-	},
-): Map<string, string> {
-	const ids = new Map<string, string>();
-
-	for (const msg of structure.messages) {
-		if (msg.branchFrom) {
-			const branchFromId = ids.get(msg.branchFrom);
-			if (!branchFromId) {
-				throw new Error(`Cannot branch from unknown entry: ${msg.branchFrom}`);
-			}
-			session.branch(branchFromId);
-		}
-
-		const id =
-			msg.role === "user" ? session.appendMessage(userMsg(msg.text)) : session.appendMessage(assistantMsg(msg.text));
-
-		ids.set(msg.text, id);
-	}
-
-	return ids;
 }

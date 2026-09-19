@@ -1,28 +1,33 @@
-Reads files from local filesystem or internal URLs.
+Read files, directories, archives, SQLite, images, documents, internal resources, and web URLs via `path`.
 
 <instruction>
-- Reads up to {{DEFAULT_MAX_LINES}} lines default
-- Use `offset` and `limit` for large files
-{{#if IS_HASHLINE_MODE}}
-- Text output is CID prefixed: `LINE#ID:content`
-{{else}}
-{{#if IS_LINE_NUMBER_MODE}}
-- Text output is line-number-prefixed
-{{/if}}
-{{/if}}
-- Supports images (PNG, JPG) and PDFs
-- For directories, returns formatted listing with modification times
-- Parallelize reads when exploring related files
+- SHOULD parallelize independent reads.
+- SHOULD use `read` (not browser) for web content; browser only when `read` can't deliver.
 </instruction>
 
-<output>
-- Returns file content as text; images return visual content; PDFs return extracted text
-- Missing files: returns closest filename matches for correction
-</output>
+## Selectors — append `:<sel>` to `path` (e.g. `src/foo.ts:50-200`, `src/foo.ts:raw`, `db.sqlite:users:42`)
+
+- `:50` / `:50-` — from line 50 | `:50-200` — inclusive | `:50+150` — 150 lines from 50 | `:-60` — last 60 lines | `:5-16,960-973` — multiple ranges
+- `:raw` — verbatim, no anchors/prefixes | `:2-4:raw` / `:raw:2-4` — range + verbatim
+- `:conflicts` — one line per unresolved git merge conflict block
+- `:img` — rasterize a local `.svg`/`.svgz` as a PNG image; use when visual layout matters
+- Bare image path → sent directly to the active model when it supports image input.
+- `?q=<question>` — image only (also `.svg:img?q=`, `attachment://N?q=`, `local://…?q=`): vision-model answer as text instead of pixels (works on any model); prefer bare image path when active model supports image input.
+- Videos (`.mp4`, `.mov`, `.mkv`, `.webm`, `.m4v`, `.avi`, `.wmv`) need system `ffmpeg`/`ffprobe`: bare read returns a preview grid plus metadata (resolution, codecs, duration, fps); `:412` extracts frame 412, `:1h5m42s`/`:90s`/`:01:23` seeks to a timestamp
+
+## Source kinds
+
+- Parseable code, no selector → structural summary (declarations only, body elided). Footer names recovery selector — re-issue ONLY those ranges.
+- {{#if IS_HL_MODE}}File + selector → `[foo.ts#1A2B]` snapshot header + numbered lines. Copy `[FILENAME#TAG]` for anchored edits; NEVER fabricate the tag.{{/if}}
+- Directory → depth-limited dirent listing. Root is complete; page long listings with `:N-M`/`:-N`. Child dirs cap at 12 entries (`… N more` marker) — read the sub-path to expand.
+- SQLite (`.sqlite`, `.sqlite3`, `.db`, `.db3`): `file.db` (tables), `file.db:table` (schema+rows), `file.db:table:key` (by PK), `?limit=`/`?where=`/`?q=SELECT`.
+- Archives (`.zip` family incl. `.jar`/`.apk`/`.whl`, `.tar` incl. `.tar.{gz,bz2,xz,zst}`, `.rar`, `.7z`, `.iso`, `.cab`, `.deb`/`.rpm`/`.cpio`/`.ar`/`.a`, `.lzh`/`.arj`, `.asar`; single-stream `.gz`/`.bz2`/`.xz`/`.zst`): `archive.ext:path/inside/archive` reads a member.
+- Documents → extracted text. Notebooks → editable cells. Images → decoded inline for vision-capable models (prefer bare image path); `img.png?q=<question>` asks a vision model and returns text (spares context; works on any model). Videos → preview grid plus metadata. SVGs read as text unless `:img` is specified; `:raw` bypasses converters.
+- URLs → reader-mode clean text/markdown; `:raw` → untouched HTML. Bare `host:port` needs trailing slash.
+- Internal URIs — all schemes take selectors. `artifact://<id>` recovers spilled output; page with `:N-M`/`:raw:N-M`.
+- `ssh://host/<path>` reads remote file/dir (UTF-8, ≤1 MiB); bare `ssh://` lists hosts; writable with `write` and searchable with `grep`.
+  Literal `:`, `?`, `#` → percent-encode (`%3A`/`%3F`/`%23`). Requires a verified POSIX shell on the remote host. For Windows or other unsupported hosts, use `bash` with a remote SSH command or mount with `sshfs`.
 
 <critical>
-- You **MUST** use `read` instead of bash for ALL file reading: `cat`, `head`, `tail`, `less`, `more` are FORBIDDEN.
-- You **MUST** use `read(path="dir/")` instead of `ls dir/` for directory listings.
-- You **MUST** always include the `path` parameter — NEVER call `read` with empty arguments `{}`.
-- When reading specific line ranges, use `offset` and `limit`: `read(path="file", offset=50, limit=100)` not `cat -n file | sed`.
+Summary footer names elided ranges? Re-issue ONLY those ranges. NEVER guess `..`/`…` content.
 </critical>

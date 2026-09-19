@@ -1,38 +1,42 @@
 # Hooks
 
-This document describes the **current hook subsystem code** in `src/extensibility/hooks/*`.
+This document describes the **current hook subsystem code** in `packages/coding-agent/src/extensibility/hooks/*`.
 
 ## Current status in runtime
 
-The hook package (`src/extensibility/hooks/`) is still exported and usable as an API surface, but the default CLI runtime now initializes the **extension runner** path. In current startup flow:
+The default CLI runtime initializes the **extension runner** path. In current startup flow:
 
 - `--hook` is treated as an alias for `--extension` (CLI paths are merged into `additionalExtensionPaths`)
+- JS/TS hook factories discovered through `hookCapability` (for example `.omp/hooks/pre/*.ts`) are loaded as extension modules so their `pi.on(...)` handlers bind to the runtime event bus
 - tools are wrapped by `ExtensionToolWrapper`, not `HookToolWrapper`
 - context transforms and lifecycle emissions go through `ExtensionRunner`
 
-So this file documents the hook subsystem implementation itself (types/loader/runner/wrapper), including legacy behavior and constraints.
+So this file documents the legacy hook subsystem implementation itself (types/loader/runner/wrapper), plus the factory shape still accepted when a discovered hook path is loaded by the extension runner.
 
 ## Key files
 
-- `src/extensibility/hooks/types.ts` — hook context, event types, and result contracts
-- `src/extensibility/hooks/loader.ts` — module loading and hook discovery bridge
-- `src/extensibility/hooks/runner.ts` — event dispatch, command lookup, error signaling
-- `src/extensibility/hooks/tool-wrapper.ts` — pre/post tool interception wrapper
-- `src/extensibility/hooks/index.ts` — exports/re-exports
+- `packages/coding-agent/src/extensibility/hooks/types.ts` — hook context, event types, and result contracts
+- `packages/coding-agent/src/extensibility/hooks/loader.ts` — module loading and hook discovery bridge
+- `packages/coding-agent/src/extensibility/hooks/runner.ts` — event dispatch, command lookup, error signaling
+- `packages/coding-agent/src/extensibility/hooks/tool-wrapper.ts` — pre/post tool interception wrapper
+- `packages/coding-agent/src/extensibility/hooks/index.ts` — exports/re-exports
 
 ## What a hook module is
 
 A hook module must default-export a factory:
 
 ```ts
-import type { HookAPI } from "@oh-my-pi/pi-coding-agent/hooks";
+import type { HookAPI } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
 
 export default function hook(pi: HookAPI): void {
-	pi.on("tool_call", async (event, ctx) => {
-		if (event.toolName === "bash" && String(event.input.command ?? "").includes("rm -rf")) {
-			return { block: true, reason: "blocked by policy" };
-		}
-	});
+  pi.on("tool_call", async (event, ctx) => {
+    if (
+      event.toolName === "bash" &&
+      String(event.input.command ?? "").includes("rm -rf")
+    ) {
+      return { block: true, reason: "blocked by policy" };
+    }
+  });
 }
 ```
 
@@ -43,11 +47,28 @@ The factory can:
 - persist non-LLM state with `pi.appendEntry(...)`
 - register slash commands via `pi.registerCommand(...)`
 - register custom message renderers via `pi.registerMessageRenderer(...)`
-- run shell commands via `pi.exec(...)`
+- run shell commands via `pi.exec(...)` and log through `pi.logger`
+- use the injected Zod-compatible builder `pi.zod`, native omptype builder `pi.arktype`, legacy `pi.typebox`, and package exports via `pi.pi`
 
 ## Discovery and loading
 
-`discoverAndLoadHooks(configuredPaths, cwd)` does:
+Default sessions load JS/TS hook factories discovered by `hookCapability` through the extension runner. `discoverExtensionPaths(configuredPaths, cwd)` does:
+
+1. Load native extension modules from the capability registry
+2. Load importable `.ts`/`.js` hook factories from the hook capability registry
+3. Append plugin extension entry points
+4. Append explicitly configured paths
+
+### Native discovery location
+
+The native provider scans only two subdirectories per config root — a factory placed **directly** in `hooks/` is not discovered:
+
+- Project: `<cwd>/.omp/hooks/pre/*.{ts,js}` and `<cwd>/.omp/hooks/post/*.{ts,js}`
+- User: `<agentDir>/hooks/pre/*.{ts,js}` and `<agentDir>/hooks/post/*.{ts,js}` (default `~/.omp/agent/hooks/...`; profile- and `PI_CODING_AGENT_DIR`-aware)
+
+So `<cwd>/.omp/hooks/psy-guards.ts` (no `pre/`/`post/` subdirectory) loads nothing and reports no error — move it into `pre/` or `post/`, e.g. `<cwd>/.omp/hooks/pre/psy-guards.ts`. This mirrors `.claude/hooks/pre|post/`. Only `.ts`/`.js` factories are appended to the extension pipeline and bound through the extension runner. See [Extension Loading](./extension-loading.md) for the shared module pipeline these factories flow through (native `.omp/extensions/` roots, plugin entries, configured paths, load order, and disable controls).
+
+The legacy `discoverAndLoadHooks(configuredPaths, cwd)` helper still exists and does:
 
 1. Load discovered hooks from capability registry (`loadCapability("hooks")`)
 2. Append explicitly configured paths (deduped by absolute path)
@@ -62,12 +83,6 @@ The factory can:
 - absolute path: used as-is
 - `~` path: expanded
 - relative path: resolved against `cwd`
-
-### Important legacy mismatch
-
-Discovery providers for `hookCapability` still model pre/post shell-style hook files (for example `.claude/hooks/pre/*`, `.omp/.../hooks/pre/*`).
-
-The hook loader here uses dynamic module import and requires a default JS/TS hook factory. If a discovered hook path is not importable as a module, load fails and is reported in `LoadHooksResult.errors`.
 
 ## Event surfaces
 
@@ -90,7 +105,7 @@ Hook events are strongly typed in `types.ts`.
 ### Agent/context events
 
 - `context` → can return `{ messages?: Message[] }`
-- `before_agent_start` → can return `{ message?: { customType; content; display; details } }`
+- `before_agent_start` → can return `{ message?: { customType; content; display; details; attribution } }`
 - `agent_start`
 - `agent_end`
 - `turn_start`
@@ -104,10 +119,10 @@ Hook events are strongly typed in `types.ts`.
 
 ### Tool events (pre/post model)
 
-- `tool_call` (pre-execution) → can return `{ block?: boolean; reason?: string }`
+- `tool_call` (pre-execution) → can return `{ block?: boolean; reason?: string; input?: Record<string, unknown> }`. A non-blocking handler that returns `input` replaces the arguments the tool executes with (the raw execution input, not the normalized `event.input` view); ignored when `block` is true.
 - `tool_result` (post-execution) → can return `{ content?; details?; isError? }`
 
-This is the hook subsystem’s core pre/post interception model.
+This is the hook subsystem’s core pre/post interception model. Eval prelude invocations such as `browser.open(...)`, direct `BrowserTab` helpers, `tab.run(...)`, direct `computer` helpers, and `computer.run(fnOrCode, options)` are host bridge calls, not AgentTool calls, so they do not emit `tool_call` or `tool_result`.
 
 ```text
 Hook tool interception flow
@@ -125,7 +140,6 @@ tool_call handlers
       │
       └─ error   ──> emit tool_result(isError=true) then rethrow original error
 ```
-
 
 ## Execution model and mutation semantics
 
@@ -160,13 +174,13 @@ On tool failure, wrapper emits `tool_result` with `isError: true` and error text
 ### What hooks can mutate
 
 - LLM context for a single call via `context` (`messages` replacement chain)
+- raw tool execution arguments by returning `input` from `tool_call`
 - tool output content/details on successful tool calls (`tool_result` path)
 - pre-agent injected message via `before_agent_start`
 - cancellation/custom compaction/tree behavior via `session_before_*` and `session.compacting`
 
 ### What hooks cannot mutate in this implementation
 
-- raw tool input parameters in-place (only block/allow on `tool_call`)
 - execution continuation after thrown tool errors (error path rethrows)
 - final success/error status in wrapper behavior (returned `isError` is typed but not applied by `HookToolWrapper`)
 
@@ -192,7 +206,7 @@ Inside `HookRunner`, order is deterministic by registration sequence:
 
 Conflict behavior by event type:
 
-- `tool_call`: last returned result wins unless a handler blocks; first block short-circuits
+- `tool_call`: last returned result wins unless a handler blocks; first block short-circuits. A returned `input` (execution-argument override) follows the same last-wins rule; handlers do not observe each other's revisions
 - `tool_result`: last returned override wins (no short-circuit)
 - `context`: chained; each handler receives prior handler’s message output
 - `before_agent_start`: first returned message is kept; later messages ignored
@@ -216,7 +230,7 @@ Command/renderer conflicts:
 - `setEditorText`, `getEditorText`
 - `theme` getter
 
-`ctx.hasUI` indicates whether interactive UI is available.
+`ctx` includes `hasUI`, `cwd`, `sessionManager`, `modelRegistry`, current `model`, `isIdle()`, `abort()`, and `hasQueuedMessages()`.
 
 When running with no UI, the default no-op context behavior is:
 
@@ -231,7 +245,7 @@ Hook status text set via `ctx.ui.setStatus(key, text)` is:
 
 - stored per key
 - sorted by key name
-- sanitized (`\r`, `\n`, `\t` → spaces; repeated spaces collapsed)
+- sanitized (ANSI/VT escape sequences stripped; control characters mapped to spaces; repeated spaces collapsed; trimmed)
 - joined and width-truncated for display
 
 ## Error propagation and fallback
@@ -252,85 +266,92 @@ Hook status text set via `ctx.ui.setStatus(key, text)` is:
 ### Block unsafe bash commands
 
 ```ts
-import type { HookAPI } from "@oh-my-pi/pi-coding-agent/hooks";
+import type { HookAPI } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
 
 export default function (pi: HookAPI): void {
-	pi.on("tool_call", async (event, ctx) => {
-		if (event.toolName !== "bash") return;
-		const cmd = String(event.input.command ?? "");
-		if (!cmd.includes("rm -rf")) return;
+  pi.on("tool_call", async (event, ctx) => {
+    if (event.toolName !== "bash") return;
+    const cmd = String(event.input.command ?? "");
+    if (!cmd.includes("rm -rf")) return;
 
-		if (!ctx.hasUI) return { block: true, reason: "rm -rf blocked (no UI)" };
-		const ok = await ctx.ui.confirm("Dangerous command", `Allow: ${cmd}`);
-		if (!ok) return { block: true, reason: "user denied command" };
-	});
+    if (!ctx.hasUI) return { block: true, reason: "rm -rf blocked (no UI)" };
+    const ok = await ctx.ui.confirm("Dangerous command", `Allow: ${cmd}`);
+    if (!ok) return { block: true, reason: "user denied command" };
+  });
 }
 ```
 
 ### Redact tool output on post-execution
 
 ```ts
-import type { HookAPI } from "@oh-my-pi/pi-coding-agent/hooks";
+import type { HookAPI } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
 
 export default function (pi: HookAPI): void {
-	pi.on("tool_result", async event => {
-		if (event.toolName !== "read" || event.isError) return;
+  pi.on("tool_result", async (event) => {
+    if (event.toolName !== "read" || event.isError) return;
 
-		const redacted = event.content.map(chunk => {
-			if (chunk.type !== "text") return chunk;
-			return { ...chunk, text: chunk.text.replaceAll(/API_KEY=\S+/g, "API_KEY=[REDACTED]") };
-		});
+    const redacted = event.content.map((chunk) => {
+      if (chunk.type !== "text") return chunk;
+      return {
+        ...chunk,
+        text: chunk.text.replaceAll(/API_KEY=\S+/g, "API_KEY=[REDACTED]"),
+      };
+    });
 
-		return { content: redacted };
-	});
+    return { content: redacted };
+  });
 }
 ```
 
 ### Modify model context per LLM call
 
 ```ts
-import type { HookAPI } from "@oh-my-pi/pi-coding-agent/hooks";
+import type { HookAPI } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
 
 export default function (pi: HookAPI): void {
-	pi.on("context", async event => {
-		const filtered = event.messages.filter(msg => !(msg.role === "custom" && msg.customType === "debug-only"));
-		return { messages: filtered };
-	});
+  pi.on("context", async (event) => {
+    const filtered = event.messages.filter(
+      (msg) => !(msg.role === "custom" && msg.customType === "debug-only"),
+    );
+    return { messages: filtered };
+  });
 }
 ```
 
 ### Register slash command with command-safe context methods
 
 ```ts
-import type { HookAPI } from "@oh-my-pi/pi-coding-agent/hooks";
+import type { HookAPI } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
 
 export default function (pi: HookAPI): void {
-	pi.registerCommand("handoff", {
-		description: "Create a new session with setup message",
-		handler: async (_args, ctx) => {
-			await ctx.waitForIdle();
-			await ctx.newSession({
-				parentSession: ctx.sessionManager.getSessionFile(),
-				setup: async sm => {
-					sm.appendMessage({
-						role: "user",
-						content: [{ type: "text", text: "Continue from prior session summary." }],
-						timestamp: Date.now(),
-					});
-				},
-			});
-		},
-	});
+  pi.registerCommand("handoff", {
+    description: "Create a new session with setup message",
+    handler: async (_args, ctx) => {
+      await ctx.waitForIdle();
+      await ctx.newSession({
+        parentSession: ctx.sessionManager.getSessionFile(),
+        setup: async (sm) => {
+          sm.appendMessage({
+            role: "user",
+            content: [
+              { type: "text", text: "Continue from prior session summary." },
+            ],
+            timestamp: Date.now(),
+          });
+        },
+      });
+    },
+  });
 }
 ```
 
 ## Export surface
 
-`src/extensibility/hooks/index.ts` exports:
+`packages/coding-agent/src/extensibility/hooks/index.ts` and the package subpath `@oh-my-pi/pi-coding-agent/extensibility/hooks` export:
 
 - loading APIs (`discoverAndLoadHooks`, `loadHooks`)
 - runner and wrapper (`HookRunner`, `HookToolWrapper`)
 - all hook types
 - `execCommand` re-export
 
-And package root (`src/index.ts`) re-exports hook **types** as a legacy compatibility surface.
+The package root (`@oh-my-pi/pi-coding-agent`) does not re-export `HookAPI`; import legacy hook types from the hooks subpath.

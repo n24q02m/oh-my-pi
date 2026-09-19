@@ -7,23 +7,18 @@
  * - skill://<name> - Reads SKILL.md
  * - skill://<name>/<path> - Reads relative path within skill's baseDir
  */
+import type * as fsTypes from "node:fs";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import type { Skill } from "../extensibility/skills";
-import type { InternalResource, InternalUrl, ProtocolHandler } from "./types";
+import { isEnoent } from "@oh-my-pi/pi-utils";
+import { resolveContainedPath } from "../discovery/contained-path";
+import { getActiveSkills } from "../extensibility/skills";
+import { isMarkdownPath } from "@oh-my-pi/pi-tui/lang-from-path";
+import { buildDirectoryResource } from "./filesystem-resource";
+import type { InternalResource, InternalUrl, ProtocolHandler, ResolveContext, UrlCompletion } from "./types";
 
-export interface SkillProtocolOptions {
-	/**
-	 * Returns the currently loaded skills.
-	 */
-	getSkills: () => readonly Skill[];
-}
-
-/**
- * Get content type based on file extension.
- */
 function getContentType(filePath: string): InternalResource["contentType"] {
-	const ext = path.extname(filePath).toLowerCase();
-	if (ext === ".md") return "text/markdown";
+	if (isMarkdownPath(filePath)) return "text/markdown";
 	return "text/plain";
 }
 
@@ -36,31 +31,31 @@ export function validateRelativePath(relativePath: string): void {
 	}
 
 	const normalized = path.normalize(relativePath);
-	if (normalized.startsWith("..") || normalized.includes("/../") || normalized.includes("/..")) {
+	if (
+		relativePath.split(/[\\/]/).includes("..") ||
+		normalized.startsWith("..") ||
+		normalized.includes("/../") ||
+		normalized.includes("/..")
+	) {
 		throw new Error("Path traversal (..) is not allowed in skill:// URLs");
 	}
 }
 
 /**
  * Handler for skill:// URLs.
- *
- * Resolves skill names to their content files.
  */
 export class SkillProtocolHandler implements ProtocolHandler {
 	readonly scheme = "skill";
+	readonly immutable = true;
 
-	constructor(private readonly options: SkillProtocolOptions) {}
+	async resolve(url: InternalUrl, context?: ResolveContext): Promise<InternalResource> {
+		const skills = context?.skills ?? getActiveSkills();
 
-	async resolve(url: InternalUrl): Promise<InternalResource> {
-		const skills = this.options.getSkills();
-
-		// Extract skill name from host
 		const skillName = url.rawHost || url.hostname;
 		if (!skillName) {
 			throw new Error("skill:// URL requires a skill name: skill://<name>");
 		}
 
-		// Find the skill
 		const skill = skills.find(s => s.name === skillName);
 		if (!skill) {
 			const available = skills.map(s => s.name);
@@ -68,44 +63,69 @@ export class SkillProtocolHandler implements ProtocolHandler {
 			throw new Error(`Unknown skill: ${skillName}\nAvailable: ${availableStr}`);
 		}
 
-		// Determine the file to read
 		let targetPath: string;
 		const urlPath = url.pathname;
 		const hasRelativePath = urlPath && urlPath !== "/" && urlPath !== "";
 
 		if (hasRelativePath) {
-			// Read relative path within skill's baseDir
-			const relativePath = decodeURIComponent(urlPath.slice(1)); // Remove leading /
+			const relativePath = decodeURIComponent(urlPath.slice(1));
 			validateRelativePath(relativePath);
 			targetPath = path.join(skill.baseDir, relativePath);
 
-			// Verify the resolved path is still within baseDir
 			const resolvedPath = path.resolve(targetPath);
 			const resolvedBaseDir = path.resolve(skill.baseDir);
 			if (!resolvedPath.startsWith(resolvedBaseDir + path.sep) && resolvedPath !== resolvedBaseDir) {
 				throw new Error("Path traversal is not allowed");
 			}
+			// Agent Plugin skills (§4.1): the resource must canonically resolve
+			// within the plugin root; a dangling or unresolvable path fails closed.
+			// Symlinks may target other files inside the same package.
+			if (skill.containRoot) {
+				const contained = await resolveContainedPath(skill.containRoot, resolvedPath);
+				if (contained.status === "outside") {
+					throw new Error(`skill:// path resolves outside the plugin root: ${url.href}`);
+				}
+				if (contained.status === "missing") {
+					throw new Error(`File not found: ${resolvedPath}`);
+				}
+				targetPath = contained.realPath;
+			}
 		} else {
-			// Read SKILL.md
-			targetPath = skill.filePath;
+			targetPath = context?.pathOnly === true ? skill.baseDir : skill.filePath;
 		}
 
-		// Read the file
-		const file = Bun.file(targetPath);
-		if (!(await file.exists())) {
-			throw new Error(`File not found: ${targetPath}`);
+		let stats: fsTypes.Stats;
+		try {
+			stats = await fs.stat(targetPath);
+		} catch (error) {
+			if (isEnoent(error)) {
+				throw new Error(`File not found: ${targetPath}`);
+			}
+			throw error;
 		}
 
-		const content = await file.text();
-		const contentType = getContentType(targetPath);
+		if (stats.isDirectory()) {
+			return buildDirectoryResource(url.href, targetPath);
+		}
+		if (!stats.isFile()) {
+			throw new Error(`skill:// URL must resolve to a file or directory: ${url.href}`);
+		}
 
+		const content = await Bun.file(targetPath).text();
 		return {
 			url: url.href,
 			content,
-			contentType,
+			contentType: getContentType(targetPath),
 			size: Buffer.byteLength(content, "utf-8"),
 			sourcePath: targetPath,
 			notes: [],
 		};
+	}
+
+	async complete(): Promise<UrlCompletion[]> {
+		return getActiveSkills().map(skill => ({
+			value: skill.name,
+			...(skill.description ? { description: skill.description } : {}),
+		}));
 	}
 }

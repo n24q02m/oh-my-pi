@@ -14,6 +14,20 @@ export interface SkillFrontmatter {
 	description?: string;
 	globs?: string[];
 	alwaysApply?: boolean;
+	/**
+	 * When `true`, the skill is loaded and accessible via `skill://<name>` (and
+	 * `/skill:<name>` slash commands), but is omitted from the rendered system
+	 * prompt's skill listing. Use for skills the user opts into explicitly
+	 * rather than ones the model should auto-discover.
+	 */
+	hide?: boolean;
+	/**
+	 * Agent Skills standard equivalent of `hide`.
+	 * When `true`, the skill is excluded from the system prompt listing.
+	 * Normalized from kebab-case `disable-model-invocation` in YAML frontmatter.
+	 * @see https://agentskills.io/specification
+	 */
+	disableModelInvocation?: boolean;
 	[key: string]: unknown;
 }
 
@@ -29,6 +43,12 @@ export interface Skill {
 	content: string;
 	/** Parsed frontmatter */
 	frontmatter?: SkillFrontmatter;
+	/**
+	 * Filesystem-resolved plugin root this skill was packaged in (Agent Plugins
+	 * §4.1). When set, every `skill://` resource access must realpath-resolve
+	 * within this directory; symlinks may target other files inside it.
+	 */
+	containRoot?: string;
 	/** Source level */
 	level: "user" | "project";
 	/** Source metadata */
@@ -40,6 +60,7 @@ export const skillCapability = defineCapability<Skill>({
 	displayName: "Skills",
 	description: "Specialized knowledge and workflow files that extend agent capabilities",
 	key: skill => skill.name,
+	toExtensionId: skill => `skill:${skill.name}`,
 	validate: skill => {
 		if (!skill.name) return "Missing skill name";
 		if (!skill.path) return "Missing skill path";

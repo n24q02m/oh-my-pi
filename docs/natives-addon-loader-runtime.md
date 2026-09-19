@@ -1,268 +1,141 @@
 # Natives Addon Loader Runtime
 
-This document deep-dives the addon loading/validation layer in `@oh-my-pi/pi-natives`: how `native.ts` decides which `.node` file to load, when embedded payload extraction runs, and how startup failures are reported.
+This page documents `packages/natives/native/loader-state.js`, the runtime between an ESM entrypoint and a validated `pi_natives.*.node` addon.
 
-## Implementation files
+## Entrypoints and eager/lazy loading
 
-- `packages/natives/src/native.ts`
-- `packages/natives/src/embedded-addon.ts`
-- `packages/natives/src/bindings.ts`
-- `packages/natives/package.json`
+- `native/index.js` calls `loadNative()` at module evaluation and exposes the generated root API.
+- `native/desktop.js` and `native/clipboard.js` import the loader but call it only inside their public wrappers.
+- Pure loader helpers are exported for focused tests and do not perform detection or filesystem probing until `loadNative()` or `initLoaderContext()` is called.
 
-## Scope and responsibility
+A successful call is not memoized by JS. Repeated calls rely on the runtime's `require(...)` module cache, while post-load setup is idempotent or best-effort.
 
-Loader/runtime responsibilities are intentionally narrow:
+## Loader context
 
-- Build a platform/CPU-aware candidate list for addon filenames and directories.
-- Optionally materialize an embedded addon into a versioned per-user cache directory.
-- Attempt candidates in deterministic order.
-- Reject stale or incompatible addons via `validateNative` before exposing bindings.
+`initLoaderContext()` derives:
 
-Out of scope here: module-specific grep/text/highlight behavior.
+- `platformTag`: `${platform}-${process.arch}`;
+- package version and sentinel name `__piNativesV<version_with_underscores>`;
+- package-local `nativeDir` and the directory of `process.execPath`;
+- `nativesDir`, normally `~/.omp/natives`; it uses `$XDG_DATA_HOME/omp/natives` only when `$XDG_DATA_HOME/omp` exists;
+- `versionedDir`: `<nativesDir>/<packageVersion>`;
+- legacy compiled-binary directory: `%LOCALAPPDATA%/omp` (or `~/AppData/Local/omp`) on Windows, `~/.local/bin` elsewhere;
+- workspace/install/compiled mode, optional leaf directory, Windows staging policy, CPU variant, filenames, and ordered candidates.
 
-## Runtime inputs and derived state
+Compiled mode is true when a populated embedded manifest exists, `PI_COMPILED` is set, or `import.meta.url` contains a Bun embedded marker (`$bunfs`, `~BUN`, or `%7EBUN`). A non-compiled `nativeDir` outside a `node_modules` path is a workspace load. Windows path classification is case-insensitive; other platforms use case-sensitive path matching.
 
-At module initialization (`export const native = loadNative();`), `native.ts` computes static context:
+## Platforms and variants
 
-- **Platform tag**: ``${process.platform}-${process.arch}`` (for example `darwin-arm64`).
-- **Package version**: from `packages/natives/package.json` (`version` field).
-- **Core directories**:
-  - `nativeDir`: package-local `packages/natives/native`.
-  - `execDir`: directory containing `process.execPath`.
-  - `versionedDir`: `<getNativesDir()>/<packageVersion>`.
-  - `userDataDir` fallback:
-    - Windows: `%LOCALAPPDATA%/omp` (or `%USERPROFILE%/AppData/Local/omp`).
-    - Non-Windows: `~/.local/bin`.
-- **Compiled-binary mode** (`isCompiledBinary`): true if any of:
-  - `PI_COMPILED` env var is set, or
-  - `import.meta.url` contains Bun-embedded markers (`$bunfs`, `~BUN`, `%7EBUN`).
-- **Variant override**: `PI_NATIVE_VARIANT` (`modern`/`baseline` only; invalid values ignored).
-- **Selected variant**: explicit override, otherwise runtime AVX2 detection on x64 (`modern` if AVX2, else `baseline`).
-
-## Platform support and tag resolution
-
-`SUPPORTED_PLATFORMS` is fixed to:
+Supported publish tags are:
 
 - `linux-x64`
 - `linux-arm64`
 - `darwin-x64`
 - `darwin-arm64`
 - `win32-x64`
+- `win32-arm64`
 
-Behavior detail:
+An unsupported tag is reported only after probing candidates.
 
-- Unsupported platforms are not rejected up-front.
-- Loader still tries all computed candidates first.
-- If nothing loads, it throws an explicit unsupported-platform error listing supported tags.
+For x64, `PI_NATIVE_VARIANT=modern|baseline` wins. Invalid values are ignored. Otherwise the private inherited `__PI_NATIVE_VARIANT_CACHE` result is used when valid; only then does the loader detect AVX2:
 
-This preserves useful diagnostics for near-miss cases while still failing hard for truly unsupported targets.
+- Linux reads `/proc/cpuinfo`.
+- macOS tries `/usr/sbin/sysctl` and then `sysctl`, querying `machdep.cpu.leaf7_features` and `machdep.cpu.features`.
+- Windows invokes non-interactive PowerShell for `System.Runtime.Intrinsics.X86.Avx2`.
 
-## Variant selection (`modern` / `baseline` / default)
+Detection uses `Bun.spawnSync` when available, then falls back to `node:child_process`. A detected result is written to the private cache environment entry so later workers/children inherit the same decision. Non-x64 does not use or populate a variant.
 
-### x64 behavior
+`getAddonFilenames()` returns:
 
-1. If `PI_NATIVE_VARIANT` is `modern` or `baseline`, that value wins.
-2. Else detect AVX2 support:
-   - Linux: scan `/proc/cpuinfo` for `avx2`.
-   - macOS: query `sysctl` (`machdep.cpu.leaf7_features`, fallback `machdep.cpu.features`).
-   - Windows: run PowerShell `[System.Runtime.Intrinsics.X86.Avx2]::IsSupported`.
-3. Result:
-   - AVX2 available -> `modern`
-   - AVX2 unavailable/undetectable -> `baseline`
+| Runtime selection    | Ordered filenames                                                                         |
+| -------------------- | ----------------------------------------------------------------------------------------- |
+| modern x64           | `pi_natives.<tag>-modern.node`, `pi_natives.<tag>-baseline.node`, `pi_natives.<tag>.node` |
+| baseline x64         | `pi_natives.<tag>-baseline.node`, `pi_natives.<tag>.node`                                 |
+| non-x64 / no variant | `pi_natives.<tag>.node`                                                                   |
 
-### Non-x64 behavior
+## Candidate ordering
 
-- No variant is used; loader stays on the default filename (`pi_natives.<platform>-<arch>.node`).
+`resolveLoaderCandidates()` de-duplicates paths while retaining first occurrence.
 
-### Filename construction
+### Installed, non-compiled package
 
-Given `tag = <platform>-<arch>`:
+1. Every selected filename in `@oh-my-pi/pi-natives-<tag>`.
+2. For each filename, package-local `nativeDir`, then the executable directory.
 
-- Non-x64 or no variant: `pi_natives.<tag>.node`
-- x64 + `modern`: try in order
-  1. `pi_natives.<tag>-modern.node`
-  2. `pi_natives.<tag>-baseline.node` (intentional fallback)
-- x64 + `baseline`: only `pi_natives.<tag>-baseline.node`
+The platform leaf wins over a stale core artifact. Workspace loads deliberately skip leaf resolution.
 
-The `addonLabel` used in final error messages is either `<tag>` or `<tag> (<variant>)`.
+### Windows `node_modules` staging
 
-## Candidate path construction and fallback ordering
+When the platform is Windows, the runtime is non-compiled, and `nativeDir` contains a `node_modules` segment:
 
-`native.ts` builds candidate pools before any `require(...)` call.
+1. Every selected filename in `versionedDir`.
+2. Leaf-package candidates.
+3. Package-local and executable candidates.
 
-### Debug/dev candidates (only when `PI_DEV` is set)
+Before probing, `maybeStageNodeModulesAddon()` copies each available filename from `leafPackageDir ?? nativeDir` to a missing cache target. Existing cache files are retained. This keeps the loaded DLL handle away from the package-manager copy that an update must replace. Directory/copy failures are recorded and normal probing continues.
 
-Prepended first:
+### Compiled runtime
 
-1. `<nativeDir>/pi_natives.dev.node`
-2. `<execDir>/pi_natives.dev.node`
+1. For each filename, `versionedDir`, then the legacy user-data directory.
+2. For each filename, package-local `nativeDir`, then the executable directory.
 
-This path is explicit debug intent and always outranks release candidates.
+A successfully selected embedded candidate is prepended. Windows staging is disabled in compiled mode.
 
-### Release candidates
+## Embedded manifest and extraction
 
-Built from variant-resolved filename list and searched in this order:
+`embedded-addon.js` is reset to `embeddedAddon = null` in normal source/published-core state. `scripts/embed-native.ts` can generate a matching manifest containing:
 
-- **Non-compiled runtime**:
-  1. `<nativeDir>/<filename>`
-  2. `<execDir>/<filename>`
+- `platformTag` and package `version`;
+- a gzip-compressed tar archive reference;
+- `files[]` with `variant`, basename-only `filename`, and `size`.
 
-- **Compiled runtime** (`PI_COMPILED` or Bun embedded markers):
-  1. `<versionedDir>/<filename>`
-  2. `<userDataDir>/<filename>`
-  3. `<nativeDir>/<filename>`
-  4. `<execDir>/<filename>`
+Extraction runs only for compiled mode with matching platform and version and a selectable file. Selection is:
 
-`dedupedCandidates` removes duplicates while preserving first occurrence order.
+- non-x64: `default`, then first file;
+- modern x64: `modern`, then `baseline`;
+- baseline x64: `baseline` only.
 
-### Final runtime sequence
+The loader creates `versionedDir`. If every manifest file that needs extraction is already a regular file with the declared size, it reuses them. Otherwise it gunzips and parses the tar archive, accepting only basename-only regular-file entries from the manifest allowlist, validating sizes, and writing through a temporary file plus rename. Missing, truncated, unsafe, wrong-type, and wrong-size entries are errors. Older manifests without an archive can still provide per-file `filePath` metadata.
 
-At load time:
+Extraction errors are accumulated; the loader continues to ordinary candidates.
 
-1. Optional embedded extraction candidate (if produced) is inserted at the front.
-2. Remaining deduplicated candidates are tried in order.
-3. First candidate that both `require(...)`s and passes `validateNative(...)` wins.
+## Candidate validation and post-load setup
 
-## Embedded addon extraction lifecycle
+For each candidate:
 
-`embedded-addon.ts` defines a generated manifest shape:
+1. Emit a startup marker when enabled.
+2. `require(candidate)`.
+3. Unless this is workspace development, require the expected package-version sentinel function.
+4. Call `__ompInstallTokioRuntime()` if the addon provides it.
+5. Best-effort remove valid semantic-version cache directories older than the current version.
+6. Return the bindings.
 
-- `platformTag`
-- `version`
-- `files[]` where each entry has `variant`, `filename`, `filePath`
+The sentinel error distinguishes a previous addon still resident in the current process from a stale file on disk. If the loaded exports carry an older sentinel but the candidate bytes contain the expected current sentinel, the diagnostic says to restart. Otherwise it says to reinstall. The loader does not validate all public exports.
 
-Current checked-in default is `embeddedAddon: null`; compiled artifacts may replace this with real metadata.
+Rust module initialization installs crash diagnostics but does not spawn runtime threads under the dynamic-loader lock. The optional post-load hook installs bounded Windows Tokio and Rayon pools. It is best-effort; older addons or hook failures fall back to napi-rs behavior. Set `PI_DEBUG_STARTUP` to emit synchronous `[startup]` markers to stderr, including hook success/failure.
 
-### Extraction state machine
+Cache cleanup ignores read/delete failures and removes only directories whose parsed semantic version is older than the current package. It preserves current/future versions, prerelease/non-semver names, and ordinary files.
 
-Extraction (`maybeExtractEmbeddedAddon`) runs only when all gates pass:
+## Failure diagnostics
 
-1. `isCompiledBinary === true`
-2. `embeddedAddon !== null`
-3. `embeddedAddon.platformTag === platformTag`
-4. `embeddedAddon.version === packageVersion`
-5. A variant-appropriate embedded file is found
+If no candidate succeeds:
 
-Variant file selection mirrors runtime variant intent:
+- an unsupported tag throws `Unsupported platform: <tag>`, the supported list, and issue guidance;
+- a supported tag throws `Failed to load pi_natives native addon for <tag>` (including the x64 variant), followed by every candidate/preparation error and mode-specific help.
 
-- Non-x64: prefer `default`, then first available file.
-- x64 + `modern`: prefer `modern`, fallback to `baseline`.
-- x64 + `baseline`: require `baseline`.
+Compiled help lists expected cache paths, suggests deleting the versioned directory, and prints release-download `curl` commands. Installed-package help suggests reinstalling, the local host build (`bun --cwd=packages/natives run build`), and explicit `scripts/bazel-natives.ts <target> --dest packages/natives/native` builds.
 
-Materialization behavior:
-
-1. Ensure `<versionedDir>` exists (`mkdirSync(..., { recursive: true })`).
-2. If `<versionedDir>/<selected filename>` already exists, reuse it (no rewrite).
-3. Else read embedded source `filePath` and write target file.
-4. Return target path for highest-priority load attempt.
-
-On failure, extraction does not crash immediately; it appends an error entry (directory creation or write failure) and loader proceeds to normal candidate probing.
-
-## Lifecycle and state transitions
+## Lifecycle
 
 ```text
-Init
-  -> Compute platform/version/variant/candidate lists
-  -> (Compiled + embedded manifest matches?)
-       yes -> Try extract embedded to versionedDir (record errors, continue)
-       no  -> Skip extraction
-  -> For each runtime candidate in order:
-       require(candidate)
-       -> success: validateNative
-            -> pass: return bindings (READY)
-            -> fail: record error, continue
-       -> failure: record error, continue
-  -> none loaded:
-       if unsupported platform tag -> throw Unsupported platform
-       else -> throw Failed to load (full tried-path diagnostics + hints)
+entrypoint evaluates or lazy wrapper is invoked
+  -> initialize loader context
+  -> extract matching embedded archive, if any
+  -> otherwise stage Windows node_modules addon, if applicable
+  -> require candidates in deterministic order
+       -> validate sentinel outside workspace development
+       -> install optional post-load runtime
+       -> best-effort clean older version caches
+       -> return bindings
+  -> no success: throw unsupported-platform or aggregated load error
 ```
-
-## `validateNative` contract checks
-
-`validateNative(bindings, source)` enforces a function-only contract over `NativeBindings` at startup.
-
-Mechanics:
-
-- For each required export name, it checks `typeof bindings[name] === "function"`.
-- Missing names are aggregated.
-- If any are missing, loader throws:
-  - source addon path,
-  - missing export list,
-  - rebuild command hint.
-
-This is a hard compatibility gate against stale binaries, partial builds, and symbol/name drift.
-
-### JS API ↔ native export mapping (validation gate)
-
-| JS binding name checked in `validateNative` | Expected native export name |
-| --- | --- |
-| `grep` | `grep` |
-| `glob` | `glob` |
-| `highlightCode` | `highlightCode` |
-| `executeShell` | `executeShell` |
-| `PtySession` | `PtySession` |
-| `Shell` | `Shell` |
-| `visibleWidth` | `visibleWidth` |
-| `getSystemInfo` | `getSystemInfo` |
-| `getWorkProfile` | `getWorkProfile` |
-| `invalidateFsScanCache` | `invalidateFsScanCache` |
-
-Note: `bindings.ts` declares only the base `cancelWork(id)` member; module `types.ts` files declaration-merge additional symbols that `validateNative` enforces.
-
-## Failure behavior and diagnostics
-
-## Unsupported platform
-
-If all candidates fail and `platformTag` is not in `SUPPORTED_PLATFORMS`, loader throws:
-
-- `Unsupported platform: <tag>`
-- Full supported-platform list
-- Explicit issue-reporting guidance
-
-## Stale binary / mismatch symptoms
-
-Typical stale mismatch signal:
-
-- `Native addon missing exports (<candidate>). Missing: ...`
-
-Common causes:
-
-- Old `.node` binary from previous package version/API shape.
-- Wrong variant artifact selected (for x64).
-- New Rust export not present in loaded artifact.
-
-Loader behavior:
-
-- Records per-candidate missing-export failures.
-- Continues probing remaining candidates.
-- If no candidate validates, final error includes every attempted path with each failure message.
-
-## Compiled-binary startup failures
-
-In compiled mode final diagnostics include:
-
-- expected versioned cache target paths (`<versionedDir>/<filename>`),
-- remediation to delete stale `<versionedDir>` and rerun,
-- direct release download `curl` commands for each expected filename.
-
-## Non-compiled startup failures
-
-In normal package/runtime mode final diagnostics include:
-
-- reinstall hint (`bun install @oh-my-pi/pi-natives`),
-- local rebuild command (`bun --cwd=packages/natives run build:native`),
-- optional x64 variant build hint (`TARGET_VARIANT=baseline|modern ...`).
-
-## Dev/debug versus release behavior
-
-When `PI_DEV` is set:
-
-- `pi_natives.dev.node` candidates are prepended ahead of all release candidates.
-- Loader emits per-candidate console diagnostics (`Loaded native addon...` and load errors).
-
-Without `PI_DEV`:
-
-- Only release candidate chain is used.
-- No dev console diagnostics are emitted.
-
-Operationally, this means debug sessions can validate an ad-hoc dev addon first, while production/release runs remain on deterministic release artifact probing.

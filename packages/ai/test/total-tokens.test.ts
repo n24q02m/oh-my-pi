@@ -13,9 +13,9 @@
  */
 
 import { describe, expect, it } from "bun:test";
-import { getBundledModel } from "@oh-my-pi/pi-ai/models";
 import { complete } from "@oh-my-pi/pi-ai/stream";
 import type { Api, Context, Model, OptionsForApi, Usage } from "@oh-my-pi/pi-ai/types";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
@@ -47,7 +47,7 @@ async function testTotalTokensWithCache<TApi extends Api>(
 ): Promise<{ first: Usage; second: Usage }> {
 	// First request - no cache
 	const context1: Context = {
-		systemPrompt: LONG_SYSTEM_PROMPT,
+		systemPrompt: [LONG_SYSTEM_PROMPT],
 		messages: [
 			{
 				role: "user",
@@ -62,7 +62,7 @@ async function testTotalTokensWithCache<TApi extends Api>(
 
 	// Second request - should trigger cache read (same system prompt, add conversation)
 	const context2: Context = {
-		systemPrompt: LONG_SYSTEM_PROMPT,
+		systemPrompt: [LONG_SYSTEM_PROMPT],
 		messages: [
 			...context1.messages,
 			response1, // Include previous assistant response
@@ -154,7 +154,7 @@ describe("totalTokens field", () => {
 			"gpt-4o-mini - should return totalTokens equal to sum of components",
 			async () => {
 				const llm: Model<"openai-completions"> = {
-					...getBundledModel("openai", "gpt-4o-mini")!,
+					...(getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">)!,
 					api: "openai-completions",
 				};
 

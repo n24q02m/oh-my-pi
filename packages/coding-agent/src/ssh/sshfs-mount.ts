@@ -1,15 +1,29 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { getRemoteDir, postmortem } from "@oh-my-pi/pi-utils";
+import { $which, getRemoteDir, postmortem } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
-import { getControlDir, getControlPathTemplate, type SSHConnectionTarget } from "./connection-manager";
+import {
+	ensureSshControlDir,
+	getControlPathTemplate,
+	type SSHConnectionTarget,
+	supportsSshControlMaster,
+} from "./connection-manager";
 import { buildSshTarget, sanitizeHostName } from "./utils";
 
 const REMOTE_DIR = getRemoteDir();
-const CONTROL_DIR = getControlDir();
 const CONTROL_PATH = getControlPathTemplate();
 
 const mountedPaths = new Set<string>();
+
+type MountPointStatReader = (filePath: string) => Promise<{ dev: number }>;
+
+interface MountCheckOptions {
+	platform?: NodeJS.Platform;
+	stat?: MountPointStatReader;
+	which?: (command: string) => string | null;
+}
+
+const readMountPointStats: MountPointStatReader = async filePath => fs.promises.stat(filePath);
 
 async function ensureDir(path: string, mode = 0o700): Promise<void> {
 	try {
@@ -40,13 +54,11 @@ function buildSshfsArgs(host: SSHConnectionTarget): string[] {
 		"BatchMode=yes",
 		"-o",
 		"StrictHostKeyChecking=accept-new",
-		"-o",
-		"ControlMaster=auto",
-		"-o",
-		`ControlPath=${CONTROL_PATH}`,
-		"-o",
-		"ControlPersist=3600",
 	];
+
+	if (supportsSshControlMaster()) {
+		args.push("-o", "ControlMaster=auto", "-o", `ControlPath=${CONTROL_PATH}`, "-o", "ControlPersist=3600");
+	}
 
 	if (host.port) {
 		args.push("-p", String(host.port));
@@ -60,26 +72,39 @@ function buildSshfsArgs(host: SSHConnectionTarget): string[] {
 }
 
 async function unmountPath(path: string): Promise<boolean> {
-	const fusermount = Bun.which("fusermount") ?? Bun.which("fusermount3");
+	const fusermount = $which("fusermount") ?? $which("fusermount3");
 	if (fusermount) {
 		const result = await $`${fusermount} -u ${path}`.quiet().nothrow();
 		if (result.exitCode === 0) return true;
 	}
 
-	const umount = Bun.which("umount");
+	const umount = $which("umount");
 	if (!umount) return false;
 	const result = await $`${umount} ${path}`.quiet().nothrow();
 	return result.exitCode === 0;
 }
 
 export function hasSshfs(): boolean {
-	return Bun.which("sshfs") !== null;
+	return $which("sshfs") !== null;
 }
 
-export async function isMounted(path: string): Promise<boolean> {
-	const mountpoint = Bun.which("mountpoint");
-	if (!mountpoint) return false;
-	const result = await $`${mountpoint} -q ${path}`.quiet().nothrow();
+async function isMountedByDeviceBoundary(mountPath: string, stat = readMountPointStats): Promise<boolean> {
+	try {
+		const [mountStats, parentStats] = await Promise.all([stat(mountPath), stat(path.dirname(mountPath))]);
+		return mountStats.dev !== parentStats.dev;
+	} catch {
+		return false;
+	}
+}
+
+export async function isMounted(mountPath: string, options: MountCheckOptions = {}): Promise<boolean> {
+	const which = options.which ?? $which;
+	const mountpoint = which("mountpoint");
+	if (!mountpoint) {
+		const platform = options.platform ?? process.platform;
+		return platform === "darwin" ? isMountedByDeviceBoundary(mountPath, options.stat) : false;
+	}
+	const result = await $`${mountpoint} -q ${mountPath}`.quiet().nothrow();
 	return result.exitCode === 0;
 }
 
@@ -89,7 +114,8 @@ export async function mountRemote(host: SSHConnectionTarget, remotePath = "/"): 
 	if (!hasSshfs()) return undefined;
 
 	const mountPath = getMountPath(host);
-	await Promise.all([ensureDir(REMOTE_DIR), ensureDir(CONTROL_DIR), ensureDir(mountPath)]);
+	ensureSshControlDir();
+	await Promise.all([ensureDir(REMOTE_DIR), ensureDir(mountPath)]);
 
 	if (await isMounted(mountPath)) {
 		if (!registered) {

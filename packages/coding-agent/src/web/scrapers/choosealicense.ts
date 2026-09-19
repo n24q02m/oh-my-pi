@@ -1,4 +1,4 @@
-import { parseFrontmatter } from "../../utils/frontmatter";
+import { parseFrontmatter } from "@oh-my-pi/pi-utils";
 import type { RenderResult, SpecialHandler } from "./types";
 import { buildResult, loadPage } from "./types";
 import { asString } from "./utils";
@@ -67,7 +67,7 @@ export const handleChooseALicense: SpecialHandler = async (
 		const { frontmatter, body } = parseFrontmatter(result.content, { source: rawUrl });
 
 		const title = asString(frontmatter.title) ?? formatLabel(licenseSlug);
-		const spdxId = asString(frontmatter["spdx-id"]) ?? "Unknown";
+		const spdxId = asString(frontmatter.spdxId) ?? "Unknown";
 		const description = asString(frontmatter.description);
 		const permissions = normalizeList(frontmatter.permissions);
 		const conditions = normalizeList(frontmatter.conditions);

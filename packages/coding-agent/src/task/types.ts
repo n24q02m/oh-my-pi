@@ -1,11 +1,17 @@
-import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Usage } from "@oh-my-pi/pi-ai";
+import type { AgentSource } from "@oh-my-pi/pi-tui/tools/task";
+export {
+	TASK_SUBAGENT_PROGRESS_CHANNEL,
+	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
+} from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
+export type {
+	SubagentProgressPayload,
+	SubagentLifecyclePayload,
+} from "@oh-my-pi/pi-tui/overlays/session-observer-registry";
+import { type BaseType, type } from "@oh-my-pi/omptype";
 import { $env } from "@oh-my-pi/pi-utils";
-import { type Static, Type } from "@sinclair/typebox";
-import type { NestedRepoPatch } from "./worktree";
 
-/** Source of an agent definition */
-export type AgentSource = "bundled" | "user" | "project";
+import type { AgentSessionEvent } from "../session/agent-session";
+import type { ConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 
 const parseNumber = (value: string | undefined, defaultValue: number): number => {
 	if (value) {
@@ -28,89 +34,185 @@ export const MAX_OUTPUT_LINES = parseNumber($env.PI_TASK_MAX_OUTPUT_LINES, 5000)
 /** EventBus channel for raw subagent events */
 export const TASK_SUBAGENT_EVENT_CHANNEL = "task:subagent:event";
 
-/** EventBus channel for aggregated subagent progress */
-export const TASK_SUBAGENT_PROGRESS_CHANNEL = "task:subagent:progress";
+/** Payload emitted on TASK_SUBAGENT_EVENT_CHANNEL */
+export interface SubagentEventPayload {
+	id: string;
+	event: AgentSessionEvent;
+}
 
-/** Single task item for parallel execution */
-export const taskItemSchema = Type.Object({
-	id: Type.String({
-		description: "CamelCase identifier, max 48 chars",
-		maxLength: 48,
-	}),
-	description: Type.String({
-		description: "Short one-liner for UI display only — not seen by the subagent",
-	}),
-	assignment: Type.String({
-		description:
-			"Complete per-task instructions the subagent executes. Must follow the Target/Change/Edge Cases/Acceptance structure. Only include per-task deltas — shared background belongs in `context`.",
-	}),
+// Keep this explicit: ArkType serializes `unknown` as a boolean subschema, which llama.cpp grammars reject.
+const outputSchemaInputSchema = type("object | boolean | string | null");
+// Coarse per-spawn thinking effort; must stay in sync with TASK_EFFORTS in ../thinking.
+const effortRule = '"lo" | "med" | "hi"' as const;
+
+export const taskItemSchema = type({
+	"name?": "string",
+	agent: "string = 'task'",
+	task: "string",
+	"outputSchema?": outputSchemaInputSchema,
+	"schemaMode?": '"permissive" | "strict"',
+	"tools?": "string[]",
+	"+": "delete",
 });
-export type TaskItem = Static<typeof taskItemSchema>;
+const taskItemSchemaIsolated = type({
+	"name?": "string",
+	agent: "string = 'task'",
+	task: "string",
+	"outputSchema?": outputSchemaInputSchema,
+	"schemaMode?": '"permissive" | "strict"',
+	"tools?": "string[]",
+	"isolated?": "boolean",
+	"+": "delete",
+});
 
-const createTaskSchema = (options: { isolationEnabled: boolean }) => {
-	const properties = {
-		agent: Type.String({ description: "Agent type for all tasks in this batch" }),
-		context: Type.Optional(
-			Type.String({
-				description:
-					"Shared background prepended to every task's assignment. Put goal, non-goals, constraints, conventions, reference paths, API contracts, and global acceptance commands here once — instead of duplicating across assignments.",
-			}),
-		),
-		schema: Type.Optional(
-			Type.Record(Type.String(), Type.Unknown(), {
-				description:
-					"JTD schema defining expected response structure. Use typed properties. Output format belongs here — never in context or assignment.",
-			}),
-		),
-		tasks: Type.Array(taskItemSchema, {
-			description:
-				"Tasks to execute in parallel. Each must be small-scoped (3-5 files max) and self-contained given context + assignment.",
-		}),
-	};
+export const taskSchema = type({
+	"name?": "string",
+	agent: "string = 'task'",
+	task: "string",
+	"outputSchema?": outputSchemaInputSchema,
+	"schemaMode?": '"permissive" | "strict"',
+	"tools?": "string[]",
+	"isolated?": "boolean",
+	"+": "delete",
+});
+const taskSchemaNoIsolation = type({
+	"name?": "string",
+	agent: "string = 'task'",
+	task: "string",
+	"outputSchema?": outputSchemaInputSchema,
+	"schemaMode?": '"permissive" | "strict"',
+	"tools?": "string[]",
+	"+": "delete",
+});
+const taskSchemaBatch = type({
+	context: "string",
+	tasks: taskItemSchemaIsolated.array(),
+	"+": "delete",
+});
+const taskSchemaBatchNoIsolation = type({
+	context: "string",
+	tasks: taskItemSchema.array(),
+	"+": "delete",
+});
+const ALL_TASK_SCHEMAS = [taskSchema, taskSchemaNoIsolation, taskSchemaBatch, taskSchemaBatchNoIsolation] as const;
 
-	if (options.isolationEnabled) {
-		return Type.Object({
-			...properties,
-			isolated: Type.Optional(
-				Type.Boolean({
-					description: "Run in isolated environment; returns patches. Use when tasks edit overlapping files.",
-				}),
-			),
+type DynamicTaskSchema = (typeof ALL_TASK_SCHEMAS)[number];
+export type TaskSchema = typeof taskSchema;
+/** Active task tool parameter schema for the current isolation / batch flags */
+export type TaskToolSchemaInstance = DynamicTaskSchema | BaseType;
+
+const TASK_AGENT_NAME_PATTERN = /^[A-Za-z0-9_-]+$/;
+const taskSchemaCache = new Map<string, BaseType>();
+
+function taskAgentSchemaRule(defaultAgent: string): string {
+	const trimmed = defaultAgent.trim();
+	if (TASK_AGENT_NAME_PATTERN.test(trimmed)) {
+		return `string = '${trimmed}'`;
+	}
+	return "string";
+}
+
+function createTaskSchema(options: {
+	isolationEnabled: boolean;
+	batchEnabled: boolean;
+	defaultAgent: string;
+	effortEnabled: boolean;
+	evalToolsEnabled: boolean;
+}): BaseType {
+	const agent = taskAgentSchemaRule(options.defaultAgent);
+	const effortField = options.effortEnabled ? { "effort?": effortRule } : {};
+	const toolsField = options.evalToolsEnabled ? { "tools?": "string[]" } : {};
+	if (options.batchEnabled) {
+		if (options.isolationEnabled) {
+			const item = type.raw({
+				"name?": "string",
+				agent,
+				task: "string",
+				...effortField,
+				"outputSchema?": outputSchemaInputSchema,
+				"schemaMode?": '"permissive" | "strict"',
+				...toolsField,
+				"isolated?": "boolean",
+				"+": "delete",
+			});
+			return type.raw({
+				context: "string",
+				tasks: item.array(),
+				"+": "delete",
+			});
+		}
+		const item = type.raw({
+			"name?": "string",
+			agent,
+			task: "string",
+			...effortField,
+			"outputSchema?": outputSchemaInputSchema,
+			"schemaMode?": '"permissive" | "strict"',
+			...toolsField,
+			"+": "delete",
+		});
+		return type.raw({
+			context: "string",
+			tasks: item.array(),
+			"+": "delete",
 		});
 	}
-
-	return Type.Object(properties);
-};
-
-export const taskSchema = createTaskSchema({ isolationEnabled: true });
-export const taskSchemaNoIsolation = createTaskSchema({ isolationEnabled: false });
-
-export type TaskSchema = typeof taskSchema | typeof taskSchemaNoIsolation;
-
-export type TaskParams = Static<TaskSchema>;
-
-/** A code review finding reported by the reviewer agent */
-export interface ReviewFinding {
-	title: string;
-	body: string;
-	priority: number;
-	confidence: number;
-	file_path: string;
-	line_start: number;
-	line_end: number;
+	if (options.isolationEnabled) {
+		return type.raw({
+			"name?": "string",
+			agent,
+			task: "string",
+			...effortField,
+			"outputSchema?": outputSchemaInputSchema,
+			"schemaMode?": '"permissive" | "strict"',
+			...toolsField,
+			"isolated?": "boolean",
+			"+": "delete",
+		});
+	}
+	return type.raw({
+		"name?": "string",
+		agent,
+		task: "string",
+		...effortField,
+		"outputSchema?": outputSchemaInputSchema,
+		"schemaMode?": '"permissive" | "strict"',
+		...toolsField,
+		"+": "delete",
+	});
 }
 
-/** Review summary submitted by the reviewer agent */
-export interface ReviewSummary {
-	overall_correctness: "correct" | "incorrect";
-	explanation: string;
-	confidence: number;
+/** Build the task wire schema for the current settings and spawn policy. */
+export function getTaskSchema(options: {
+	isolationEnabled: boolean;
+	batchEnabled: boolean;
+	effortEnabled?: boolean;
+	/** Advertise the `tools` field for eval-defined tools (`eval.tools.enabled`, default on). */
+	evalToolsEnabled?: boolean;
+	defaultAgent?: string;
+}): TaskToolSchemaInstance {
+	const defaultAgent = options.defaultAgent ?? "task";
+	const effortEnabled = options.effortEnabled ?? false;
+	const evalToolsEnabled = options.evalToolsEnabled ?? true;
+	if (defaultAgent === "task" && !effortEnabled && evalToolsEnabled) {
+		if (options.batchEnabled) return options.isolationEnabled ? taskSchemaBatch : taskSchemaBatchNoIsolation;
+		return options.isolationEnabled ? taskSchema : taskSchemaNoIsolation;
+	}
+	const key = `${options.isolationEnabled ? "iso" : "flat"}:${options.batchEnabled ? "batch" : "single"}:${effortEnabled ? "effort" : "default"}:${evalToolsEnabled ? "tools" : "notools"}:${defaultAgent}`;
+	const cached = taskSchemaCache.get(key);
+	if (cached) return cached;
+	const schema = createTaskSchema({ ...options, effortEnabled, evalToolsEnabled, defaultAgent });
+	taskSchemaCache.set(key, schema);
+	return schema;
 }
 
-/** Structured review data extracted from reviewer agent */
-export interface ReviewData {
-	findings: ReviewFinding[];
-	summary?: ReviewSummary;
+/**
+ * Whether an agent at `taskDepth` may still spawn children — i.e. it currently
+ * holds the `task` tool. Mirrors the task-tool availability gate;
+ * `maxRecursionDepth < 0` disables the cap entirely.
+ */
+export function canSpawnAtDepth(maxRecursionDepth: number, taskDepth: number): boolean {
+	return maxRecursionDepth < 0 || taskDepth < maxRecursionDepth;
 }
 
 /** Agent definition (bundled or discovered) */
@@ -121,82 +223,16 @@ export interface AgentDefinition {
 	tools?: string[];
 	spawns?: string[] | "*";
 	model?: string[];
-	thinkingLevel?: ThinkingLevel;
+	thinkingLevel?: ConfiguredThinkingLevel;
 	output?: unknown;
 	blocking?: boolean;
+	autoloadSkills?: string[];
+	/** When `false`, the agent's `read` tool returns verbatim file content instead of structural summaries. */
+	readSummarize?: boolean;
+	/** Prewalk hand-off for the spawned session: `true` = switch to the default prewalk target at the first edit/write, string = custom target model pattern. */
+	prewalk?: boolean | string;
+	/** Advisor for spawned sessions of this agent: `true` = advise with the default advisor-role model, string = advise with that model pattern (optional `:level` suffix). Absent/`false` = no advisor. */
+	advisor?: boolean | string;
 	source: AgentSource;
 	filePath?: string;
-}
-
-/** Progress tracking for a single agent */
-export interface AgentProgress {
-	index: number;
-	id: string;
-	agent: string;
-	agentSource: AgentSource;
-	status: "pending" | "running" | "completed" | "failed" | "aborted";
-	task: string;
-	description?: string;
-	lastIntent?: string;
-	currentTool?: string;
-	currentToolArgs?: string;
-	currentToolStartMs?: number;
-	recentTools: Array<{ tool: string; args: string; endMs: number }>;
-	recentOutput: string[];
-	toolCount: number;
-	tokens: number;
-	durationMs: number;
-	modelOverride?: string | string[];
-	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
-	extractedToolData?: Record<string, unknown[]>;
-}
-
-/** Result from a single agent execution */
-export interface SingleResult {
-	index: number;
-	id: string;
-	agent: string;
-	agentSource: AgentSource;
-	task: string;
-	description?: string;
-	lastIntent?: string;
-	exitCode: number;
-	output: string;
-	stderr: string;
-	truncated: boolean;
-	durationMs: number;
-	tokens: number;
-	modelOverride?: string | string[];
-	error?: string;
-	aborted?: boolean;
-	/** Aggregated usage from the subprocess, accumulated incrementally from message_end events. */
-	usage?: Usage;
-	/** Output path for the task result */
-	outputPath?: string;
-	/** Patch path for isolated worktree output */
-	patchPath?: string;
-	/** Branch name for isolated branch-mode output */
-	branchName?: string;
-	/** Nested repo patches to apply after parent merge */
-	nestedPatches?: NestedRepoPatch[];
-	/** Data extracted by registered subprocess tool handlers (keyed by tool name) */
-	extractedToolData?: Record<string, unknown[]>;
-	/** Output metadata for agent:// URL integration */
-	outputMeta?: { lineCount: number; charCount: number };
-}
-
-/** Tool details for TUI rendering */
-export interface TaskToolDetails {
-	projectAgentsDir: string | null;
-	results: SingleResult[];
-	totalDurationMs: number;
-	/** Aggregated usage across all subagents. */
-	usage?: Usage;
-	outputPaths?: string[];
-	progress?: AgentProgress[];
-	async?: {
-		state: "running" | "completed" | "failed";
-		jobId: string;
-		type: "task";
-	};
 }

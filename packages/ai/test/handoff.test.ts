@@ -1,13 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import { getBundledModel } from "@oh-my-pi/pi-ai/models";
+import { type } from "@oh-my-pi/omptype";
 import { complete } from "@oh-my-pi/pi-ai/stream";
 import type { Api, AssistantMessage, Context, Message, Model, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
-import { Type } from "@sinclair/typebox";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { e2eApiKey } from "./oauth";
 
 // Tool for testing
-const weatherSchema = Type.Object({
-	location: Type.String({ description: "City name" }),
+const weatherSchema = type({
+	location: type("string").describe("City name"),
 });
 
 const weatherTool: Tool<typeof weatherSchema> = {

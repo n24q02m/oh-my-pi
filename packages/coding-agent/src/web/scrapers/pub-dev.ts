@@ -109,7 +109,7 @@ export const handlePubDev: SpecialHandler = async (url: string, timeout: number,
 					md += "\n";
 				}
 				if (deps.length > 20) {
-					md += `\n*...and ${deps.length - 20} more*\n`;
+					md += `\n[…${deps.length - 20} dependencies elided…]\n`;
 				}
 				md += "\n";
 			}
@@ -125,7 +125,7 @@ export const handlePubDev: SpecialHandler = async (url: string, timeout: number,
 					/<div[^>]*class="[^"]*markdown-body[^"]*"[^>]*>([\s\S]*?)<\/div>/i,
 				);
 				if (readmeMatch) {
-					const readme = htmlToBasicMarkdown(readmeMatch[1]);
+					const readme = await htmlToBasicMarkdown(readmeMatch[1]);
 
 					if (readme.length > 100) {
 						md += `## README\n\n${readme}\n`;

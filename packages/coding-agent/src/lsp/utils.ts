@@ -1,8 +1,10 @@
 export { truncate } from "@oh-my-pi/pi-utils";
 
+import * as fs from "node:fs/promises";
 import path from "node:path";
 import { isEnoent } from "@oh-my-pi/pi-utils";
-import { type Theme, theme } from "../modes/theme/theme";
+import { type Theme, theme } from "@oh-my-pi/pi-tui/theme";
+import { formatPathRelativeToCwd, resolveToCwd } from "../tools/path-utils";
 import type {
 	CodeAction,
 	Command,
@@ -16,142 +18,7 @@ import type {
 	WorkspaceEdit,
 } from "./types";
 
-// =============================================================================
-// Language Detection
-// =============================================================================
-
-const LANGUAGE_MAP: Record<string, string> = {
-	// TypeScript/JavaScript
-	".ts": "typescript",
-	".tsx": "typescriptreact",
-	".js": "javascript",
-	".jsx": "javascriptreact",
-	".mjs": "javascript",
-	".cjs": "javascript",
-	".mts": "typescript",
-	".cts": "typescript",
-
-	// Systems languages
-	".rs": "rust",
-	".go": "go",
-	".c": "c",
-	".h": "c",
-	".cpp": "cpp",
-	".cc": "cpp",
-	".cxx": "cpp",
-	".hpp": "cpp",
-	".hxx": "cpp",
-	".zig": "zig",
-
-	// Scripting languages
-	".py": "python",
-	".rb": "ruby",
-	".lua": "lua",
-	".sh": "shellscript",
-	".bash": "shellscript",
-	".zsh": "shellscript",
-	".fish": "fish",
-	".pl": "perl",
-	".php": "php",
-
-	// JVM languages
-	".java": "java",
-	".kt": "kotlin",
-	".kts": "kotlin",
-	".scala": "scala",
-	".groovy": "groovy",
-	".clj": "clojure",
-
-	// .NET languages
-	".cs": "csharp",
-	".fs": "fsharp",
-	".vb": "vb",
-
-	// Web
-	".html": "html",
-	".htm": "html",
-	".css": "css",
-	".scss": "scss",
-	".sass": "sass",
-	".less": "less",
-	".vue": "vue",
-	".svelte": "svelte",
-
-	// Data formats
-	".json": "json",
-	".jsonc": "jsonc",
-	".yaml": "yaml",
-	".yml": "yaml",
-	".toml": "toml",
-	".xml": "xml",
-	".ini": "ini",
-
-	// Documentation
-	".md": "markdown",
-	".markdown": "markdown",
-	".rst": "restructuredtext",
-	".adoc": "asciidoc",
-	".tex": "latex",
-
-	// Other
-	".sql": "sql",
-	".graphql": "graphql",
-	".gql": "graphql",
-	".proto": "protobuf",
-	".dockerfile": "dockerfile",
-	".tf": "terraform",
-	".hcl": "hcl",
-	".nix": "nix",
-	".ex": "elixir",
-	".exs": "elixir",
-	".erl": "erlang",
-	".hrl": "erlang",
-	".hs": "haskell",
-	".ml": "ocaml",
-	".mli": "ocaml",
-	".swift": "swift",
-	".r": "r",
-	".R": "r",
-	".jl": "julia",
-	".dart": "dart",
-	".elm": "elm",
-	".v": "v",
-	".nim": "nim",
-	".cr": "crystal",
-	".d": "d",
-	".pas": "pascal",
-	".pp": "pascal",
-	".lisp": "lisp",
-	".lsp": "lisp",
-	".rkt": "racket",
-	".scm": "scheme",
-	".ps1": "powershell",
-	".psm1": "powershell",
-	".bat": "bat",
-	".cmd": "bat",
-};
-
-/**
- * Detect language ID from file path.
- * Returns the LSP language identifier for the file type.
- */
-export function detectLanguageId(filePath: string): string {
-	const ext = path.extname(filePath).toLowerCase();
-	const basename = path.basename(filePath).toLowerCase();
-
-	// Handle special filenames
-	if (basename === "dockerfile" || basename.startsWith("dockerfile.")) {
-		return "dockerfile";
-	}
-	if (basename === "makefile" || basename === "gnumakefile") {
-		return "makefile";
-	}
-	if (basename === "cmakelists.txt" || ext === ".cmake") {
-		return "cmake";
-	}
-
-	return LANGUAGE_MAP[ext] ?? "plaintext";
-}
+export { detectLanguageId } from "@oh-my-pi/pi-tui/lang-from-path";
 
 // =============================================================================
 // URI Handling (Cross-Platform)
@@ -159,22 +26,17 @@ export function detectLanguageId(filePath: string): string {
 
 /**
  * Convert a file path to a file:// URI.
+ * Uses the URL machinery so special characters (`%`, `#`, `?`, spaces) are
+ * percent-encoded; plain concatenation produced URIs that broke round-trips.
  * Handles Windows drive letters correctly.
  */
 export function fileToUri(filePath: string): string {
-	const resolved = path.resolve(filePath);
-
-	if (process.platform === "win32") {
-		// Windows: file:///C:/path/to/file
-		return `file:///${resolved.replace(/\\/g, "/")}`;
-	}
-
-	// Unix: file:///path/to/file
-	return `file://${resolved}`;
+	return Bun.pathToFileURL(path.resolve(filePath)).href;
 }
 
 /**
  * Convert a file:// URI to a file path.
+ * Tolerates both percent-encoded URIs and lax servers that send raw paths.
  * Handles Windows drive letters correctly.
  */
 export function uriToFile(uri: string): string {
@@ -182,7 +44,30 @@ export function uriToFile(uri: string): string {
 		return uri;
 	}
 
-	let filePath = decodeURIComponent(uri.slice(7));
+	// A raw `#`/`?` parses *successfully* as fragment/query and silently
+	// truncates the path — it never reaches the catch below. LSP servers do
+	// not use fragments or queries on file URIs (encoded forms are %23/%3F),
+	// so raw occurrences mean a lax server sent an unencoded path.
+	if (uri.includes("#") || uri.includes("?")) {
+		return laxUriToFile(uri);
+	}
+
+	try {
+		return Bun.fileURLToPath(uri);
+	} catch {
+		// Not a well-formed file URL (unencoded characters, stray `%`, host
+		// component). Fall back to a lenient manual conversion.
+		return laxUriToFile(uri);
+	}
+}
+
+function laxUriToFile(uri: string): string {
+	let filePath = uri.slice(7);
+	try {
+		filePath = decodeURIComponent(filePath);
+	} catch {
+		// Invalid percent-encoding — treat as a literal path.
+	}
 
 	// Windows: file:///C:/path → C:/path (strip leading slash before drive letter)
 	if (process.platform === "win32" && filePath.startsWith("/") && /^[A-Za-z]:/.test(filePath.slice(1))) {
@@ -190,6 +75,35 @@ export function uriToFile(uri: string): string {
 	}
 
 	return filePath;
+}
+
+/** Map that treats equivalent file URI spellings as the same key. */
+export class EquivalentUriMap<Value> extends Map<string, Value> {
+	#key(uri: string): string {
+		if (!uri.startsWith("file://")) return uri;
+		const filePath = path.normalize(uriToFile(uri));
+		return process.platform === "win32" ? filePath.toLowerCase() : filePath;
+	}
+
+	override delete(uri: string): boolean {
+		const key = this.#key(uri);
+		return super.delete(key);
+	}
+
+	override get(uri: string): Value | undefined {
+		const key = this.#key(uri);
+		return super.get(key);
+	}
+
+	override has(uri: string): boolean {
+		const key = this.#key(uri);
+		return super.has(key);
+	}
+
+	override set(uri: string, value: Value): this {
+		const key = this.#key(uri);
+		return super.set(key, value);
+	}
 }
 
 // =============================================================================
@@ -303,6 +217,27 @@ export function formatDiagnosticsSummary(diagnostics: Diagnostic[]): string {
 	return parts.length > 0 ? parts.join(", ") : "no issues";
 }
 
+export function summarizeDiagnosticMessages(messages: string[]): { summary: string; errored: boolean } {
+	const counts = { error: 0, warning: 0, info: 0, hint: 0 };
+	for (const message of messages) {
+		const match = message.match(/\[(error|warning|info|hint)\]/i);
+		if (!match) continue;
+		const key = match[1].toLowerCase() as keyof typeof counts;
+		counts[key] += 1;
+	}
+
+	const parts: string[] = [];
+	if (counts.error > 0) parts.push(`${counts.error} error(s)`);
+	if (counts.warning > 0) parts.push(`${counts.warning} warning(s)`);
+	if (counts.info > 0) parts.push(`${counts.info} info(s)`);
+	if (counts.hint > 0) parts.push(`${counts.hint} hint(s)`);
+
+	return {
+		summary: parts.length > 0 ? parts.join(", ") : "no issues",
+		errored: counts.error > 0,
+	};
+}
+
 // =============================================================================
 // Location Formatting
 // =============================================================================
@@ -311,7 +246,7 @@ export function formatDiagnosticsSummary(diagnostics: Diagnostic[]): string {
  * Format a location as file:line:col relative to cwd.
  */
 export function formatLocation(location: Location, cwd: string): string {
-	const file = path.relative(cwd, uriToFile(location.uri));
+	const file = formatPathRelativeToCwd(uriToFile(location.uri), cwd);
 	const line = location.range.start.line + 1;
 	const col = location.range.start.character + 1;
 	return `${file}:${line}:${col}`;
@@ -337,7 +272,7 @@ export function formatWorkspaceEdit(edit: WorkspaceEdit, cwd: string): string[] 
 	// Handle changes map (legacy format)
 	if (edit.changes) {
 		for (const [uri, textEdits] of Object.entries(edit.changes)) {
-			const file = path.relative(cwd, uriToFile(uri));
+			const file = formatPathRelativeToCwd(uriToFile(uri), cwd);
 			results.push(`${file}: ${textEdits.length} edit${textEdits.length > 1 ? "s" : ""}`);
 		}
 	}
@@ -346,20 +281,20 @@ export function formatWorkspaceEdit(edit: WorkspaceEdit, cwd: string): string[] 
 	if (edit.documentChanges) {
 		for (const change of edit.documentChanges) {
 			if ("edits" in change && change.textDocument) {
-				const file = path.relative(cwd, uriToFile(change.textDocument.uri));
+				const file = formatPathRelativeToCwd(uriToFile(change.textDocument.uri), cwd);
 				results.push(`${file}: ${change.edits.length} edit${change.edits.length > 1 ? "s" : ""}`);
 			} else if ("kind" in change) {
 				switch (change.kind) {
 					case "create":
-						results.push(`CREATE: ${path.relative(cwd, uriToFile(change.uri))}`);
+						results.push(`CREATE: ${formatPathRelativeToCwd(uriToFile(change.uri), cwd)}`);
 						break;
 					case "rename":
 						results.push(
-							`RENAME: ${path.relative(cwd, uriToFile(change.oldUri))} ${theme.nav.cursor} ${path.relative(cwd, uriToFile(change.newUri))}`,
+							`RENAME: ${formatPathRelativeToCwd(uriToFile(change.oldUri), cwd)} ${theme.nav.cursor} ${formatPathRelativeToCwd(uriToFile(change.newUri), cwd)}`,
 						);
 						break;
 					case "delete":
-						results.push(`DELETE: ${path.relative(cwd, uriToFile(change.uri))}`);
+						results.push(`DELETE: ${formatPathRelativeToCwd(uriToFile(change.uri), cwd)}`);
 						break;
 				}
 			}
@@ -604,6 +539,30 @@ export async function collectGlobMatches(
 	}
 	return { matches, truncated: false };
 }
+
+export async function resolveDiagnosticTargets(
+	file: string,
+	cwd: string,
+	maxMatches: number,
+): Promise<{ matches: string[]; truncated: boolean }> {
+	if (!hasGlobPattern(file)) {
+		return { matches: [file], truncated: false };
+	}
+
+	const resolved = resolveToCwd(file, cwd);
+	try {
+		const stat = await fs.stat(resolved);
+		if (stat.isFile()) {
+			return { matches: [file], truncated: false };
+		}
+	} catch (error) {
+		if (!isEnoent(error)) {
+			throw error;
+		}
+	}
+
+	return collectGlobMatches(file, cwd, maxMatches);
+}
 // =============================================================================
 // Hover Content Extraction
 // =============================================================================
@@ -639,53 +598,70 @@ function firstNonWhitespaceColumn(lineText: string): number {
 	return match ? (match.index ?? 0) : 0;
 }
 
+const BARE_IDENTIFIER_RE = /^[$A-Za-z_][\w$]*$/;
+const IDENTIFIER_CHAR_RE = /[A-Za-z0-9_$]/;
+
 function findSymbolMatchIndexes(lineText: string, symbol: string, caseInsensitive = false): number[] {
 	if (symbol.length === 0) return [];
 	const haystack = caseInsensitive ? lineText.toLowerCase() : lineText;
 	const needle = caseInsensitive ? symbol.toLowerCase() : symbol;
+	const requireWordBoundary = BARE_IDENTIFIER_RE.test(symbol);
 	const indexes: number[] = [];
 	let fromIndex = 0;
 	while (fromIndex <= haystack.length - needle.length) {
 		const matchIndex = haystack.indexOf(needle, fromIndex);
 		if (matchIndex === -1) break;
+		if (requireWordBoundary) {
+			const before = matchIndex > 0 ? haystack[matchIndex - 1] : "";
+			const afterIdx = matchIndex + needle.length;
+			const after = afterIdx < haystack.length ? haystack[afterIdx] : "";
+			if (IDENTIFIER_CHAR_RE.test(before) || IDENTIFIER_CHAR_RE.test(after)) {
+				fromIndex = matchIndex + 1;
+				continue;
+			}
+		}
 		indexes.push(matchIndex);
 		fromIndex = matchIndex + needle.length;
 	}
 	return indexes;
 }
 
-function normalizeOccurrence(occurrence?: number): number {
-	if (occurrence === undefined || !Number.isFinite(occurrence)) return 1;
-	return Math.max(1, Math.trunc(occurrence));
+/**
+ * Parses a symbol spec of the form `name` or `name#N` where N is the 1-indexed
+ * occurrence on the target line. Returns `name` and `occurrence` (default 1).
+ *
+ * Greedy match on `.+` so `#name#2` parses as symbol=`#name` (TS private field)
+ * with occurrence 2. Specs without a trailing `#\d+` are treated as literal.
+ */
+function parseSymbolSpec(spec: string): { symbol: string; occurrence: number } {
+	const match = spec.match(/^(.+)#(\d+)$/);
+	if (!match) return { symbol: spec, occurrence: 1 };
+	const occurrence = Math.max(1, Number.parseInt(match[2], 10));
+	return { symbol: match[1], occurrence };
 }
 
-export async function resolveSymbolColumn(
-	filePath: string,
-	line: number,
-	symbol?: string,
-	occurrence?: number,
-): Promise<number> {
+export async function resolveSymbolColumn(filePath: string, line: number, symbolSpec?: string): Promise<number> {
 	const lineNumber = Math.max(1, line);
-	const matchOccurrence = normalizeOccurrence(occurrence);
 	try {
 		const fileText = await Bun.file(filePath).text();
 		const lines = fileText.split("\n");
 		const targetLine = lines[lineNumber - 1] ?? "";
-		if (!symbol) {
+		if (!symbolSpec) {
 			return firstNonWhitespaceColumn(targetLine);
 		}
 
+		const { symbol, occurrence } = parseSymbolSpec(symbolSpec);
 		const exactIndexes = findSymbolMatchIndexes(targetLine, symbol);
 		const fallbackIndexes = exactIndexes.length > 0 ? exactIndexes : findSymbolMatchIndexes(targetLine, symbol, true);
 		if (fallbackIndexes.length === 0) {
 			throw new Error(`Symbol "${symbol}" not found on line ${lineNumber}`);
 		}
-		if (matchOccurrence > fallbackIndexes.length) {
+		if (occurrence > fallbackIndexes.length) {
 			throw new Error(
-				`Symbol "${symbol}" occurrence ${matchOccurrence} is out of bounds on line ${lineNumber} (found ${fallbackIndexes.length})`,
+				`Symbol "${symbol}" occurrence ${occurrence} is out of bounds on line ${lineNumber} (found ${fallbackIndexes.length})`,
 			);
 		}
-		return fallbackIndexes[matchOccurrence - 1];
+		return fallbackIndexes[occurrence - 1];
 	} catch (error) {
 		if (isEnoent(error)) {
 			throw new Error(`File not found: ${filePath}`);

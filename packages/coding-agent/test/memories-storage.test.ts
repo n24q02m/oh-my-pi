@@ -1,7 +1,10 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import * as fs from "node:fs";
-import * as os from "node:os";
+import { afterEach, beforeEach, describe, expect, test, vi } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
+import * as ai from "@oh-my-pi/pi-ai";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { startMemoryStartupTask } from "@oh-my-pi/pi-coding-agent/memories";
 import {
 	claimStage1Jobs,
 	clearMemoryData,
@@ -13,25 +16,62 @@ import {
 	tryClaimGlobalPhase2Job,
 	upsertThreads,
 } from "@oh-my-pi/pi-coding-agent/memories/storage";
-import { Snowflake } from "@oh-my-pi/pi-utils";
+import { getAgentDbPath, TempDir } from "@oh-my-pi/pi-utils";
 
 const GLOBAL_KIND = "memory_consolidate_global";
-const GLOBAL_KEY = "global";
+const PROJECT_CWD = "/repo";
+const GLOBAL_KEY = `global:${PROJECT_CWD}`;
 
+function deferred(): { promise: Promise<void>; resolve: () => void } {
+	let resolve!: () => void;
+	const promise = new Promise<void>(res => {
+		resolve = res;
+	});
+	return { promise, resolve };
+}
+
+function createMemoryTestModel(): Model {
+	return {
+		provider: "openai",
+		id: "test-model",
+		name: "test-model",
+		contextWindow: 32_000,
+	} as Model;
+}
+
+function assistantText(text: string): AssistantMessage {
+	const message: AssistantMessage = {
+		role: "assistant",
+		content: [{ type: "text", text }],
+		api: "openai-responses",
+		provider: "openai",
+		model: "test-model",
+		usage: {
+			input: 1,
+			output: 1,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: 2,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		},
+		stopReason: "stop",
+		timestamp: Date.now(),
+	};
+	return message;
+}
 describe("memories/storage", () => {
-	let testDir: string;
+	let tempDir: TempDir;
 	let dbPath: string;
 
 	beforeEach(() => {
-		testDir = path.join(os.tmpdir(), "test-memories-storage", Snowflake.next());
-		fs.mkdirSync(testDir, { recursive: true });
-		dbPath = path.join(testDir, "state.db");
+		tempDir = TempDir.createSync("@test-memories-storage-");
+		dbPath = tempDir.join("state.db");
 	});
 
-	afterEach(() => {
-		if (fs.existsSync(testDir)) {
-			fs.rmSync(testDir, { recursive: true, force: true });
-		}
+	afterEach(async () => {
+		await Bun.sleep(0);
+		vi.restoreAllMocks();
+		await tempDir.remove().catch(() => {});
 	});
 
 	test("claimStage1Jobs excludes explicitly blocked thread IDs", () => {
@@ -73,12 +113,13 @@ describe("memories/storage", () => {
 	test("markGlobalPhase2FailedUnowned recovers lost ownership", () => {
 		const db = openMemoryDb(dbPath);
 		const nowSec = 1_800_000_000;
-		enqueueGlobalWatermark(db, 100, { forceDirtyWhenNotAdvanced: true });
+		enqueueGlobalWatermark(db, 100, PROJECT_CWD, { forceDirtyWhenNotAdvanced: true });
 
 		const claim = tryClaimGlobalPhase2Job(db, {
 			workerId: "test-worker",
 			leaseSeconds: 60,
 			nowSec,
+			cwd: PROJECT_CWD,
 		});
 		expect(claim.kind).toBe("claimed");
 		if (claim.kind !== "claimed") {
@@ -97,6 +138,7 @@ describe("memories/storage", () => {
 			retryDelaySeconds: 120,
 			reason: "strict-fail",
 			nowSec,
+			cwd: PROJECT_CWD,
 		});
 		expect(strict).toBe(false);
 
@@ -104,6 +146,7 @@ describe("memories/storage", () => {
 			retryDelaySeconds: 120,
 			reason: "fallback-fail",
 			nowSec,
+			cwd: PROJECT_CWD,
 		});
 		expect(fallback).toBe(true);
 
@@ -117,12 +160,12 @@ describe("memories/storage", () => {
 
 	test("enqueueGlobalWatermark force-dirties when watermark does not advance", () => {
 		const db = openMemoryDb(dbPath);
-		enqueueGlobalWatermark(db, 100, { forceDirtyWhenNotAdvanced: true });
+		enqueueGlobalWatermark(db, 100, PROJECT_CWD, { forceDirtyWhenNotAdvanced: true });
 		db.prepare(
 			"UPDATE jobs SET status = 'done', input_watermark = 100, last_success_watermark = 100, retry_remaining = 0, retry_at = 999 WHERE kind = ? AND job_key = ?",
 		).run(GLOBAL_KIND, GLOBAL_KEY);
 
-		enqueueGlobalWatermark(db, 80, { forceDirtyWhenNotAdvanced: true });
+		enqueueGlobalWatermark(db, 80, PROJECT_CWD, { forceDirtyWhenNotAdvanced: true });
 		const row = db
 			.prepare(
 				"SELECT input_watermark, last_success_watermark, retry_remaining, retry_at FROM jobs WHERE kind = ? AND job_key = ?",
@@ -139,6 +182,80 @@ describe("memories/storage", () => {
 		closeMemoryDb(db);
 	});
 
+	test("startup memory scan reads cwd/id from the session header after a title slot", async () => {
+		const agentDir = tempDir.join("agent");
+		const sessionDir = path.join(agentDir, "sessions");
+		await fs.mkdir(sessionDir, { recursive: true });
+		const currentSessionFile = path.join(sessionDir, "current-file.jsonl");
+		const rolloutFile = path.join(sessionDir, "rollout-file.jsonl");
+		await Bun.write(
+			currentSessionFile,
+			[
+				JSON.stringify({ type: "title", v: 1, title: "Current", updatedAt: "2026-06-27T00:00:00.000Z" }),
+				JSON.stringify({ type: "session", id: "current-thread", cwd: PROJECT_CWD }),
+				"",
+			].join("\n"),
+		);
+		await Bun.write(
+			rolloutFile,
+			[
+				JSON.stringify({ type: "title", v: 1, title: "Rollout", updatedAt: "2026-06-27T00:00:00.000Z" }),
+				JSON.stringify({ type: "session", id: "rollout-header-id", cwd: PROJECT_CWD }),
+				JSON.stringify({ type: "message", message: { role: "user", content: "remember this rollout" } }),
+				"",
+			].join("\n"),
+		);
+
+		const model = createMemoryTestModel();
+		const settings = Settings.isolated({
+			"memories.enabled": true,
+			"memories.minRolloutIdleHours": 0,
+			"memories.maxRolloutsPerStartup": 16,
+			"memories.threadScanLimit": 64,
+			"memories.phase2HeartbeatSeconds": 1,
+		});
+		const settled = deferred();
+		const session = {
+			sessionManager: {
+				getSessionFile: () => currentSessionFile,
+				getSessionDir: () => sessionDir,
+				getSessionId: () => "current-thread",
+				getCwd: () => PROJECT_CWD,
+			},
+			settings,
+			model,
+			refreshBaseSystemPrompt: async () => settled.resolve(),
+		} as unknown as Parameters<typeof startMemoryStartupTask>[0]["session"];
+		const modelRegistry = {
+			find: () => model,
+			getAll: () => [model],
+			getApiKey: async () => "test-api-key",
+			resolver: () => async () => "test-api-key",
+		} as unknown as Parameters<typeof startMemoryStartupTask>[0]["modelRegistry"];
+		let completionCount = 0;
+		const completeSpy = vi.spyOn(ai, "completeSimple").mockImplementation(async () => {
+			completionCount += 1;
+			return assistantText(
+				completionCount === 1
+					? JSON.stringify({
+							rollout_summary: "Rollout summary",
+							rollout_slug: "slot-rollout",
+							raw_memory: "Raw memory",
+						})
+					: JSON.stringify({ memory_md: "# Memory\n\nBody", memory_summary: "Summary", skills: [] }),
+			);
+		});
+
+		startMemoryStartupTask({ session, settings, modelRegistry, agentDir, taskDepth: 0 });
+
+		await settled.promise;
+		expect(completeSpy).toHaveBeenCalledTimes(2);
+		const db = openMemoryDb(getAgentDbPath(agentDir));
+		const rows = db.prepare("SELECT id, cwd FROM threads ORDER BY id").all() as Array<{ id: string; cwd: string }>;
+		closeMemoryDb(db);
+		expect(rows).toEqual([{ id: "rollout-header-id", cwd: PROJECT_CWD }]);
+	});
+
 	test("clearMemoryData removes thread/output/job state", () => {
 		const db = openMemoryDb(dbPath);
 		upsertThreads(db, [
@@ -153,7 +270,7 @@ describe("memories/storage", () => {
 		db.prepare(
 			"INSERT INTO stage1_outputs (thread_id, source_updated_at, raw_memory, rollout_summary, rollout_slug, generated_at) VALUES (?, ?, ?, ?, ?, ?)",
 		).run("thread-a", 100, "raw", "summary", null, 100);
-		enqueueGlobalWatermark(db, 100, { forceDirtyWhenNotAdvanced: true });
+		enqueueGlobalWatermark(db, 100, PROJECT_CWD, { forceDirtyWhenNotAdvanced: true });
 		db.prepare(
 			"INSERT INTO jobs (kind, job_key, status, retry_remaining, input_watermark, last_success_watermark) VALUES (?, ?, ?, ?, ?, ?)",
 		).run("some_other_job", "x", "pending", 1, 0, 0);

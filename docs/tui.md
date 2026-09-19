@@ -11,11 +11,11 @@ The runtime has two layers:
 
 ## Runtime behavior by mode
 
-| Mode | `ctx.ui.custom(...)` availability | Notes |
-| --- | --- | --- |
-| Interactive TUI | Supported | Component is mounted in the editor area, focused, and must call `done(result)` to resolve. |
-| Background/headless | Not interactive | UI context is no-op (`hasUI === false`). |
-| RPC mode | Not supported | `custom()` returns `Promise<never>` and does not mount TUI components. |
+| Mode                | `ctx.ui.custom(...)` availability | Notes                                                                                                                          |
+| ------------------- | --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Interactive TUI     | Supported                         | Component is mounted in the editor area or overlay, focused, and must call `done(result)` to resolve.                          |
+| Background/headless | Not interactive                   | UI context is no-op (`hasUI === false`).                                                                                       |
+| RPC mode            | Not mounted                       | `custom()` is implemented as unsupported UI and returns `undefined as never`; do not depend on interactive UI in RPC handlers. |
 
 If your extension/tool can run in non-interactive mode, guard with `ctx.hasUI` / `pi.hasUI`.
 
@@ -25,18 +25,23 @@ If your extension/tool can run in non-interactive mode, guard with `ctx.hasUI` /
 
 ```ts
 export interface Component {
-  render(width: number): string[];
+  render(width: number): readonly string[];
   handleInput?(data: string): void;
   wantsKeyRelease?: boolean;
-  invalidate(): void;
+  invalidate?(): void;
+  setIgnoreTight?(ignore: boolean): any;
+  dispose?(): void;
 }
 ```
+
+Render results are component-owned and immutable to callers. An unchanged component may (and should) return the **same array reference** it returned last time; it must return a new array whenever content changes. Reference equality enables container memoization and stable-prefix work avoidance. A component that mutates a previously returned array in place must also implement `RenderStablePrefix` and report how many leading rows survived unchanged.
 
 `Focusable` is separate:
 
 ```ts
 export interface Focusable {
   focused: boolean;
+  setUseTerminalCursor?(useTerminalCursor: boolean): void;
 }
 ```
 
@@ -46,7 +51,7 @@ Cursor behavior uses `CURSOR_MARKER` (not `getCursorPosition`). Focused componen
 
 Your `render(width)` output must be terminal-safe:
 
-1. **Never exceed `width` on any line**. The renderer throws if a non-image line overflows.
+1. **Do not intentionally exceed `width` on any line**. The renderer truncates overwide non-image lines as a last-resort guard, but components should still return width-safe output.
 2. **Measure visual width**, not string length: use `visibleWidth()`.
 3. **Truncate/wrap ANSI-aware text** with `truncateToWidth()` / `wrapTextWithAnsi()`.
 4. **Sanitize tabs/content** from external sources using `replaceTabs()` (and higher-level sanitizers in coding-agent render paths).
@@ -56,7 +61,7 @@ Minimal pattern:
 ```ts
 import { replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui";
 
-render(width: number): string[] {
+render(width: number): readonly string[] {
   return this.lines.map(line => truncateToWidth(replaceTabs(line), width));
 }
 ```
@@ -67,12 +72,12 @@ render(width: number): string[] {
 
 Use `matchesKey(data, "...")` for navigation keys and combos.
 
-### Respect user-configured app keybindings
+### Match app keybinding actions
 
-Extension UI factories receive a `KeybindingsManager` (interactive mode) so you can honor mapped actions instead of hardcoding keys:
+Extension UI factories receive a `KeybindingsManager` (interactive mode; an in-memory instance carrying the default bindings, not the user's `keybindings.yml`) so you can match action ids instead of hardcoding keys:
 
 ```ts
-if (keybindings.matches(data, "interrupt")) {
+if (keybindings.matches(data, "app.interrupt")) {
   done(undefined);
   return;
 }
@@ -91,8 +96,12 @@ Then use `isKeyRelease()` / `isKeyRepeat()` if needed.
 ## Focus, overlays, and cursor
 
 - `TUI.setFocus(component)` routes input to that component.
-- Overlay APIs exist in `TUI` (`showOverlay`, `OverlayHandle`), but extension `ctx.ui.custom` mounting in interactive mode currently replaces the editor component area directly.
-- The `custom(..., options?: { overlay?: boolean })` option exists in extension types; interactive extension mounting currently ignores this option.
+- Overlay APIs exist in `TUI` (`showOverlay`, `OverlayHandle`). In interactive extension/custom UI, `custom(..., { overlay: true })` mounts your component through `TUI.showOverlay(...)`; without `overlay`, it replaces the editor component area directly.
+- Overlay custom UI is anchored at `bottom-center` with full terminal width/max height and is removed through the returned overlay handle when `done(...)` closes the flow.
+
+### Built-in full-screen surfaces
+
+The coding-agent integration also mounts built-in full-screen surfaces outside `ctx.ui.custom(...)`. [Agent Hub](./agent-hub.md) is the live roster and control surface for subagents. Its file-backed transcript viewer borrows the alternate screen while it is open, then restores the Hub beneath it on close.
 
 ## Mount points and return contracts
 
@@ -115,40 +124,37 @@ custom<T>(
 Behavior in interactive mode (`extension-ui-controller.ts`):
 
 - Saves editor text.
-- Replaces editor component with your component.
+- Without `options.overlay`, replaces the editor component with your component.
+- With `options.overlay`, mounts your component as a bottom-centered overlay instead of replacing the editor.
 - Focuses your component.
-- On `done(result)`: calls `component.dispose?.()`, restores editor + text, focuses editor, resolves promise.
+- On `done(result)`: calls `component.dispose?.()`, hides the overlay if present, restores editor + text for non-overlay flows, focuses editor, resolves promise.
+  So `done(...)` is mandatory for completion.
 
-So `done(...)` is mandatory for completion.
+## 2) Hook/custom-tool UI context (`HookUIContext`)
 
-## 2) Hook/custom-tool UI context (legacy typing)
-
-`HookUIContext.custom` is typed as `(tui, theme, done)` in hook/custom-tool types.
-Underlying interactive implementation calls factories with `(tui, theme, keybindings, done)`. JS consumers can use the extra arg; type-level compatibility still reflects the 3-arg legacy signature.
-
-Custom tools typically use the same UI entrypoint via the factory-scoped `pi.ui` object, then return the selected value in normal tool content:
+Current signature (`extensibility/hooks/types.ts`) matches the interactive
+controller and `ExtensionUIContext.custom`:
 
 ```ts
-async execute(toolCallId, params, onUpdate, ctx, signal) {
-  if (!pi.hasUI) {
-    return { content: [{ type: "text", text: "UI unavailable" }] };
-  }
-
-  const picked = await pi.ui.custom<string | undefined>((tui, theme, done) => {
-    const component = new MyPickerComponent(done, signal);
-    return component;
-  });
-
-  return { content: [{ type: "text", text: picked ? `Picked: ${picked}` : "Cancelled" }] };
-}
+custom<T>(
+  factory: (
+    tui: TUI,
+    theme: Theme,
+    keybindings: KeybindingsManager,
+    done: (result: T) => void,
+  ) => (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>,
+): Promise<T>
 ```
 
+Use the fourth argument as `done`. The third argument is a `KeybindingsManager`
+(interactive mode uses an in-memory instance with the default bindings). Guard
+terminal-only UI with `pi.hasUI` when the hook may also run headless.
 
 ## 3) Custom tool call/result renderers
 
 Custom tools and extension tools can return components from:
 
-- `renderCall(args, theme)`
+- `renderCall(args, options, theme)`
 - `renderResult(result, options, theme, args?)`
 
 `options` currently includes:
@@ -161,16 +167,21 @@ These renderers are mounted by `ToolExecutionComponent`.
 
 ## Lifecycle and cancellation
 
-- `dispose()` is optional at type level but should be implemented when you own timers, subprocesses, watchers, sockets, or overlays.
+- `dispose()` is optional at type level but should be implemented when you own timers, subprocesses, watchers, sockets, or overlays. It must be idempotent: containers propagate disposal, and reset/removal paths may converge.
 - `done(...)` should be called exactly once from your component flow.
 - For cancellable long-running UI, pair `CancellableLoader` with `AbortSignal` and call `done(...)` from `onAbort`.
 
 Example cancellation pattern:
 
 ```ts
-const loader = new CancellableLoader(tui, theme.fg("accent"), theme.fg("muted"), "Working...");
+const loader = new CancellableLoader(
+  tui,
+  theme.fg("accent"),
+  theme.fg("muted"),
+  "Working...",
+);
 loader.onAbort = () => done(undefined);
-void doWork(loader.signal).then(result => done(result));
+void doWork(loader.signal).then((result) => done(result));
 return loader;
 ```
 
@@ -178,8 +189,16 @@ return loader;
 
 ```ts
 import type { Component } from "@oh-my-pi/pi-tui";
-import { SelectList, matchesKey, replaceTabs, truncateToWidth } from "@oh-my-pi/pi-tui";
-import { getSelectListTheme, type ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import {
+  SelectList,
+  matchesKey,
+  replaceTabs,
+  truncateToWidth,
+} from "@oh-my-pi/pi-tui";
+import {
+  getSelectListTheme,
+  type ExtensionAPI,
+} from "@oh-my-pi/pi-coding-agent";
 
 class Picker implements Component {
   list: SelectList;
@@ -194,20 +213,22 @@ class Picker implements Component {
     this.list = new SelectList(items, 8, getSelectListTheme());
     this.keybindings = keybindings;
     this.done = done;
-    this.list.onSelect = item => this.done(item.value);
+    this.list.onSelect = (item) => this.done(item.value);
     this.list.onCancel = () => this.done(undefined);
   }
 
   handleInput(data: string): void {
-    if (this.keybindings.matches(data, "interrupt")) {
+    if (this.keybindings.matches(data, "app.interrupt")) {
       this.done(undefined);
       return;
     }
     this.list.handleInput(data);
   }
 
-  render(width: number): string[] {
-    return this.list.render(width).map(line => truncateToWidth(replaceTabs(line), width));
+  render(width: number): readonly string[] {
+    return this.list
+      .render(width)
+      .map((line) => truncateToWidth(replaceTabs(line), width));
   }
 
   invalidate(): void {
@@ -221,14 +242,16 @@ export default function extension(pi: ExtensionAPI): void {
     handler: async (_args, ctx) => {
       if (!ctx.hasUI) return;
 
-      const selected = await ctx.ui.custom<string | undefined>((tui, theme, keybindings, done) => {
-        const items = [
-          { value: "fast", label: theme.fg("accent", "Fast") },
-          { value: "balanced", label: "Balanced" },
-          { value: "quality", label: "Quality" },
-        ];
-        return new Picker(items, keybindings, done);
-      });
+      const selected = await ctx.ui.custom<string | undefined>(
+        (tui, theme, keybindings, done) => {
+          const items = [
+            { value: "fast", label: theme.fg("accent", "Fast") },
+            { value: "balanced", label: "Balanced" },
+            { value: "quality", label: "Quality" },
+          ];
+          return new Picker(items, keybindings, done);
+        },
+      );
 
       if (selected) ctx.ui.notify(`Selected profile: ${selected}`, "info");
     },
@@ -245,5 +268,5 @@ export default function extension(pi: ExtensionAPI): void {
 - `packages/coding-agent/src/extensibility/extensions/types.ts` — extension UI and renderer contracts.
 - `packages/coding-agent/src/extensibility/hooks/types.ts` — hook UI contract (legacy custom signature).
 - `packages/coding-agent/src/extensibility/custom-tools/types.ts` — custom tool execute/render contracts.
-- `packages/coding-agent/src/modes/components/tool-execution.ts` — mounting `renderCall`/`renderResult` components and partial-state options.
+- `packages/tui/src/chat/tool-execution.ts` — mounting `renderCall`/`renderResult` components and partial-state options.
 - `packages/coding-agent/src/tools/context.ts` — tool UI context propagation (`hasUI`, `ui`).

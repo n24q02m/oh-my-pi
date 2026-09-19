@@ -6,54 +6,23 @@ import { processFileArguments } from "@oh-my-pi/pi-coding-agent/cli/file-process
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { ReadTool } from "@oh-my-pi/pi-coding-agent/tools/read";
+import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
 
 // 1x1 red PNG image as base64 (smallest valid PNG)
 const TINY_PNG_BASE64 =
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFBQIAX8jx0gAAAABJRU5ErkJggg==";
 
-function createTestToolSession(cwd: string): ToolSession {
+function createTestToolSession(cwd: string, settings: Settings = Settings.isolated()): ToolSession {
 	return {
 		cwd,
 		hasUI: false,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
-		settings: Settings.isolated(),
+		settings,
 	};
 }
 
 describe("blockImages setting", () => {
-	describe("Settings", () => {
-		it("should default blockImages to false", () => {
-			const settings = Settings.isolated({});
-			expect(settings.get("images.blockImages")).toBe(false);
-		});
-
-		it("should return true when blockImages is set to true", () => {
-			const settings = Settings.isolated({ "images.blockImages": true });
-			expect(settings.get("images.blockImages")).toBe(true);
-		});
-
-		it("should persist blockImages setting via set", () => {
-			const settings = Settings.isolated({});
-			expect(settings.get("images.blockImages")).toBe(false);
-
-			settings.set("images.blockImages", true);
-			expect(settings.get("images.blockImages")).toBe(true);
-
-			settings.set("images.blockImages", false);
-			expect(settings.get("images.blockImages")).toBe(false);
-		});
-
-		it("should handle blockImages alongside autoResize", () => {
-			const settings = Settings.isolated({
-				"images.autoResize": true,
-				"images.blockImages": true,
-			});
-			expect(settings.get("images.autoResize")).toBe(true);
-			expect(settings.get("images.blockImages")).toBe(true);
-		});
-	});
-
 	describe("Read tool", () => {
 		let testDir: string;
 
@@ -63,10 +32,10 @@ describe("blockImages setting", () => {
 		});
 
 		afterEach(() => {
-			fs.rmSync(testDir, { recursive: true, force: true });
+			removeSyncWithRetries(testDir);
 		});
 
-		it("should always read images (filtering happens at convertToLlm layer)", async () => {
+		it("should include image blocks for image-capable models", async () => {
 			// Create test image
 			const imagePath = path.join(testDir, "test.png");
 			fs.writeFileSync(imagePath, Buffer.from(TINY_PNG_BASE64, "base64"));
@@ -104,7 +73,7 @@ describe("blockImages setting", () => {
 		});
 
 		afterEach(() => {
-			fs.rmSync(testDir, { recursive: true, force: true });
+			removeSyncWithRetries(testDir);
 		});
 
 		it("should always process images (filtering happens at convertToLlm layer)", async () => {

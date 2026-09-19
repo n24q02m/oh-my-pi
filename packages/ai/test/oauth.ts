@@ -7,15 +7,16 @@
  * E2E tests are disabled by default. Set E2E=1 environment variable to enable.
  */
 import * as fs from "node:fs/promises";
-import { getOAuthApiKey } from "@oh-my-pi/pi-ai/utils/oauth";
-import type { OAuthCredentials, OAuthProvider } from "@oh-my-pi/pi-ai/utils/oauth/types";
-import { getTestAuthPath, isEnoent } from "@oh-my-pi/pi-utils";
+import path from "node:path";
+import { getOAuthApiKey } from "@oh-my-pi/pi-ai/oauth";
+import type { OAuthCredentials, OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
+import { $flag, getAgentDir, isEnoent } from "@oh-my-pi/pi-utils";
 
 /**
  * E2E tests require explicit opt-in via E2E=1 environment variable.
  * This prevents accidental API calls when keys happen to be in the environment.
  */
-export const E2E_ENABLED = Bun.env.E2E === "1" || Bun.env.E2E === "true";
+const E2E_ENABLED = $flag("E2E");
 
 /**
  * Get an API key from environment, but only if E2E tests are enabled.
@@ -26,7 +27,7 @@ export function e2eApiKey(envVar: string): string | undefined {
 	return Bun.env[envVar];
 }
 
-const AUTH_PATH = getTestAuthPath();
+const AUTH_PATH = path.join(getAgentDir(), "testauth.db");
 
 type ApiKeyCredential = {
 	type: "api_key";

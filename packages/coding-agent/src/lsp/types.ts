@@ -1,48 +1,25 @@
-import { StringEnum } from "@oh-my-pi/pi-ai";
-import type { ptree } from "@oh-my-pi/pi-utils";
-import { type Static, Type } from "@sinclair/typebox";
+import { type } from "@oh-my-pi/omptype";
+import { TOOL_TIMEOUTS } from "../tools/tool-timeouts";
 
 // =============================================================================
 // Tool Schema
 // =============================================================================
 
-export const lspSchema = Type.Object({
-	action: StringEnum(
-		[
-			"diagnostics",
-			"definition",
-			"references",
-			"hover",
-			"symbols",
-			"rename",
-			"code_actions",
-			"type_definition",
-			"implementation",
-			"status",
-			"reload",
-		],
-		{ description: "LSP operation" },
-	),
-	file: Type.Optional(Type.String({ description: "File path" })),
-	line: Type.Optional(Type.Number({ description: "Line number (1-indexed)" })),
-	symbol: Type.Optional(
-		Type.String({ description: "Symbol/substring to locate on the line (used to compute column)" }),
-	),
-	occurrence: Type.Optional(Type.Number({ description: "Symbol occurrence on line (1-indexed, default: 1)" })),
-	query: Type.Optional(Type.String({ description: "Search query or SSR pattern" })),
-	new_name: Type.Optional(Type.String({ description: "New name for rename" })),
-	apply: Type.Optional(Type.Boolean({ description: "Apply edits (default: true)" })),
-	timeout: Type.Optional(Type.Number({ description: "Request timeout in seconds" })),
+export const lspSchema = type({
+	action:
+		"'diagnostics' | 'definition' | 'references' | 'hover' | 'symbols' | 'rename' | 'rename_file' | 'code_actions' | 'type_definition' | 'implementation' | 'status' | 'reload' | 'capabilities' | 'request'",
+	file: "string?",
+	line: "number?",
+	symbol: "string?",
+	query: "string?",
+	new_name: "string?",
+	apply: "boolean?",
+	"timeout?": type.number
+		.atLeast(TOOL_TIMEOUTS.lsp.min)
+		.atMost(TOOL_TIMEOUTS.lsp.max)
+		.describe("Timeout in seconds (default 20; range 5–300)."),
+	payload: "string?",
 });
-
-export type LspParams = Static<typeof lspSchema>;
-
-export interface LspToolDetails {
-	serverName?: string;
-	action: string;
-	success: boolean;
-	request?: LspParams;
-}
 
 // =============================================================================
 // Core LSP Protocol Types
@@ -93,6 +70,17 @@ export interface Diagnostic {
 	data?: unknown;
 }
 
+export interface PublishedDiagnostics {
+	diagnostics: Diagnostic[];
+	version: number | null;
+}
+
+export interface PublishDiagnosticsParams {
+	uri: string;
+	diagnostics: Diagnostic[];
+	version?: number | null;
+}
+
 // =============================================================================
 // Text Edits
 // =============================================================================
@@ -100,6 +88,7 @@ export interface Diagnostic {
 export interface TextEdit {
 	range: Range;
 	newText: string;
+	insertTextFormat?: 1 | 2;
 }
 
 export interface AnnotatedTextEdit extends TextEdit {
@@ -317,7 +306,7 @@ export interface LinterClient {
 	format(filePath: string, content: string): Promise<string>;
 
 	/** Get diagnostics for a file. Content should already be written to disk. */
-	lint(filePath: string): Promise<Diagnostic[]>;
+	lint(filePath: string, signal?: AbortSignal): Promise<Diagnostic[]>;
 
 	/** Dispose of any resources (e.g., LSP connection) */
 	dispose?(): void;
@@ -342,12 +331,24 @@ export interface ServerConfig {
 	command: string;
 	args?: string[];
 	fileTypes: string[];
+	/** LSP language identifier sent in didOpen; inferred from the file path when omitted. */
+	languageId?: string;
 	rootMarkers: string[];
 	initOptions?: Record<string, unknown>;
 	settings?: Record<string, unknown>;
 	disabled?: boolean;
 	/** Per-server warmup timeout in milliseconds. Overrides the global WARMUP_TIMEOUT_MS for this server during startup. */
 	warmupTimeoutMs?: number;
+	/**
+	 * Per-server overrides for rust-analyzer workspace-ready polling. When omitted, the module
+	 * defaults are used. Primarily a tuning/test seam to bound the multi-second settle window.
+	 */
+	workspaceReadyTimings?: {
+		timeoutMs?: number;
+		pollMs?: number;
+		settleMs?: number;
+		statusRequestTimeoutMs?: number;
+	};
 	capabilities?: ServerCapabilities;
 	/** If true, this is a linter/formatter server (e.g., Biome) - used only for diagnostics/actions, not type intelligence */
 	isLinter?: boolean;
@@ -361,12 +362,45 @@ export interface ServerConfig {
 }
 
 // =============================================================================
+// Transport
+// =============================================================================
+
+/** Minimal write sink for the server-bound byte stream (satisfied by `Bun.FileSink` and the mux socket adapter). */
+export interface LspWriteSink {
+	write(data: string | Uint8Array): number | Promise<number>;
+	flush(): number | void | Promise<number | void>;
+}
+
+/**
+ * Byte transport carrying one LSP JSON-RPC link. Structurally satisfied by
+ * `ptree.ChildProcess<"pipe">` (local server spawn) and by the socket adapter
+ * in `mux/daemon.ts` (broker-shared server). `exited` may reject (ptree kill).
+ */
+export interface LspTransport {
+	readonly stdin: LspWriteSink;
+	readonly stdout: ReadableStream<Uint8Array>;
+	readonly exited: Promise<number>;
+	readonly exitCode: number | null;
+	readonly pid?: number;
+	/** Present and true on broker-shared mux links; `lsp reload` uses it to request a shared-server restart. */
+	readonly sharedMux?: boolean;
+	kill(): void;
+	peekStderr(): string;
+}
+
+// =============================================================================
 // Client State
 // =============================================================================
 
 export interface OpenFile {
 	version: number;
 	languageId: string;
+	/**
+	 * Hash of the document text last sent to the server, used to detect external
+	 * disk edits. Absent means the last-synced text is unknown, so the next
+	 * reconcile treats the document as dirty and resyncs from disk.
+	 */
+	syncedHash?: number | bigint;
 }
 
 export interface PendingRequest {
@@ -383,6 +417,7 @@ export interface LspServerCapabilities {
 	referencesProvider?: boolean;
 	documentSymbolProvider?: boolean;
 	workspaceSymbolProvider?: boolean;
+	diagnosticProvider?: boolean | Record<string, unknown>;
 	[key: string]: unknown;
 }
 
@@ -390,32 +425,47 @@ export interface LspClient {
 	name: string;
 	cwd: string;
 	config: ServerConfig;
-	proc: ptree.ChildProcess<"pipe">;
+	proc: LspTransport;
 	requestId: number;
-	diagnostics: Map<string, Diagnostic[]>;
+	diagnostics: Map<string, PublishedDiagnostics>;
 	diagnosticsVersion: number;
+	/** Dynamic capability registrations keyed by the server-provided registration ID. */
+	dynamicCapabilityRegistrations?: Map<string, string>;
 	openFiles: Map<string, OpenFile>;
-	pendingRequests: Map<number, PendingRequest>;
+	pendingRequests: Map<number | string, PendingRequest>;
 	messageBuffer: Uint8Array;
 	isReading: boolean;
+	/** Lifecycle state: "connecting" until initialize completes, then "ready"; "error" on init failure or reader death. */
+	status: "connecting" | "ready" | "error";
 	serverCapabilities?: LspServerCapabilities;
 	lastActivity: number;
+	/** Serializes outbound JSON-RPC writes to the server process. */
+	writeQueue: Promise<void>;
+	/** Tracks active work-done progress tokens from the server */
+	activeProgressTokens: Set<string | number>;
+	/** Resolves when the server's initial project loading completes (or after timeout) */
+	projectLoaded: Promise<void>;
+	/** Call to signal that project loading has completed */
+	resolveProjectLoaded: () => void;
 }
 
 // =============================================================================
 // JSON-RPC Protocol Types
 // =============================================================================
 
+/** JSON-RPC request/response identifier accepted by LSP peers. */
+export type LspJsonRpcId = number | string;
+
 export interface LspJsonRpcRequest {
 	jsonrpc: "2.0";
-	id: number;
+	id: LspJsonRpcId;
 	method: string;
 	params: unknown;
 }
 
 export interface LspJsonRpcResponse {
 	jsonrpc: "2.0";
-	id?: number;
+	id?: LspJsonRpcId;
 	result?: unknown;
 	error?: { code: number; message: string; data?: unknown };
 }

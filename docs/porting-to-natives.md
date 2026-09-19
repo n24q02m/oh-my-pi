@@ -1,155 +1,154 @@
-# Porting to pi-natives (N-API) — Field Notes
+# Porting Hot Paths to `pi-natives`
 
-This is a practical guide for moving hot paths into `crates/pi-natives` and wiring them through the JS bindings. It exists to avoid the same failures happening twice.
+This is the contributor path for moving a measured JS/TS hot path into `crates/pi-natives` and exposing it through `@oh-my-pi/pi-natives`.
 
-## When to port
+## Decide whether to port
 
-Port when any of these are true:
+Port when native code removes demonstrated CPU, blocking-I/O, allocation, or platform-integration cost and the boundary can stay data-oriented. Keep JS when the work depends heavily on JS object identity, dynamic imports, callbacks into application state, or native conversion cost erases the gain.
 
-- The hot path runs in render loops, tight UI updates, or large batches.
-- JS allocations dominate (string churn, regex backtracking, large arrays).
-- You already have a JS baseline and can benchmark both versions side by side.
-- The work is CPU-bound or blocking I/O that can run on the libuv thread pool.
-- The work is async I/O that can run on Tokio's runtime (e.g., shell execution).
+Start with a behavior-compatible JS baseline and representative inputs. A native export that exists but is slower or behaviorally different is not a successful port.
 
-Avoid ports that depend on JS-only state or dynamic imports. N-API exports should be pure, data-in/data-out. Long-running work should go through `task::blocking` (CPU-bound/blocking I/O) or `task::future` (async I/O) with cancellation.
+## Current package and build split
 
-## Anatomy of a native export
+The package has no `packages/natives/src/<module>` wrapper layer. Its entrypoints are:
 
-**Rust side:**
+- eager root: `native/index.js` with generated `native/index.d.ts`;
+- lazy desktop wrapper: `native/desktop.js` / `desktop.d.ts`;
+- lazy clipboard wrapper: `native/clipboard.js` / `clipboard.d.ts`;
+- lazy vcs wrapper: `native/vcs.js` / `vcs.d.ts` (`@oh-my-pi/pi-natives/vcs`).
 
-- Implementation lives in `crates/pi-natives/src/<module>.rs`. If you add a new module, register it in `crates/pi-natives/src/lib.rs`.
-- Export with `#[napi]` and `#[napi(js_name = "...")]` to keep JS-facing camelCase names. Use `#[napi(object)]` for structs.
-- Use `task::blocking(tag, cancel_token, work)` (see `crates/pi-natives/src/task.rs`) for CPU-bound or blocking work. Use `task::future(env, tag, work)` for async work that needs Tokio (e.g., shell sessions). Pass a `CancelToken` when you expose `timeoutMs` or `AbortSignal`.
+The vcs subpath exposes the backend-neutral `Vcs*` repository API (added in
+18.0.9, with `VcsGitRepo.mergeBase()` following in 18.0.10): discovery and
+Git/Jujutsu operations through `git()` / `repo()` / `require()` / `requireGit()`
+returning `VcsGitRepo` / `VcsRepo` / `VcsJjWorkspace` handles (refs and status,
+diffs, staging, commits, branches, worktrees, patch application, stash,
+cherry-pick, CLI-backed push/fetch/clone, all cancellation-aware), plus the
+JS-side error helpers (`isVcsError`) and the `watch(repo, onChange)` head-change
+watcher built on `VcsRepo.watchTarget()`.
 
-**JS side:**
+Two commands serve different purposes:
 
-- `packages/natives/src/bindings.ts` holds the base `NativeBindings` interface.
-- `packages/natives/src/<module>/types.ts` defines TS types and augments `NativeBindings` via declaration merging.
-- `packages/natives/src/native.ts` imports each `<module>/types.ts` file to activate the declarations.
-- `packages/natives/src/<module>/index.ts` wraps the `native` binding from `packages/natives/src/native.ts`.
-- `packages/natives/src/native.ts` loads the addon and `validateNative` enforces required exports.
-- `packages/natives/src/index.ts` re-exports the wrapper for callers in `packages/*`.
+- `bun --cwd=packages/natives run build:bindings` runs napi-rs for the host, installs a local variant addon and generated declarations, and regenerates explicit ESM/enum exports. Use this when the Rust public type surface changes.
+- `bun --cwd=packages/natives run build` invokes `scripts/bazel-natives.ts host --dest native`. The host target builds through the local cargo/napi-rs backend by default (`OMP_NATIVE_BUILD_BACKEND=bazel` opts into bazel) but does not regenerate declarations.
 
-## Porting checklist
+Release builds use Bazel targets and publish `.node` files in platform leaf packages. The core publish rewrite removes addons and injects lockstep optional dependencies generated from `LEAF_TARGETS` in `gen-npm-packages.ts`.
 
-1. **Add the Rust implementation**
+## Design the N-API boundary
 
-- Put the core logic in a plain Rust function.
-- If it’s a new module, add it to `crates/pi-natives/src/lib.rs`.
-- Expose it with `#[napi(js_name = "...")]` to keep camelCase names stable.
-- Keep signatures owned and simple: `String`, `Vec<String>`, `Uint8Array`, or `Either<JsString, Uint8Array>` for large string/byte inputs.
-- For CPU-bound or blocking work, use `task::blocking`; for async work, use `task::future`. Pass a `CancelToken` and call `heartbeat()` inside long loops.
+1. Put implementation in the owning `crates/pi-natives/src/<module>.rs`; register new modules in `lib.rs`.
+2. Keep the computation in a plain Rust function where practical, then expose a thin `#[napi]` boundary.
+3. Prefer owned N-API-compatible values: `String`, vectors, typed arrays, and `#[napi(object)]` option/result structs. Avoid borrowed public inputs whose lifetime cannot cross N-API work.
+4. Let napi-rs apply the default snake_case-to-camelCase name unless a deliberate public name requires `js_name`.
+5. Preserve the JS contract: null/undefined distinctions, ordering, error versus result semantics, callback timing, and sync versus Promise behavior.
 
-2. **Wire JS bindings**
+### Work scheduling and cancellation
 
-- Add the types and `NativeBindings` augmentation in `packages/natives/src/<module>/types.ts`.
-- Import `./<module>/types` in `packages/natives/src/native.ts` to trigger declaration merging.
-- Add a wrapper in `packages/natives/src/<module>/index.ts` that calls `native`.
-- Re-export from `packages/natives/src/index.ts`.
+- Use `task::blocking(tag, cancel_token, work)` for CPU-heavy or blocking work. It returns an `AsyncTask`, profiles the work, and catches panics before they cross the async-work FFI boundary.
+- Use `task::future(env, tag, future)` for Tokio async I/O. It returns a `PromiseRaw` through `Env::spawn_future`.
+- When the public options expose `timeoutMs` or `AbortSignal`, build `task::CancelToken::new(timeout_ms, signal)` and call `heartbeat()` at meaningful intervals in blocking loops. Cancellation is cooperative; a token that is never checked does not stop work.
+- Do not create runtimes or worker pools in module initialization. The JS loader performs the optional `__ompInstallTokioRuntime` post-load step after the dynamic-loader lock is released.
 
-3. **Update native validation**
+Match an existing export with the same scheduling/error shape rather than introducing a second convention.
 
-- Add `checkFn("newExport")` in `validateNative` (`packages/natives/src/native.ts`).
+## End-to-end checklist
 
-4. **Add benchmarks**
+### 1. Implement and expose
 
-- Put benchmarks next to the owning package (`packages/tui/bench`, `packages/natives/bench`, or `packages/coding-agent/bench`).
-- Include a JS baseline and native version in the same run.
-- Use `Bun.nanoseconds()` and a fixed iteration count.
-- Keep the benchmark inputs small and realistic (actual data seen in the hot path).
+- Add the Rust logic and focused Rust tests for pure invariants when needed.
+- Add the `#[napi]` item and object/enum types.
+- Register a new module in `crates/pi-natives/src/lib.rs`.
+- If the port uses another first-party crate, add the dependency to `crates/pi-natives/Cargo.toml` and its build-system inputs as required by the native build.
 
-5. **Build the native binary**
+### 2. Regenerate and inspect the binding
 
-- `bun --cwd=packages/natives run build:native`
-- Use `bun --cwd=packages/natives run dev:native` for debug builds (`pi_natives.dev.node`) and set `PI_DEV=1` when loading it.
-
-6. **Run the benchmark**
-
-- `bun run packages/<pkg>/bench/<bench>.ts` (or `bun --cwd=packages/natives run bench`)
-
-7. **Decide on usage**
-
-- If native is slower, **keep JS** and leave the native export unused.
-- If native is faster, switch call sites to the native wrapper.
-
-## Pain points and how to avoid them
-
-### 1) Stale `pi_natives.node` prevents new exports
-
-The loader prefers the platform-tagged binary in `packages/natives/native` (`pi_natives.<platform>-<arch>.node`). When `PI_DEV=1`, it will load `pi_natives.dev.node` instead. There is also a fallback `pi_natives.node`. Compiled binaries extract to `~/.omp/natives/<version>/pi_natives.<platform>-<arch>.node`. If any of these are stale, exports won’t update.
-
-**Fix:** remove the stale file before rebuilding.
+Run:
 
 ```bash
-rm packages/natives/native/pi_natives.linux-x64.node
-rm packages/natives/native/pi_natives.node
-bun --cwd=packages/natives run build:native
+bun --cwd=packages/natives run build:bindings
 ```
 
-If you’re running a compiled binary, delete the cached addon directory:
+Then verify:
 
-```bash
-rm -rf ~/.omp/natives/<version>
-```
+- `native/index.d.ts` contains the intended JS name, exact input/result types, callback shape, and sync/Promise return;
+- the marked generated block in `native/index.js` contains the class/function export;
+- changed enums have both declarations and literal runtime objects.
 
-Then verify the export exists in the binary:
+`gen-enums.ts` derives exports by reading top-level `export declare class`, `export declare function`, and enum declarations. An item absent from the declarations will not become a named root ESM export.
 
-```bash
-bun -e 'const tag = `${process.platform}-${process.arch}`; const mod = require(`./packages/natives/native/pi_natives.${tag}.node`); console.log(Object.keys(mod).includes("newExport"));'
-```
+### 3. Add a lazy entrypoint only when justified
 
-### 2) “Missing exports” errors from `validateNative`
+The root eagerly loads the addon. If a worker must import without paying that startup cost, follow the desktop/clipboard pattern:
 
-This is **good** — it prevents silent mismatches. When you see this:
+- a small JS wrapper calls `loadNative()` inside the exported function;
+- a matching `.d.ts` imports/re-exports root types;
+- `package.json#exports` supplies both `types` and `import` paths.
 
-```
-Native addon missing exports ... Missing: visibleWidth
-```
+Do not add a wrapper merely to rename a generated root export.
 
-it means your binary is stale, the Rust `#[napi(js_name = "...")]` doesn’t match the JS name, or the export never compiled in. Fix the build and the naming mismatch, don’t weaken validation.
+### 4. Migrate consumers cleanly
 
-### 3) Rust signature mismatch
+- Import the generated root symbol or intentional lazy subpath from `@oh-my-pi/pi-natives`.
+- Compare results and errors against the JS baseline on boundary cases.
+- Switch every intended caller and remove the obsolete implementation in the same change.
+- Keep user-facing policy and rendering in the consumer when the native primitive does not own it.
 
-Keep it simple and owned. `String`, `Vec<String>`, and `Uint8Array` work. Avoid references like `&str` in public exports. If you need structured data, wrap it in `#[napi(object)]` structs.
+### 5. Benchmark representative work
 
-### 4) Benchmarking mistakes
-
-- Don’t compare different inputs or allocations.
-- Keep JS and native using identical input arrays.
-- Run both in the same benchmark file to avoid skew.
-
-## Benchmark template
+Place a durable benchmark with the owning package (`packages/natives/bench`, `packages/tui/bench`, `packages/coding-agent/bench`, or another existing package bench directory). Run JS and native implementations in the same process on identical prepared input. Separate setup/conversion from the timed operation when callers can reuse that setup.
 
 ```ts
-const ITERATIONS = 2000;
+const ITERATIONS = 2_000;
 
 function bench(name: string, fn: () => void): number {
-	const start = Bun.nanoseconds();
-	for (let i = 0; i < ITERATIONS; i++) fn();
-	const elapsed = (Bun.nanoseconds() - start) / 1e6;
-	console.log(`${name}: ${elapsed.toFixed(2)}ms total (${(elapsed / ITERATIONS).toFixed(6)}ms/op)`);
-	return elapsed;
+  const start = Bun.nanoseconds();
+  for (let i = 0; i < ITERATIONS; i++) fn();
+  const elapsedMs = (Bun.nanoseconds() - start) / 1e6;
+  console.log(
+    `${name}: ${elapsedMs.toFixed(2)}ms (${(elapsedMs / ITERATIONS).toFixed(6)}ms/op)`,
+  );
+  return elapsedMs;
 }
 
-bench("feature/js", () => {
-	jsImpl(sample);
-});
-
-bench("feature/native", () => {
-	nativeImpl(sample);
-});
+bench("feature/js", () => jsImpl(sample));
+bench("feature/native", () => nativeImpl(sample));
 ```
 
-## Verification checklist
+For Promise-returning operations, use an async benchmark loop and await every call; do not time promise creation alone.
 
-- `validateNative` passes (no missing exports).
-- `NativeBindings` is augmented in `packages/natives/src/<module>/types.ts` and the wrapper is re-exported in `packages/natives/src/index.ts`.
-- `Object.keys(require(...))` includes your new export.
-- Bench numbers recorded in the PR/notes.
-- Call site updated **only if** native is faster or equal.
+### 6. Verify the loaded artifact
 
-## Rule of thumb
+Run the narrow scenario against the addon you just built. When diagnosing a candidate mismatch, inspect the candidate path reported by the loader:
 
-- If native is slower, **do not switch**. Keep the export for future work, but the TUI should stay on the faster path.
-- If native is faster, switch the call site and keep the benchmark in place to catch regressions.
+```bash
+bun -e 'import { createRequire } from "node:module"; const require = createRequire(import.meta.url); const mod = require(process.argv[1]); console.log(Object.keys(mod).sort())' -- /path/to/pi_natives.<tag>[-variant].node
+```
+
+Confirm the export and the package-version sentinel are present. Do not add optional consumer checks for a required export to conceal an artifact mismatch.
+
+## Common failures
+
+### Stale variant or cache wins
+
+x64 candidate order is modern → baseline → unsuffixed for a modern host, and baseline → unsuffixed for a baseline host. Compiled and staged Windows loads can also win from `<getNativesDir()>/<version>` before package paths.
+
+Remove only the stale local artifacts/cache identified by loader diagnostics, then rebuild. The loader best-effort deletes cache directories from valid older releases after a successful load, but it intentionally preserves the current-version directory.
+
+### Declarations changed but shipping addon did not
+
+`build:bindings` owns declaration generation; `build` owns the Bazel host artifact. CI/release targets own cross-platform artifacts. Verify both generated source control outputs and the actual binary used by the scenario.
+
+### Same-version incomplete addon
+
+The sentinel proves release version, not the complete export set. A locally produced same-version binary can pass loading while missing a newly generated member. Inspect `Object.keys` on the actual candidate and rebuild it; do not weaken the caller.
+
+### Runtime enum missing
+
+napi-rs enum declarations alone do not supply the root's literal runtime object. Run `build:bindings` and verify the generated block. If `gen-enums.ts` cannot parse the declaration shape, fix the generator rather than hand-editing its marked block.
+
+### Wrong sync/async assumption
+
+Use `native/index.d.ts` as authority. For example, `renderSnapcompactPng` returns `Promise<string>`, while `snapcompactSupportedChars` is synchronous. A port that changes call style requires an intentional consumer migration.
+
+## Completion criteria
+
+A port is complete only when the generated declaration and ESM export match the Rust API, the intended consumers use it, obsolete JS code is gone, a focused real invocation succeeds against the built addon, and representative comparison shows acceptable behavior and performance.

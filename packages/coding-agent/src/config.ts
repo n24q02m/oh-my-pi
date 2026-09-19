@@ -1,15 +1,15 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { CONFIG_DIR_NAME, getAgentDir, getProjectDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
-import type { TSchema } from "@sinclair/typebox";
-import { Value } from "@sinclair/typebox/value";
-import { Ajv, type ErrorObject, type ValidateFunction } from "ajv";
-import { JSONC, YAML } from "bun";
+import { CONFIG_DIR_NAME, getConfigAgentDirName, getProjectDir } from "@oh-my-pi/pi-utils";
+import { isUserSourceEnabled } from "./capability";
+import { resolveClaudePaths } from "./config/claude-paths";
 import { expandTilde } from "./tools/path-utils";
 
+export * from "./config/config-file";
+
 const priorityList = [
-	{ dir: CONFIG_DIR_NAME, globalAgentDir: `${CONFIG_DIR_NAME}/agent` },
+	{ dir: CONFIG_DIR_NAME, globalAgentDir: getConfigAgentDirName },
 	{ dir: ".claude" },
 	{ dir: ".codex" },
 	{ dir: ".gemini" },
@@ -20,225 +20,57 @@ const priorityList = [
 // =============================================================================
 
 /**
- * Get the base directory for resolving optional package assets (docs, examples).
- * Walk up from import.meta.dir until we find package.json, or fall back to cwd.
+ * Walk up from `startDir` looking for a `package.json`. Returns the directory
+ * containing the marker, or `undefined` when the walk hits the filesystem root
+ * without finding one.
+ *
+ * Exported for unit-testing the resolution contract from arbitrary start
+ * directories (notably the `bun --compile` case where `import.meta.dir`
+ * resolves to `/$bunfs/root` and no owning package is locatable — issue
+ * #1423). Production callers should use {@link getPackageDir} instead.
  */
-export function getPackageDir(): string {
-	// Allow override via environment variable (useful for Nix/Guix where store paths tokenize poorly)
-	const envDir = process.env.PI_PACKAGE_DIR;
-	if (envDir) {
-		return expandTilde(envDir);
-	}
-
-	let dir = import.meta.dir;
+export function walkUpForPackageDir(startDir: string): string | undefined {
+	let dir = startDir;
 	while (dir !== path.dirname(dir)) {
 		if (fs.existsSync(path.join(dir, "package.json"))) {
 			return dir;
 		}
 		dir = path.dirname(dir);
 	}
-	// Fallback to project dir (docs/examples won't be found, but that's fine)
-	return getProjectDir();
+	return undefined;
 }
 
-/** Get path to CHANGELOG.md (optional, may not exist in binary) */
-export function getChangelogPath(): string {
-	return path.resolve(path.join(getPackageDir(), "CHANGELOG.md"));
+/**
+ * Get the base directory for resolving optional package assets (docs, examples, CHANGELOG.md).
+ *
+ * Honors the `PI_PACKAGE_DIR` override (useful for Nix/Guix store paths);
+ * otherwise walks up from `import.meta.dir` looking for a `package.json`.
+ * Returns `undefined` when no owning package is locatable — notably inside
+ * `bun --compile` binaries where `import.meta.dir` resolves to `/$bunfs/root`
+ * and the walk hits the filesystem root with nothing found.
+ *
+ * Callers MUST treat `undefined` as "no package assets available" and skip the
+ * lookup. NEVER fall back to the user's `cwd` here: that conflates the host
+ * project with omp's own assets and was the source of issue #1423 (the host
+ * project's `CHANGELOG.md` rendered as omp's startup changelog).
+ */
+export function getPackageDir(): string | undefined {
+	const envDir = process.env.PI_PACKAGE_DIR;
+	if (envDir) {
+		return expandTilde(envDir);
+	}
+	return walkUpForPackageDir(import.meta.dir);
 }
 
-// =============================================================================
-// User Config Paths (~/.omp/agent/*)
-// =============================================================================
-
-function migrateJsonToYml(jsonPath: string, ymlPath: string) {
-	try {
-		if (fs.existsSync(ymlPath)) return;
-		if (!fs.existsSync(jsonPath)) return;
-
-		const content = fs.readFileSync(jsonPath, "utf-8");
-		const parsed = JSON.parse(content);
-		if (!parsed) {
-			logger.warn("migrateJsonToYml: invalid json structure", { path: jsonPath });
-			return;
-		}
-		fs.writeFileSync(ymlPath, YAML.stringify(parsed, null, 2));
-	} catch (error) {
-		logger.warn("migrateJsonToYml: migration failed", { error: String(error) });
-	}
-}
-
-export interface IConfigFile<T> {
-	readonly id: string;
-	readonly schema: TSchema;
-	path?(): string;
-	load(): T | null;
-	invalidate?(): void;
-}
-
-export class ConfigError extends Error {
-	readonly #message: string;
-	constructor(
-		public readonly id: string,
-		public readonly schemaErrors: ErrorObject[] | null | undefined,
-		public readonly other?: { err: unknown; stage: string },
-	) {
-		let messages: string[] | undefined;
-		let cause: any | undefined;
-		let klass: string;
-
-		if (schemaErrors) {
-			klass = "Schema";
-			messages = schemaErrors.map(e => `${e.instancePath || "root"}: ${e.message}`);
-		} else if (other) {
-			klass = other.stage;
-			if (other.err instanceof Error) {
-				messages = [other.err.message];
-				cause = other.err;
-			} else {
-				messages = [String(other.err)];
-			}
-		} else {
-			klass = "Unknown";
-		}
-
-		const title = `Failed to load config file ${id}, ${klass} error:`;
-		let message: string;
-		switch (messages?.length ?? 0) {
-			case 0:
-				message = title.slice(0, -1);
-				break;
-			case 1:
-				message = `${title} ${messages![0]}`;
-				break;
-			default:
-				message = `${title}\n${messages!.map(m => `  - ${m}`).join("\n")}`;
-				break;
-		}
-
-		super(message, { cause });
-		this.name = "LoadError";
-		this.#message = message;
-	}
-
-	get message(): string {
-		return this.#message;
-	}
-
-	toString(): string {
-		return this.message;
-	}
-}
-
-export type LoadStatus = "ok" | "error" | "not-found";
-
-export type LoadResult<T> =
-	| { value?: null; error: ConfigError; status: "error" }
-	| { value: T; error?: undefined; status: "ok" }
-	| { value?: null; error?: unknown; status: "not-found" };
-
-const ajv = new Ajv();
-export class ConfigFile<T> implements IConfigFile<T> {
-	readonly #basePath: string;
-	#cache?: LoadResult<T>;
-	#auxValidate?: (value: T) => void;
-
-	constructor(
-		readonly id: string,
-		readonly schema: TSchema,
-		configPath: string = path.join(getAgentDir(), `${id}.yml`),
-	) {
-		this.#basePath = configPath;
-		if (configPath.endsWith(".yml")) {
-			const jsonPath = `${configPath.slice(0, -4)}.json`;
-			migrateJsonToYml(jsonPath, configPath);
-		} else if (configPath.endsWith(".yaml")) {
-			const jsonPath = `${configPath.slice(0, -5)}.json`;
-			migrateJsonToYml(jsonPath, configPath);
-		} else if (configPath.endsWith(".json") || configPath.endsWith(".jsonc")) {
-			// JSON configs are still supported without migration.
-		} else {
-			throw new Error(`Invalid config file path: ${configPath}`);
-		}
-	}
-
-	relocate(path?: string): ConfigFile<T> {
-		if (!path || path === this.#basePath) return this;
-		const result = new ConfigFile<T>(this.id, this.schema, path);
-		result.#auxValidate = this.#auxValidate;
-		return result;
-	}
-
-	withValidation(name: string, validate: (value: T) => void): this {
-		const prev = this.#auxValidate;
-		this.#auxValidate = (value: T) => {
-			prev?.(value);
-			try {
-				validate(value);
-			} catch (error) {
-				throw new ConfigError(this.id, undefined, { err: error, stage: `Validate(${name})` });
-			}
-		};
-		return this;
-	}
-
-	createDefault() {
-		return Value.Default(this.schema, [], undefined) as T;
-	}
-
-	#storeCache(result: LoadResult<T>): LoadResult<T> {
-		this.#cache = result;
-		return result;
-	}
-
-	tryLoad(): LoadResult<T> {
-		if (this.#cache) return this.#cache;
-
-		try {
-			const content = fs.readFileSync(this.path(), "utf-8").trim();
-
-			let parsed: unknown;
-			if (this.#basePath.endsWith(".json") || this.#basePath.endsWith(".jsonc")) {
-				parsed = JSONC.parse(content);
-			} else if (this.#basePath.endsWith(".yml") || this.#basePath.endsWith(".yaml")) {
-				parsed = YAML.parse(content);
-			} else {
-				throw new Error(`Invalid config file path: ${this.#basePath}`);
-			}
-
-			const validate = ajv.compile(this.schema) as ValidateFunction<T>;
-			if (!validate(parsed)) {
-				const error = new ConfigError(this.id, validate.errors);
-				logger.warn("Failed to parse config file", { path: this.path(), error });
-				return this.#storeCache({ error, status: "error" });
-			}
-			return this.#storeCache({ value: parsed, status: "ok" });
-		} catch (error) {
-			if (isEnoent(error)) {
-				return this.#storeCache({ status: "not-found" });
-			}
-			logger.warn("Failed to parse config file", { path: this.path(), error });
-			return this.#storeCache({
-				error: new ConfigError(this.id, undefined, { err: error, stage: "Unexpected" }),
-				status: "error",
-			});
-		}
-	}
-
-	load(): T | null {
-		return this.tryLoad().value ?? null;
-	}
-
-	loadOrDefault(): T {
-		return this.tryLoad().value ?? this.createDefault();
-	}
-
-	path(): string {
-		return this.#basePath;
-	}
-
-	invalidate() {
-		this.#cache = undefined;
-	}
+/**
+ * Path to omp's own `CHANGELOG.md`, or `undefined` when the package directory
+ * cannot be resolved (e.g. inside `bun --compile` binaries that don't bundle
+ * package assets). Callers MUST skip changelog parsing when this is undefined;
+ * see issue #1423.
+ */
+export function getChangelogPath(): string | undefined {
+	const packageDir = getPackageDir();
+	return packageDir ? path.resolve(packageDir, "CHANGELOG.md") : undefined;
 }
 
 // =============================================================================
@@ -246,12 +78,12 @@ export class ConfigFile<T> implements IConfigFile<T> {
 // =============================================================================
 
 /**
- * Config directory bases in priority order (highest first).
- * User-level: ~/.omp/agent, ~/.claude, ~/.codex, ~/.gemini
+ * User-level: ~/.omp/agent, Claude's active config directory, ~/.codex, ~/.gemini
  * Project-level: .omp, .claude, .codex, .gemini
  */
 const USER_CONFIG_BASES = priorityList.map(({ dir, globalAgentDir }) => ({
-	base: () => path.join(os.homedir(), globalAgentDir ?? dir),
+	base: () =>
+		dir === ".claude" ? resolveClaudePaths().configDir : path.join(os.homedir(), globalAgentDir?.() ?? dir),
 	name: dir,
 }));
 
@@ -300,6 +132,9 @@ export function getConfigDirs(subpath: string, options: GetConfigDirsOptions = {
 	// User-level directories (highest priority)
 	if (user) {
 		for (const { base, name } of USER_CONFIG_BASES) {
+			if (name !== CONFIG_DIR_NAME && !isUserSourceEnabled(name.replace(/^\./, ""))) {
+				continue;
+			}
 			const resolvedPath = path.resolve(base(), subpath);
 			if (!existingOnly || fs.existsSync(resolvedPath)) {
 				results.push({ path: resolvedPath, source: name, level: "user" });

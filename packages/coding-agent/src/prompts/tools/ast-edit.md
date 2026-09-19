@@ -1,30 +1,11 @@
-Performs structural AST-aware rewrites via native ast-grep.
+Structural AST-aware rewrites via ast-grep. Use for codemods where text replace is unsafe. Mixed-language paths are fine: each file is parsed in its own language, and a pattern only rewrites files it parses in.
 
-<instruction>
-- Use for codemods and structural rewrites where plain text replace is unsafe
-- Narrow scope with `path` before replacing (`path` accepts files, directories, or glob patterns)
-- Default to language-scoped rewrites in mixed repositories: set `lang` and keep `path` narrow
-- Treat parse issues as a scoping signal: tighten `path`/`lang` before retrying
-- Metavariables captured in each rewrite pattern (`$A`, `$$$ARGS`) are substituted into that entry's rewrite template
-- Each matched rewrite is a 1:1 structural substitution; you cannot split one capture into multiple nodes or merge multiple captures into one node
-</instruction>
-
-<output>
-- Returns replacement summary, per-file replacement counts, and change diffs
-- Includes parse issues when files cannot be processed
-</output>
-
-<examples>
-- Rename a call site across a directory:
-  `{"ops":[{"pat":"oldApi($$$ARGS)","out":"newApi($$$ARGS)"}],"lang":"typescript","path":"src/"}`
-- Multi-op codemod:
-  `{"ops":[{"pat":"require($A)","out":"import $A"},{"pat":"module.exports = $E","out":"export default $E"}],"lang":"javascript","path":"src/"}`
-- Swap two arguments using captures:
-  `{"ops":[{"pat":"assertEqual($A, $B)","out":"assertEqual($B, $A)"}],"lang":"typescript","path":"tests/"}`
-</examples>
-
-<critical>
-- `ops` **MUST** contain at least one concrete `{ pat, out }` entry
-- If the path pattern spans multiple languages, set `lang` explicitly for deterministic rewrites
-- For one-off local text edits, prefer the Edit tool instead of AST edit
-</critical>
+- Metavariables in `pat` (`$A`, `$$$ARGS`) substitute into `out`.
+- **Patterns match AST structure, not text.** `$NAME` = one node; `$_` = unbound; `$$$NAME` = zero-or-more.
+  - Use `$$$NAME`, NOT `$$NAME` (invalid). Names UPPERCASE, whole node — partial like `prefix$VAR` fails.
+- Same metavariable twice → MUST match identical code (`$A == $A` matches `x == x`, not `x == y`).
+- Rewrite patterns MUST parse as single AST node. Non-standalone → wrap: `class $_ { … }`.
+- TS: tolerate annotations — `async function $NAME($$$ARGS): $_ { $$$BODY }`. Delete with empty `out`: `{"pat":"console.log($$$)","out":""}`.
+- 1:1 substitution — no splitting/merging captures.
+- Matches are STAGED as a proposal, not applied: finalize by writing a one-sentence reason to `xd://resolve` (apply) or `xd://reject` (discard).
+- Parse issues → malformed rewrite, not clean no-op. For one-off text edits, prefer the Edit tool.

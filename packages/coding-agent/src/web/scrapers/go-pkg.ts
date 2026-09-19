@@ -1,5 +1,4 @@
 import { tryParseJson } from "@oh-my-pi/pi-utils";
-import { parseHTML } from "linkedom";
 import type { RenderResult, SpecialHandler } from "./types";
 import { buildResult, htmlToBasicMarkdown, loadPage } from "./types";
 
@@ -97,6 +96,7 @@ export const handleGoPkg: SpecialHandler = async (
 			});
 		}
 
+		const { parseHTML } = await import("@oh-my-pi/pi-utils/dom");
 		const doc = parseHTML(pageResult.content).document;
 
 		// Extract actual module path from breadcrumb or header
@@ -159,7 +159,7 @@ export const handleGoPkg: SpecialHandler = async (
 			// Get overview paragraph
 			const overview = docSection.querySelector(".go-Message");
 			if (overview) {
-				const overviewMd = htmlToBasicMarkdown(overview.innerHTML);
+				const overviewMd = await htmlToBasicMarkdown(overview.innerHTML);
 				sections.push(overviewMd);
 				sections.push("");
 			}
@@ -172,7 +172,7 @@ export const handleGoPkg: SpecialHandler = async (
 				const docParts: string[] = [];
 				for (let i = 0; i < Math.min(3, paragraphs.length); i++) {
 					const p = paragraphs[i];
-					const text = htmlToBasicMarkdown(p.innerHTML).trim();
+					const text = (await htmlToBasicMarkdown(p.innerHTML)).trim();
 					if (text) {
 						docParts.push(text);
 					}
@@ -211,7 +211,7 @@ export const handleGoPkg: SpecialHandler = async (
 					sections.push(exported.slice(0, 50).join("\n"));
 					if (exported.length > 50) {
 						notes.push(`showing 50 of ${exported.length} exports`);
-						sections.push(`\n... and ${exported.length - 50} more`);
+						sections.push(`\n[…${exported.length - 50} exports elided…]`);
 					}
 					sections.push("");
 				}
@@ -240,7 +240,7 @@ export const handleGoPkg: SpecialHandler = async (
 					sections.push(imports.slice(0, 20).join("\n"));
 					if (imports.length > 20) {
 						notes.push(`showing 20 of ${imports.length} imports`);
-						sections.push(`\n... and ${imports.length - 20} more`);
+						sections.push(`\n[…${imports.length - 20} imports elided…]`);
 					}
 					sections.push("");
 				}

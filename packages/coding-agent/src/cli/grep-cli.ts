@@ -4,9 +4,10 @@
  * Handles `omp grep` subcommand for testing grep tool on Windows.
  */
 import * as path from "node:path";
-import { grep } from "@oh-my-pi/pi-natives";
+import { GrepOutputMode, grep } from "@oh-my-pi/pi-natives";
 import { APP_NAME } from "@oh-my-pi/pi-utils";
-import chalk from "chalk";
+import chalk from "@oh-my-pi/pi-utils/chalk";
+import { expandPath } from "../tools/path-utils";
 
 export interface GrepCommandArgs {
 	pattern: string;
@@ -14,7 +15,8 @@ export interface GrepCommandArgs {
 	glob?: string;
 	limit: number;
 	context: number;
-	mode: "content" | "filesWithMatches" | "count";
+	mode: GrepOutputMode;
+	gitignore: boolean;
 }
 
 /**
@@ -31,7 +33,8 @@ export function parseGrepArgs(args: string[]): GrepCommandArgs | undefined {
 		path: ".",
 		limit: 20,
 		context: 2,
-		mode: "content",
+		mode: GrepOutputMode.Content,
+		gitignore: true,
 	};
 
 	const positional: string[] = [];
@@ -45,9 +48,11 @@ export function parseGrepArgs(args: string[]): GrepCommandArgs | undefined {
 		} else if (arg === "--context" || arg === "-C") {
 			result.context = parseInt(args[++i], 10);
 		} else if (arg === "--files" || arg === "-f") {
-			result.mode = "filesWithMatches";
+			result.mode = GrepOutputMode.FilesWithMatches;
 		} else if (arg === "--count" || arg === "-c") {
-			result.mode = "count";
+			result.mode = GrepOutputMode.Count;
+		} else if (arg === "--no-gitignore") {
+			result.gitignore = false;
 		} else if (!arg.startsWith("-")) {
 			positional.push(arg);
 		}
@@ -69,10 +74,12 @@ export async function runGrepCommand(cmd: GrepCommandArgs): Promise<void> {
 		process.exit(1);
 	}
 
-	const searchPath = path.resolve(cmd.path);
+	const searchPath = path.resolve(expandPath(cmd.path));
 	console.log(chalk.dim(`Searching in: ${searchPath}`));
 	console.log(chalk.dim(`Pattern: ${cmd.pattern}`));
-	console.log(chalk.dim(`Mode: ${cmd.mode}, Limit: ${cmd.limit}, Context: ${cmd.context}`));
+	console.log(
+		chalk.dim(`Mode: ${cmd.mode}, Limit: ${cmd.limit}, Context: ${cmd.context}, Gitignore: ${cmd.gitignore}`),
+	);
 
 	console.log("");
 
@@ -83,8 +90,9 @@ export async function runGrepCommand(cmd: GrepCommandArgs): Promise<void> {
 			glob: cmd.glob,
 			mode: cmd.mode,
 			maxCount: cmd.limit,
-			context: cmd.mode === "content" ? cmd.context : undefined,
+			context: cmd.mode === GrepOutputMode.Content ? cmd.context : undefined,
 			hidden: true,
+			gitignore: cmd.gitignore,
 		});
 
 		console.log(chalk.green(`Total matches: ${result.totalMatches}`));
@@ -98,7 +106,7 @@ export async function runGrepCommand(cmd: GrepCommandArgs): Promise<void> {
 		for (const match of result.matches) {
 			const displayPath = match.path.replace(/\\/g, "/");
 
-			if (cmd.mode === "content") {
+			if (cmd.mode === GrepOutputMode.Content) {
 				if (match.contextBefore) {
 					for (const ctx of match.contextBefore) {
 						console.log(chalk.dim(`${displayPath}-${ctx.lineNumber}- ${ctx.line}`));
@@ -111,7 +119,7 @@ export async function runGrepCommand(cmd: GrepCommandArgs): Promise<void> {
 					}
 				}
 				console.log("");
-			} else if (cmd.mode === "count") {
+			} else if (cmd.mode === GrepOutputMode.Count) {
 				console.log(`${chalk.cyan(displayPath)}: ${match.matchCount ?? 0} matches`);
 			} else {
 				console.log(chalk.cyan(displayPath));
@@ -140,9 +148,10 @@ ${chalk.bold("Options:")}
   -f, --files           Output file names only
   -c, --count           Output match counts per file
   -h, --help            Show this help
+  --no-gitignore        Include files excluded by .gitignore
 
 ${chalk.bold("Environment:")}
-  PI_GREP_WORKERS=0    Disable worker pool (use single-threaded mode)
+  PI_WALK_WORKERS=N    Set filesystem walker workers (default 4, 0 = auto)
 
 ${chalk.bold("Examples:")}
   ${APP_NAME} grep "import" src/

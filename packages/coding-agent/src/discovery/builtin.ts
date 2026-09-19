@@ -4,7 +4,9 @@
  * Primary provider for OMP native configs. Supports all capabilities.
  */
 import * as path from "node:path";
-import { logger, tryParseJson } from "@oh-my-pi/pi-utils";
+import { getAgentDir, logger, parseFrontmatter, tryParseJson } from "@oh-my-pi/pi-utils";
+import { YAML } from "bun";
+import { getManagedSkillsDir, MANAGED_SKILLS_PROVIDER_ID } from "../autolearn/managed-skills";
 import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
 import { type Extension, type ExtensionManifest, extensionCapability } from "../capability/extension";
@@ -22,14 +24,14 @@ import { type SystemPrompt, systemPromptCapability } from "../capability/system-
 import { type CustomTool, toolCapability } from "../capability/tool";
 import type { LoadContext, LoadResult } from "../capability/types";
 import { expandTilde } from "../tools/path-utils";
-import { parseFrontmatter } from "../utils/frontmatter";
 import {
-	buildRuleFromMarkdown,
+	discoverRuleFromMarkdown,
 	createSourceMeta,
 	discoverExtensionModulePaths,
 	expandEnvVarsDeep,
 	getExtensionNameFromPath,
 	loadFilesFromDir,
+	parseRequestIdFormat,
 	SOURCE_PATHS,
 	scanSkillsFromDir,
 } from "./helpers";
@@ -60,7 +62,9 @@ async function getConfigDirs(ctx: LoadContext): Promise<Array<{ dir: string; lev
 	if (projectDir) {
 		result.push({ dir: projectDir, level: "project" });
 	}
-	const userDir = await ifNonEmptyDir(ctx.home, PATHS.userAgent);
+	// Native user config is profile-scoped: getAgentDir() points at the active
+	// profile's agent dir (~/.omp/profiles/<name>/agent), like sessions and MCP.
+	const userDir = await ifNonEmptyDir(getAgentDir());
 	if (userDir) {
 		result.push({ dir: userDir, level: "user" });
 	}
@@ -68,12 +72,13 @@ async function getConfigDirs(ctx: LoadContext): Promise<Array<{ dir: string; lev
 	return result;
 }
 
-function getAncestorDirs(cwd: string): Array<{ dir: string; depth: number }> {
+function getAncestorDirs(cwd: string, stopAt?: string | null): Array<{ dir: string; depth: number }> {
 	const ancestors: Array<{ dir: string; depth: number }> = [];
 	let current = cwd;
 	let depth = 0;
 	while (true) {
 		ancestors.push({ dir: current, depth });
+		if (stopAt && current === stopAt) break;
 		const parent = path.dirname(current);
 		if (parent === current) break;
 		current = parent;
@@ -82,8 +87,11 @@ function getAncestorDirs(cwd: string): Array<{ dir: string; depth: number }> {
 	return ancestors;
 }
 
-async function findNearestProjectConfigDir(cwd: string): Promise<{ dir: string; depth: number } | null> {
-	for (const ancestor of getAncestorDirs(cwd)) {
+async function findNearestProjectConfigDir(
+	cwd: string,
+	repoRoot?: string | null,
+): Promise<{ dir: string; depth: number } | null> {
+	for (const ancestor of getAncestorDirs(cwd, repoRoot)) {
 		const configDir = await ifNonEmptyDir(ancestor.dir, PATHS.projectDir);
 		if (configDir) return { dir: configDir, depth: ancestor.depth };
 	}
@@ -128,7 +136,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 			if (serverConfig.timeout === undefined || serverConfig.timeout === null) {
 				timeout = undefined;
 			} else if (typeof serverConfig.timeout === "number") {
-				if (Number.isFinite(serverConfig.timeout) && serverConfig.timeout > 0) {
+				if (Number.isFinite(serverConfig.timeout) && serverConfig.timeout >= 0) {
 					timeout = serverConfig.timeout;
 				} else {
 					logger.warn(`MCP server "${serverName}": invalid timeout ${serverConfig.timeout}, ignoring`);
@@ -136,7 +144,7 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 				}
 			} else if (typeof serverConfig.timeout === "string") {
 				const parsed = Number(serverConfig.timeout);
-				if (Number.isFinite(parsed) && parsed > 0) {
+				if (Number.isFinite(parsed) && parsed >= 0) {
 					timeout = parsed;
 				} else {
 					logger.warn(`MCP server "${serverName}": invalid timeout "${serverConfig.timeout}", ignoring`);
@@ -147,17 +155,44 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 				timeout = undefined;
 			}
 
+			// Validate requestIdFormat: only the two documented encodings
+			const requestIdFormat = parseRequestIdFormat(serverConfig.requestIdFormat);
+			if (requestIdFormat === undefined && serverConfig.requestIdFormat != null) {
+				logger.warn(
+					`MCP server "${serverName}": invalid requestIdFormat ${JSON.stringify(serverConfig.requestIdFormat)}, ignoring`,
+				);
+			}
+
 			result.push({
 				name: serverName,
 				enabled,
 				timeout,
+				requestIdFormat,
 				command: serverConfig.command as string | undefined,
 				args: serverConfig.args as string[] | undefined,
 				env: serverConfig.env as Record<string, string> | undefined,
+				cwd: serverConfig.cwd as string | undefined,
 				url: serverConfig.url as string | undefined,
 				headers: serverConfig.headers as Record<string, string> | undefined,
-				auth: serverConfig.auth as { type: "oauth" | "apikey"; credentialId?: string } | undefined,
-				oauth: serverConfig.oauth as { clientId?: string; callbackPort?: number } | undefined,
+				auth: serverConfig.auth as
+					| {
+							type: "oauth" | "apikey";
+							credentialId?: string;
+							tokenUrl?: string;
+							clientId?: string;
+							clientSecret?: string;
+					  }
+					| undefined,
+				oauth: serverConfig.oauth as
+					| {
+							clientId?: string;
+							clientSecret?: string;
+							redirectUri?: string;
+							callbackPort?: number;
+							callbackPath?: string;
+							prompt?: string;
+					  }
+					| undefined,
 				transport: serverConfig.type as "stdio" | "sse" | "http" | undefined,
 				_source: createSourceMeta(PROVIDER_ID, path, level),
 			});
@@ -165,11 +200,14 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 		return result;
 	};
 
+	// User scope tracks the active profile via getAgentDir() (not ctx.home), so it
+	// stays in sync with getMCPConfigPath("user") and the /mcp config writer.
+	const userAgentDir = getAgentDir();
 	const paths = [
 		{ path: path.join(ctx.cwd, PATHS.projectDir, "mcp.json"), level: "project" as const },
 		{ path: path.join(ctx.cwd, PATHS.projectDir, ".mcp.json"), level: "project" as const },
-		{ path: path.join(ctx.home, PATHS.userAgent, "mcp.json"), level: "user" as const },
-		{ path: path.join(ctx.home, PATHS.userAgent, ".mcp.json"), level: "user" as const },
+		{ path: path.join(userAgentDir, "mcp.json"), level: "user" as const },
+		{ path: path.join(userAgentDir, ".mcp.json"), level: "user" as const },
 	];
 
 	const contents = await Promise.allSettled(
@@ -204,7 +242,7 @@ registerProvider<MCPServer>(mcpCapability.id, {
 async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemPrompt>> {
 	const items: SystemPrompt[] = [];
 
-	const userPath = path.join(ctx.home, PATHS.userAgent, "SYSTEM.md");
+	const userPath = path.join(getAgentDir(), "SYSTEM.md");
 	const userContent = await readFile(userPath);
 	if (userContent) {
 		items.push({
@@ -215,7 +253,7 @@ async function loadSystemPrompt(ctx: LoadContext): Promise<LoadResult<SystemProm
 		});
 	}
 
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd);
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
 	if (nearestProjectConfigDir) {
 		const projectPath = path.join(nearestProjectConfigDir.dir, "SYSTEM.md");
 		const projectContent = await readFile(projectPath);
@@ -242,22 +280,44 @@ registerProvider<SystemPrompt>(systemPromptCapability.id, {
 
 // Skills
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
-	const configDirs = await getConfigDirs(ctx);
-	const results = await Promise.all(
-		configDirs.map(({ dir, level }) =>
-			scanSkillsFromDir(ctx, {
-				dir: path.join(dir, "skills"),
-				providerId: PROVIDER_ID,
-				level,
-				requireDescription: true,
-			}),
-		),
+	// Walk up from cwd finding .omp/skills/ in ancestors (closest first)
+	const ancestors = getAncestorDirs(ctx.cwd, ctx.repoRoot ?? ctx.home);
+	const projectScans = ancestors.map(({ dir }) =>
+		scanSkillsFromDir(ctx, {
+			dir: path.join(dir, PATHS.projectDir, "skills"),
+			providerId: PROVIDER_ID,
+			level: "project",
+			requireDescription: true,
+		}),
 	);
 
+	// User-level scan from ~/.omp/agent/skills/
+	const userScan = scanSkillsFromDir(ctx, {
+		dir: path.join(getAgentDir(), "skills"),
+		providerId: PROVIDER_ID,
+		level: "user",
+		requireDescription: true,
+	});
+
+	const results = await Promise.all([...projectScans, userScan]);
 	return {
 		items: results.flatMap(r => r.items),
 		warnings: results.flatMap(r => r.warnings ?? []),
 	};
+}
+
+// Managed skills (auto-learn) are a SEPARATE provider at the lowest skill
+// priority, so an authored skill of the same name from ANY other provider wins
+// the capability-level priority dedup. Discovery is unconditional (an empty
+// managed dir is a no-op); only writing/nudging is gated by `autolearn.enabled`.
+const MANAGED_SKILLS_PRIORITY = 5;
+async function loadManagedSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
+	return scanSkillsFromDir(ctx, {
+		dir: getManagedSkillsDir(),
+		providerId: MANAGED_SKILLS_PROVIDER_ID,
+		level: "user",
+		requireDescription: true,
+	});
 }
 
 registerProvider<Skill>(skillCapability.id, {
@@ -266,6 +326,14 @@ registerProvider<Skill>(skillCapability.id, {
 	description: DESCRIPTION,
 	priority: PRIORITY,
 	load: loadSkills,
+});
+
+registerProvider<Skill>(skillCapability.id, {
+	id: MANAGED_SKILLS_PROVIDER_ID,
+	displayName: "Managed Skills (auto-learn)",
+	description: "Auto-generated managed skills from ~/.omp/agent/managed-skills",
+	priority: MANAGED_SKILLS_PRIORITY,
+	load: loadManagedSkills,
 });
 
 // Slash Commands
@@ -310,13 +378,47 @@ async function loadRules(ctx: LoadContext): Promise<LoadResult<Rule>> {
 		const result = await loadFilesFromDir<Rule>(ctx, rulesDir, PROVIDER_ID, level, {
 			extensions: ["md", "mdc"],
 			transform: (name, content, path, source) =>
-				buildRuleFromMarkdown(name, content, path, source, { stripNamePattern: /\.(md|mdc)$/ }),
+				discoverRuleFromMarkdown(name, content, path, source, { stripNamePattern: /\.(md|mdc)$/ }),
 		});
 		items.push(...result.items);
 		if (result.warnings) warnings.push(...result.warnings);
 	}
 
+	// Top-level RULES.md is a sticky always-apply rule. Documented in
+	// https://omp.sh/docs/context-files: its full body is carried on every
+	// request (system-prompt text, or image frames under snapcompact
+	// system-prompt imaging) so it keeps its hold across long sessions.
+	// User scope:    ~/.omp/agent/RULES.md
+	// Project scope: nearest .omp/RULES.md walking up from cwd to repoRoot
+	const userRulesFile = path.join(getAgentDir(), "RULES.md");
+	const userRule = await loadStickyRulesFile(userRulesFile, "user");
+	if (userRule) items.push(userRule);
+
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
+	if (nearestProjectConfigDir) {
+		const projectRulesFile = path.join(nearestProjectConfigDir.dir, "RULES.md");
+		const projectRule = await loadStickyRulesFile(projectRulesFile, "project");
+		if (projectRule) items.push(projectRule);
+	}
+
 	return { items, warnings };
+}
+
+/**
+ * Read a top-level `RULES.md` and synthesize an always-apply rule.
+ * Returns null when the file is absent or empty so callers can short-circuit.
+ */
+async function loadStickyRulesFile(filePath: string, level: "user" | "project"): Promise<Rule | null> {
+	const content = await readFile(filePath);
+	if (!content) return null;
+	const source = createSourceMeta(PROVIDER_ID, filePath, level);
+	const ruleName = level === "project" ? "RULES@project" : "RULES";
+	const rule = discoverRuleFromMarkdown("RULES.md", content, filePath, source, { ruleName });
+	if (!rule) return null;
+	// Force alwaysApply regardless of frontmatter — the whole point of RULES.md
+	// is that its body is carried on every request instead of degrading to an
+	// on-demand rulebook entry.
+	return { ...rule, alwaysApply: true };
 }
 
 registerProvider<Rule>(ruleCapability.id, {
@@ -749,22 +851,46 @@ async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 	const items: Settings[] = [];
 	const warnings: string[] = [];
 
+	const parseYamlSettings = (content: string, filePath: string): Record<string, unknown> | null => {
+		try {
+			const data = YAML.parse(content);
+			if (!data || typeof data !== "object" || Array.isArray(data)) return {};
+			return data as Record<string, unknown>;
+		} catch {
+			warnings.push(`Failed to parse ${filePath}`);
+			return null;
+		}
+	};
+
 	for (const { dir, level } of await getConfigDirs(ctx)) {
 		const settingsPath = path.join(dir, "settings.json");
-		const content = await readFile(settingsPath);
-		if (!content) continue;
-
-		const data = tryParseJson<Record<string, unknown>>(content);
-		if (!data) {
-			warnings.push(`Failed to parse ${settingsPath}`);
-			continue;
+		const settingsContent = await readFile(settingsPath);
+		if (settingsContent) {
+			const data = tryParseJson<Record<string, unknown>>(settingsContent);
+			if (data) {
+				items.push({
+					path: settingsPath,
+					data,
+					level,
+					_source: createSourceMeta(PROVIDER_ID, settingsPath, level),
+				});
+			} else {
+				warnings.push(`Failed to parse ${settingsPath}`);
+			}
 		}
 
+		const configPath = path.join(dir, "config.yml");
+		const configContent = await readFile(configPath);
+		if (!configContent) continue;
+
+		const data = parseYamlSettings(configContent, configPath);
+		if (!data) continue;
+
 		items.push({
-			path: settingsPath,
+			path: configPath,
 			data,
 			level,
-			_source: createSourceMeta(PROVIDER_ID, settingsPath, level),
+			_source: createSourceMeta(PROVIDER_ID, configPath, level),
 		});
 	}
 
@@ -784,7 +910,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	const items: ContextFile[] = [];
 	const warnings: string[] = [];
 
-	const userPath = path.join(ctx.home, PATHS.userAgent, "AGENTS.md");
+	const userPath = path.join(getAgentDir(), "AGENTS.md");
 	const userContent = await readFile(userPath);
 	if (userContent) {
 		items.push({
@@ -795,7 +921,7 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 		});
 	}
 
-	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd);
+	const nearestProjectConfigDir = await findNearestProjectConfigDir(ctx.cwd, ctx.repoRoot);
 	if (nearestProjectConfigDir) {
 		const projectPath = path.join(nearestProjectConfigDir.dir, "AGENTS.md");
 		const projectContent = await readFile(projectPath);

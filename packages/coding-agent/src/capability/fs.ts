@@ -15,6 +15,16 @@ export async function readFile(filePath: string): Promise<string | null> {
 	}
 
 	try {
+		// Gate on the file type first: discovery scans foreign config dirs
+		// (~/.claude, ~/.cursor, project trees), and reading a FIFO/socket/char
+		// device with `.text()` blocks until EOF — i.e. forever — hanging
+		// startup with zero output. `stat` follows symlinks, so symlinked
+		// context files (CLAUDE.md -> AGENTS.md) still resolve.
+		const stats = await fs.promises.stat(abs);
+		if (!stats.isFile()) {
+			contentCache.set(abs, null);
+			return null;
+		}
 		const content = await Bun.file(abs).text();
 		contentCache.set(abs, content);
 		return content;
@@ -59,6 +69,24 @@ export async function walkUp(
 		if (entry) {
 			if (file && entry.isFile()) return path.join(current, name);
 			if (dir && entry.isDirectory()) return path.join(current, name);
+		}
+		const parent = path.dirname(current);
+		if (parent === current) return null;
+		current = parent;
+	}
+}
+
+/**
+ * Walk up from startDir looking for a `.git` entry (file or directory).
+ * Returns the directory containing `.git` (the repo root), or null if not in a git repo.
+ * Results are based on the cached readDirEntries, so repeated calls are cheap.
+ */
+export async function findRepoRoot(startDir: string): Promise<string | null> {
+	let current = resolvePath(startDir);
+	while (true) {
+		const entries = await readDirEntries(current);
+		if (entries.some(e => e.name === ".git")) {
+			return current;
 		}
 		const parent = path.dirname(current);
 		if (parent === current) return null;

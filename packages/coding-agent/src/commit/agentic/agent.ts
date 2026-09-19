@@ -1,13 +1,13 @@
-import { INTENT_FIELD } from "@oh-my-pi/pi-agent-core";
+import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { Markdown } from "@oh-my-pi/pi-tui";
-import chalk from "chalk";
-import type { ControlledGit } from "../../commit/git";
+import { prompt } from "@oh-my-pi/pi-utils";
+import chalk from "@oh-my-pi/pi-utils/chalk";
+import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import typesDescriptionPrompt from "../../commit/prompts/types-description.md" with { type: "text" };
 import type { ModelRegistry } from "../../config/model-registry";
-import { renderPromptTemplate } from "../../config/prompt-templates";
 import type { Settings } from "../../config/settings";
-import { getMarkdownTheme } from "../../modes/theme/theme";
+import { getMarkdownTheme } from "@oh-my-pi/pi-tui/theme";
 import { createAgentSession } from "../../sdk";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import type { AuthStorage } from "../../session/auth-storage";
@@ -18,8 +18,8 @@ import { createCommitTools } from "./tools";
 
 export interface CommitAgentInput {
 	cwd: string;
-	git: ControlledGit;
 	model: Model<Api>;
+	thinkingLevel?: ThinkingLevel;
 	settings: Settings;
 	modelRegistry: ModelRegistry;
 	authStorage: AuthStorage;
@@ -29,6 +29,7 @@ export interface CommitAgentInput {
 	requireChangelog: boolean;
 	diffText?: string;
 	existingChangelogEntries?: ExistingChangelogEntries[];
+	onComplete?: (state: CommitAgentState) => Promise<void> | void;
 }
 
 export interface ExistingChangelogEntries {
@@ -37,15 +38,14 @@ export interface ExistingChangelogEntries {
 }
 
 export async function runCommitAgentSession(input: CommitAgentInput): Promise<CommitAgentState> {
-	const typesDescription = renderPromptTemplate(typesDescriptionPrompt);
-	const systemPrompt = renderPromptTemplate(agentSystemPrompt, {
+	const typesDescription = prompt.render(typesDescriptionPrompt);
+	const systemPrompt = prompt.render(agentSystemPrompt, {
 		types_description: typesDescription,
 	});
 	const state: CommitAgentState = { diffText: input.diffText };
-	const spawns = "quick_task";
+	const spawns = "sonic";
 	const tools = createCommitTools({
 		cwd: input.cwd,
-		git: input.git,
 		authStorage: input.authStorage,
 		modelRegistry: input.modelRegistry,
 		settings: input.settings,
@@ -61,13 +61,16 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 		modelRegistry: input.modelRegistry,
 		settings: input.settings,
 		model: input.model,
-		systemPrompt,
+		thinkingLevel: input.thinkingLevel,
+		systemPrompt: [systemPrompt],
 		customTools: tools,
 		enableLsp: false,
 		enableMCP: false,
 		hasUI: false,
 		spawns,
-		toolNames: ["__none__"],
+		toolNames: tools.map(tool => tool.name),
+		restrictToolNames: true,
+		allowRestrictedCustomTools: true,
 		contextFiles: input.contextFiles,
 		disableExtensionDiscovery: true,
 		skills: [],
@@ -80,12 +83,14 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 	let thinkingLineActive = false;
 	const toolArgsById = new Map<string, { name: string; args?: Record<string, unknown> }>();
 	const writeThinkingLine = (text: string) => {
+		if (!process.stdout.isTTY) return;
 		const line = chalk.dim(`… ${text}`);
 		process.stdout.write(`\r\x1b[2K${line}`);
 		thinkingLineActive = true;
 	};
 	const clearThinkingLine = () => {
 		if (!thinkingLineActive) return;
+		if (!process.stdout.isTTY) return;
 		process.stdout.write("\r\x1b[2K");
 		thinkingLineActive = false;
 	};
@@ -150,7 +155,7 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 	});
 
 	try {
-		const prompt = renderPromptTemplate(agentUserPrompt, {
+		const agentUserMessage = prompt.render(agentUserPrompt, {
 			user_context: input.userContext,
 			changelog_targets: input.changelogTargets.length > 0 ? input.changelogTargets.join("\n") : undefined,
 			existing_changelog_entries: input.existingChangelogEntries,
@@ -159,13 +164,23 @@ export async function runCommitAgentSession(input: CommitAgentInput): Promise<Co
 		let retryCount = 0;
 		const needsChangelog = input.requireChangelog && input.changelogTargets.length > 0;
 
-		await session.prompt(prompt, { expandPromptTemplates: false });
+		await session.prompt(agentUserMessage, {
+			attribution: "agent",
+			expandPromptTemplates: false,
+		});
 		while (retryCount < MAX_RETRIES && !isProposalComplete(state, needsChangelog)) {
 			retryCount += 1;
 			const reminder = buildReminderMessage(state, needsChangelog, retryCount, MAX_RETRIES);
-			await session.prompt(reminder, { expandPromptTemplates: false });
+			await session.prompt(reminder, {
+				attribution: "agent",
+				expandPromptTemplates: false,
+				synthetic: true,
+			});
 		}
 
+		if (input.onComplete) {
+			await input.onComplete(state);
+		}
 		return state;
 	} finally {
 		unsubscribe();
@@ -205,7 +220,7 @@ function writeAssistantMessage(message: string): void {
 	}
 }
 
-function renderMarkdownLines(message: string): string[] {
+function renderMarkdownLines(message: string): readonly string[] {
 	const width = Math.max(40, process.stdout.columns ?? 100);
 	const markdown = new Markdown(message, 0, 0, getMarkdownTheme());
 	return markdown.render(width);

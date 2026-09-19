@@ -16,7 +16,7 @@ import { getModel } from "@oh-my-pi/pi-ai";
 
 const agent = new Agent({
 	initialState: {
-		systemPrompt: "You are a helpful assistant.",
+		systemPrompt: ["You are a helpful assistant."],
 		model: getModel("anthropic", "claude-sonnet-4-20250514"),
 	},
 });
@@ -132,9 +132,9 @@ The last message in context must be `user` or `toolResult` (not `assistant`).
 const agent = new Agent({
   // Initial state
   initialState: {
-    systemPrompt: string,
+    systemPrompt: string[],
     model: Model,
-    thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh",
+    thinkingLevel: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max",
     tools: AgentTool<any>[],
     messages: AgentMessage[],
   },
@@ -151,8 +151,8 @@ const agent = new Agent({
   // Custom stream function (for proxy backends)
   streamFn: streamProxy,
 
-  // Dynamic API key resolution (for expiring OAuth tokens)
-  getApiKey: async (provider) => refreshToken(),
+  // Dynamic model-scoped API key resolution (for expiring OAuth tokens)
+  getApiKey: async (model) => tokenForModel(model),
 
   // Tool execution context (late-bound UI/session access)
   getToolContext: () => ({ /* app-defined */ }),
@@ -163,7 +163,7 @@ const agent = new Agent({
 
 ```typescript
 interface AgentState {
-	systemPrompt: string;
+	systemPrompt: string[];
 	model: Model;
 	thinkingLevel: ThinkingLevel;
 	tools: AgentTool<any>[];
@@ -279,17 +279,17 @@ const agent = new Agent({
 
 ## Tools
 
-Define tools using `AgentTool`:
+Define tools using `AgentTool` with an omptype parameter schema.
 
 ```typescript
-import { Type } from "@sinclair/typebox";
+import { type } from "@oh-my-pi/omptype";
 
 const readFileTool: AgentTool = {
 	name: "read_file",
 	label: "Read File", // For UI display
 	description: "Read a file's contents",
-	parameters: Type.Object({
-		path: Type.String({ description: "File path" }),
+	parameters: type({
+		path: type("string").describe("File path"),
 	}),
 	execute: async (toolCallId, params, signal, onUpdate, context) => {
 		const content = await fs.readFile(params.path, "utf-8");
@@ -348,7 +348,7 @@ For direct control without the Agent class:
 import { agentLoop, agentLoopContinue } from "@oh-my-pi/pi-agent";
 
 const context: AgentContext = {
-	systemPrompt: "You are helpful.",
+	systemPrompt: ["You are helpful."],
 	messages: [],
 	tools: [],
 };
@@ -369,6 +369,104 @@ for await (const event of agentLoopContinue(context, config)) {
 	console.log(event.type);
 }
 ```
+
+## Run-level telemetry
+Every `invoke_agent` produces two values alongside the OTEL spans:
+
+- **`AgentRunSummary`** — chat / tool / usage / cost / error counters bucketed
+  by status, with per-tool-name breakdowns. Pure aggregation, safe to
+  persist, diff, or assert.
+- **`AgentRunCoverage`** — sorted+deduped `toolsAvailable` / `toolsInvoked` /
+  `toolsUnused` / `modelsUsed` / `providersUsed` arrays. Stable for snapshot
+  tests.
+
+Three delivery channels (use whichever fits):
+
+### `agent_end` event (additive)
+
+```typescript
+for await (const event of agentLoop([userMessage], context, {
+	...config,
+	telemetry: {},
+})) {
+	if (event.type === "agent_end" && event.telemetry) {
+		console.log("tokens:", event.telemetry.usage.totalTokens);
+		console.log("unused tools:", event.coverage?.toolsUnused);
+	}
+}
+```
+
+The `messages` field is unchanged. Consumers that ignore `telemetry`/
+`coverage` continue to work.
+
+### `onRunEnd` hook (non-fatal)
+
+```typescript
+const stream = agentLoop([userMessage], context, {
+	...config,
+	telemetry: {
+		onRunEnd: (summary, coverage) => {
+			await persistRunSummary(summary, coverage);
+		},
+	},
+});
+```
+
+Exceptions thrown from `onRunEnd` are caught and logged via `console.warn`;
+a misbehaving telemetry consumer can **never** turn a successful agent run
+into a failed one.
+
+### `agentLoopDetailed` (typed `detailed()` result)
+
+Convenience wrapper that preserves the existing stream API and exposes the
+rollup as a typed value:
+
+```typescript
+const { stream, detailed } = agentLoopDetailed([userMessage], context, {
+	...config,
+	telemetry: {}, // required to populate telemetry/coverage
+});
+
+for await (const event of stream) {
+	// existing event handling
+}
+
+const { messages, telemetry, coverage } = await detailed();
+```
+
+`stream.result()` still resolves to `AgentMessage[]` — no breaking change.
+
+### Multi-run aggregation
+
+Callers that drive the loop multiple times (verify pass, benchmark harness)
+fold N summaries with `aggregateAgentRunSummaries` / `aggregateAgentRunCoverage`:
+
+```typescript
+import {
+	aggregateAgentRunSummaries,
+	aggregateAgentRunCoverage,
+} from "@oh-my-pi/pi-agent";
+
+const summaries: AgentRunSummary[] = [];
+const coverages: AgentRunCoverage[] = [];
+for (const target of targets) {
+	const { detailed } = agentLoopDetailed(/* ... */);
+	const result = await detailed();
+	if (result.telemetry) summaries.push(result.telemetry);
+	if (result.coverage) coverages.push(result.coverage);
+}
+const runSummary = aggregateAgentRunSummaries(summaries);
+const runCoverage = aggregateAgentRunCoverage(coverages);
+```
+
+### Tool status reporting
+
+`execute_tool` spans carry `pi.gen_ai.tool.status` ∈
+`"ok" | "error" | "skipped" | "blocked" | "timeout" | "aborted"`.
+`beforeToolCall` blocks throw a distinguishable `ToolCallBlockedError`
+internally; the catch path reports `status: "blocked"` instead of conflating
+with generic tool errors. Pre-run interrupts and tail-sweep skips are
+recorded as `"skipped"` even though they never start a span.
 
 ## License
 

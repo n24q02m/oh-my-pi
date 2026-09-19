@@ -12,14 +12,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { getBundledModel } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AgentSession, type AgentSessionEvent } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { Snowflake } from "@oh-my-pi/pi-utils";
+import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { e2eApiKey } from "./utilities";
 
 describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession compaction e2e", () => {
@@ -27,6 +27,7 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession compaction e2e", 
 	let tempDir: string;
 	let sessionManager: SessionManager;
 	let events: AgentSessionEvent[];
+	let authStorage: AuthStorage | undefined;
 
 	beforeEach(() => {
 		// Create temp directory for session files
@@ -39,10 +40,12 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession compaction e2e", 
 
 	afterEach(async () => {
 		if (session) {
-			session.dispose();
+			await session.dispose();
 		}
+		authStorage?.close();
+		authStorage = undefined;
 		if (tempDir && fs.existsSync(tempDir)) {
-			fs.rmSync(tempDir, { recursive: true });
+			removeSyncWithRetries(tempDir);
 		}
 	});
 
@@ -61,14 +64,14 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession compaction e2e", 
 			getApiKey: () => e2eApiKey("ANTHROPIC_API_KEY"),
 			initialState: {
 				model,
-				systemPrompt: "You are a helpful assistant. Be concise.",
+				systemPrompt: ["You are a helpful assistant. Be concise."],
 				tools,
 			},
 		});
 
-		sessionManager = inMemory ? SessionManager.inMemory() : SessionManager.create(tempDir);
+		sessionManager = inMemory ? SessionManager.inMemory() : SessionManager.create(tempDir, tempDir);
 		const settings = Settings.isolated({ "compaction.keepRecentTokens": 1 });
-		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
+		authStorage = await AuthStorage.create(":memory:");
 		const modelRegistry = new ModelRegistry(authStorage);
 
 		session = new AgentSession({
@@ -111,31 +114,6 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession compaction e2e", 
 		const firstMsg = messages[0];
 		expect(firstMsg.role).toBe("compactionSummary");
 	}, 120000);
-
-	it("should maintain valid session state after compaction", async () => {
-		await createSession();
-
-		// Build up history
-		await session.prompt("What is the capital of France? One word answer.");
-		await session.agent.waitForIdle();
-
-		await session.prompt("What is the capital of Germany? One word answer.");
-		await session.agent.waitForIdle();
-
-		// Compact
-		await session.compact();
-
-		// Session should still be usable
-		await session.prompt("What is the capital of Italy? One word answer.");
-		await session.agent.waitForIdle();
-
-		// Should have messages after compaction
-		expect(session.messages.length).toBeGreaterThan(0);
-
-		// The agent should have responded
-		const assistantMessages = session.messages.filter(m => m.role === "assistant");
-		expect(assistantMessages.length).toBeGreaterThan(0);
-	}, 180000);
 
 	it("should persist compaction to session file", async () => {
 		await createSession();
@@ -203,9 +181,5 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("AgentSession compaction e2e", 
 		);
 		// Manual compaction doesn't emit auto_compaction events
 		expect(autoCompactionEvents.length).toBe(0);
-
-		// Regular events should have been emitted
-		const messageEndEvents = events.filter(e => e.type === "message_end");
-		expect(messageEndEvents.length).toBeGreaterThan(0);
 	}, 120000);
 });

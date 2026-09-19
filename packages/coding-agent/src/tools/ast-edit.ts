@@ -1,73 +1,228 @@
+import type { AstEditToolDetails } from "@oh-my-pi/pi-tui/tools/ast-edit";
 import * as path from "node:path";
+import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { type AstReplaceChange, astEdit } from "@oh-my-pi/pi-natives";
-import type { Component } from "@oh-my-pi/pi-tui";
-import { Text } from "@oh-my-pi/pi-tui";
-import { untilAborted } from "@oh-my-pi/pi-utils";
-import { type Static, Type } from "@sinclair/typebox";
-import { renderPromptTemplate } from "../config/prompt-templates";
-import type { RenderResultOptions } from "../extensibility/custom-tools/types";
-import type { Theme } from "../modes/theme/theme";
-import { computeLineHash } from "../patch/hashline";
+import type { ToolExample } from "@oh-my-pi/pi-ai";
+import { type AstReplaceChange, type AstReplaceFileChange, astEdit } from "@oh-my-pi/pi-natives";
+
+import { $envpos, prompt, untilAborted } from "@oh-my-pi/pi-utils";
+import { getEditStore } from "../edit/store";
+import { normalizeToLF } from "../edit/normalize";
+import { formatHashlineHeader } from "@oh-my-pi/pi-tui/tools/hashline-format";
+
 import astEditDescription from "../prompts/tools/ast-edit.md" with { type: "text" };
-import { Ellipsis, Hasher, type RenderCache, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
+
 import { resolveFileDisplayMode } from "../utils/file-display-mode";
 import type { ToolSession } from ".";
-import type { OutputMeta } from "./output-meta";
-import { hasGlobPathChars, parseSearchPath, resolveToCwd } from "./path-utils";
+import { truncateForPrompt } from "./approval";
+import { parseReadUrlTarget } from "./fetch";
+import { createFileRecorder, formatResultPath } from "./file-recorder";
+import { formatGroupedFiles } from "@oh-my-pi/pi-tui/tools/grouped-file-output";
+
+import { isInternalUrlPath, resolveToolSearchScope } from "./path-utils";
 import {
+	capParseErrors,
+	formatCodeFrameLine,
 	formatCount,
-	formatEmptyMessage,
-	formatErrorMessage,
 	formatParseErrors,
-	PARSE_ERRORS_LIMIT,
-	PREVIEW_LIMITS,
-} from "./render-utils";
-import { ToolError } from "./tool-errors";
+} from "@oh-my-pi/pi-tui/render/render-utils";
+import { PREVIEW_PENDING_NOTICE, queueResolveHandler } from "./resolve";
+import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { toolResult } from "./tool-result";
 
-const astEditOpSchema = Type.Object({
-	pat: Type.String({ description: "AST pattern to match" }),
-	out: Type.String({ description: "Replacement template" }),
+const astEditOpSchema = type({
+	pat: type("string").describe("ast pattern"),
+	out: type("string").describe("replacement template"),
 });
 
-const astEditSchema = Type.Object({
-	ops: Type.Array(astEditOpSchema, {
-		description: "Rewrite ops as [{ pat, out }]",
-	}),
-	lang: Type.Optional(Type.String({ description: "Language override" })),
-	path: Type.Optional(Type.String({ description: "File, directory, or glob pattern to rewrite (default: cwd)" })),
-	selector: Type.Optional(Type.String({ description: "Optional selector for contextual pattern mode" })),
-	limit: Type.Optional(Type.Number({ description: "Max total replacements" })),
+const astEditSchema = type({
+	ops: astEditOpSchema.array().atLeastLength(1).describe("rewrite ops"),
+	paths: type("string")
+		.describe("file, directory, glob, or internal URL to rewrite")
+		.array()
+		.atLeastLength(1)
+		.describe("files, directories, globs, or internal URLs to rewrite"),
 });
 
-export interface AstEditToolDetails {
+interface AstEditCallOptions {
+	rewrites: Record<string, string>;
+	dryRun: boolean;
+	maxFiles: number;
+	failOnParseError: boolean;
+	signal?: AbortSignal;
+}
+
+interface AstEditAggregatedResult {
+	changes: AstReplaceChange[];
+	fileChanges: AstReplaceFileChange[];
 	totalReplacements: number;
 	filesTouched: number;
 	filesSearched: number;
 	applied: boolean;
 	limitReached: boolean;
 	parseErrors?: string[];
-	scopePath?: string;
-	files?: string[];
-	fileReplacements?: Array<{ path: string; count: number }>;
-	meta?: OutputMeta;
 }
+
+async function runAstEditTargets(
+	targets: Array<{ basePath: string; glob?: string }>,
+	commonBasePath: string,
+	options: AstEditCallOptions,
+): Promise<AstEditAggregatedResult> {
+	const aggregatedChanges: AstReplaceChange[] = [];
+	const fileCounts = new Map<string, number>();
+	const parseErrors: string[] = [];
+	let totalReplacements = 0;
+	let filesSearched = 0;
+	let limitReached = false;
+	let applied = !options.dryRun;
+	for (const target of targets) {
+		const targetResult = await astEdit({
+			rewrites: options.rewrites,
+			path: target.basePath,
+			glob: target.glob,
+			dryRun: options.dryRun,
+			maxFiles: options.maxFiles,
+			failOnParseError: options.failOnParseError,
+			signal: options.signal,
+		});
+		totalReplacements += targetResult.totalReplacements;
+		filesSearched += targetResult.filesSearched;
+		limitReached = limitReached || targetResult.limitReached;
+		applied = applied && targetResult.applied;
+		if (targetResult.parseErrors) parseErrors.push(...targetResult.parseErrors);
+		for (const change of targetResult.changes) {
+			const absolute = path.resolve(target.basePath, change.path);
+			const rebased = path.relative(commonBasePath, absolute).replace(/\\/g, "/");
+			aggregatedChanges.push({ ...change, path: rebased });
+		}
+		for (const fileChange of targetResult.fileChanges) {
+			const absolute = path.resolve(target.basePath, fileChange.path);
+			const rebased = path.relative(commonBasePath, absolute).replace(/\\/g, "/");
+			fileCounts.set(rebased, (fileCounts.get(rebased) ?? 0) + fileChange.count);
+		}
+	}
+	const fileChanges: AstReplaceFileChange[] = Array.from(fileCounts, ([changePath, count]) => ({
+		path: changePath,
+		count,
+	}));
+	return {
+		changes: aggregatedChanges,
+		fileChanges,
+		totalReplacements,
+		filesTouched: fileChanges.length,
+		filesSearched,
+		applied,
+		limitReached,
+		parseErrors: parseErrors.length > 0 ? parseErrors : undefined,
+	};
+}
+
+function runAstEditOnce(
+	targets: Array<{ basePath: string; glob?: string }> | undefined,
+	resolvedSearchPath: string,
+	globFilter: string | undefined,
+	options: AstEditCallOptions,
+): Promise<AstEditAggregatedResult> {
+	if (targets) {
+		return runAstEditTargets(targets, resolvedSearchPath, options);
+	}
+	return astEdit({
+		rewrites: options.rewrites,
+		path: resolvedSearchPath,
+		glob: globFilter,
+		dryRun: options.dryRun,
+		maxFiles: options.maxFiles,
+		failOnParseError: options.failOnParseError,
+		signal: options.signal,
+	});
+}
+
+type AstEditSchemaInfer = typeof astEditSchema.infer;
 
 export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolDetails> {
 	readonly name = "ast_edit";
+	readonly approval = (args: unknown) => {
+		const paths = Array.isArray((args as Partial<AstEditSchemaInfer>).paths)
+			? ((args as Partial<AstEditSchemaInfer>).paths as string[])
+			: [];
+		return paths.length > 0 && paths.every(path => isInternalUrlPath(path)) ? "read" : "write";
+	};
+	readonly formatApprovalDetails = (args: unknown): string[] => {
+		const params = args as Partial<AstEditSchemaInfer>;
+		const lines: string[] = [];
+		const ops = Array.isArray(params.ops) ? params.ops : [];
+		const firstOp = ops[0];
+		if (firstOp) {
+			lines.push(`Pattern: ${truncateForPrompt(firstOp.pat)}`);
+			lines.push(`Replacement: ${truncateForPrompt(firstOp.out)}`);
+			if (ops.length > 1) {
+				lines.push(`+${ops.length - 1} more op${ops.length === 2 ? "" : "s"}`);
+			}
+		}
+		if (Array.isArray(params.paths) && params.paths.length > 0) {
+			lines.push(`Paths: ${truncateForPrompt(params.paths.join(", "))}`);
+		}
+		return lines;
+	};
 	readonly label = "AST Edit";
+	readonly summary = "Perform AST-aware code edits (structural refactoring)";
 	readonly description: string;
 	readonly parameters = astEditSchema;
 	readonly strict = true;
+
+	readonly examples: readonly ToolExample<AstEditSchemaInfer>[] = [
+		{
+			caption: "Rename a call site across TypeScript files",
+			call: {
+				ops: [{ pat: "oldApi($$$ARGS)", out: "newApi($$$ARGS)" }],
+				paths: ["src/**/*.ts"],
+			},
+		},
+		{
+			caption: "Delete matching calls",
+			call: {
+				ops: [{ pat: "console.log($$$ARGS)", out: "" }],
+				paths: ["src/**/*.ts"],
+			},
+		},
+		{
+			caption: "Rewrite import source path",
+			call: {
+				ops: [{ pat: 'import { $$$IMPORTS } from "old-package"', out: 'import { $$$IMPORTS } from "new-package"' }],
+				paths: ["src/**/*.ts"],
+			},
+		},
+		{
+			caption: "Modernize to optional chaining (same metavariable enforces identity)",
+			call: {
+				ops: [{ pat: "$A && $A()", out: "$A?.()" }],
+				paths: ["src/**/*.ts"],
+			},
+		},
+		{
+			caption: "Swap two arguments using captures",
+			call: {
+				ops: [{ pat: "assertEqual($A, $B)", out: "assertEqual($B, $A)" }],
+				paths: ["tests/**/*.ts"],
+			},
+		},
+		{
+			caption: "Python — convert print calls to logging",
+			call: {
+				ops: [{ pat: "print($$$ARGS)", out: "logger.info($$$ARGS)" }],
+				paths: ["src/**/*.py"],
+			},
+		},
+	];
 	readonly deferrable = true;
+	readonly loadMode = "discoverable";
 	constructor(private readonly session: ToolSession) {
-		this.description = renderPromptTemplate(astEditDescription);
+		this.description = prompt.render(astEditDescription);
 	}
 
 	async execute(
 		_toolCallId: string,
-		params: Static<typeof astEditSchema>,
+		params: AstEditSchemaInfer,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<AstEditToolDetails>,
 		_context?: AgentToolContext,
@@ -90,74 +245,44 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				seenPatterns.add(pat);
 			}
 			const normalizedRewrites = Object.fromEntries(ops);
-			const maxReplacements = params.limit !== undefined ? Math.floor(params.limit) : undefined;
-			if (maxReplacements !== undefined && (!Number.isFinite(maxReplacements) || maxReplacements < 1)) {
-				throw new ToolError("limit must be a positive number");
-			}
-			const maxFiles = parseInt(process.env.PI_MAX_AST_FILES ?? "", 10) || 1000;
+			const maxFiles = $envpos("PI_MAX_AST_FILES", 1000);
 
-			let searchPath: string | undefined;
-			let globFilter: string | undefined;
-			const rawPath = params.path?.trim();
-			if (rawPath) {
-				const internalRouter = this.session.internalRouter;
-				if (internalRouter?.canHandle(rawPath)) {
-					if (hasGlobPathChars(rawPath)) {
-						throw new ToolError(`Glob patterns are not supported for internal URLs: ${rawPath}`);
-					}
-					const resource = await internalRouter.resolve(rawPath);
-					if (!resource.sourcePath) {
-						throw new ToolError(`Cannot rewrite internal URL without backing file: ${rawPath}`);
-					}
-					searchPath = resource.sourcePath;
-				} else {
-					const parsedPath = parseSearchPath(rawPath);
-					searchPath = resolveToCwd(parsedPath.basePath, this.session.cwd);
-					globFilter = parsedPath.glob;
-				}
-			}
+			const scope = await resolveToolSearchScope({
+				rawPaths: params.paths,
+				cwd: this.session.cwd,
+				internalUrlAction: "rewrite",
+				settings: this.session.settings,
+				signal,
+				sessionFile: this.session.getSessionFile() ?? undefined,
+				sessionId: this.session.sessionManager?.getSessionId?.() ?? this.session.getSessionId?.() ?? undefined,
+				agentRegistry: this.session.agentRegistry,
+				localProtocolOptions: this.session.localProtocolOptions,
+				skills: this.session.skills,
+				rules: this.session.activeRules,
+				resolveExternalUrl: async rawPath => {
+					if (!parseReadUrlTarget(rawPath)) return undefined;
+					throw new ToolError(
+						`Cannot rewrite external URL: ${rawPath}. Use \`read\` or \`search\` to inspect fetched web content; ast_edit only applies to local files.`,
+					);
+				},
+			});
+			const { searchPath: resolvedSearchPath, scopePath, isDirectory, multiTargets, globFilter } = scope;
 
-			const resolvedSearchPath = searchPath ?? resolveToCwd(".", this.session.cwd);
-			const scopePath = path.relative(this.session.cwd, resolvedSearchPath).replace(/\\/g, "/") || ".";
-			let isDirectory: boolean;
-			try {
-				const stat = await Bun.file(resolvedSearchPath).stat();
-				isDirectory = stat.isDirectory();
-			} catch {
-				throw new ToolError(`Path not found: ${resolvedSearchPath}`);
-			}
-
-			const result = await astEdit({
+			const result = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 				rewrites: normalizedRewrites,
-				lang: params.lang?.trim(),
-				path: resolvedSearchPath,
-				glob: globFilter,
-				selector: params.selector?.trim(),
 				dryRun: true,
-				maxReplacements,
 				maxFiles,
 				failOnParseError: false,
 				signal,
 			});
 
-			const formatPath = (filePath: string): string => {
-				const cleanPath = filePath.startsWith("/") ? filePath.slice(1) : filePath;
-				if (isDirectory) {
-					return cleanPath.replace(/\\/g, "/");
-				}
-				return path.basename(cleanPath);
-			};
+			const { errors: cappedParseErrors, total: parseErrorsTotal } = capParseErrors(result.parseErrors);
+			const formatPath = (filePath: string): string =>
+				formatResultPath(filePath, isDirectory, resolvedSearchPath, this.session.cwd);
 
-			const files = new Set<string>();
-			const fileList: string[] = [];
+			const { record: recordFile, list: fileList } = createFileRecorder();
 			const fileReplacementCounts = new Map<string, number>();
 			const changesByFile = new Map<string, AstReplaceChange[]>();
-			const recordFile = (relativePath: string) => {
-				if (!files.has(relativePath)) {
-					files.add(relativePath);
-					fileList.push(relativePath);
-				}
-			};
 			for (const fileChange of result.fileChanges) {
 				const relativePath = formatPath(fileChange.path);
 				recordFile(relativePath);
@@ -178,76 +303,92 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				filesSearched: result.filesSearched,
 				applied: result.applied,
 				limitReached: result.limitReached,
-				parseErrors: result.parseErrors,
+				...(cappedParseErrors.length > 0 ? { parseErrors: cappedParseErrors, parseErrorsTotal } : {}),
 				scopePath,
+				searchPath: resolvedSearchPath,
+				cwd: this.session.cwd,
 				files: fileList,
 				fileReplacements: [],
 			};
 
 			if (result.totalReplacements === 0) {
-				const parseMessage = result.parseErrors?.length
-					? `\n${formatParseErrors(result.parseErrors).join("\n")}`
+				const parseMessage = cappedParseErrors.length
+					? `\n${formatParseErrors(cappedParseErrors, parseErrorsTotal).join("\n")}`
 					: "";
 				return toolResult(baseDetails).text(`No replacements made${parseMessage}`).done();
 			}
 
 			const useHashLines = resolveFileDisplayMode(this.session).hashLines;
+			const hashContexts = new Map<string, { tag: string }>();
+			if (useHashLines) {
+				const snapshotStore = getEditStore(this.session);
+				for (const relativePath of fileList) {
+					const absolutePath = path.resolve(this.session.cwd, relativePath);
+					try {
+						const fullText = normalizeToLF(await Bun.file(absolutePath).text());
+						const tag = snapshotStore.recordSnapshot(absolutePath, fullText);
+						hashContexts.set(relativePath, { tag });
+					} catch {
+						// Best-effort: if a file disappears between ast-edit and rendering, emit plain line output.
+					}
+				}
+			}
 			const outputLines: string[] = [];
-			const renderChangesForFile = (relativePath: string) => {
+			const displayLines: string[] = [];
+			const renderChangesForFile = (relativePath: string): { model: string[]; display: string[] } => {
+				const modelOut: string[] = [];
+				const displayOut: string[] = [];
 				const fileChanges = changesByFile.get(relativePath) ?? [];
-				const lineWidth =
-					fileChanges.length > 0 ? Math.max(...fileChanges.map(change => change.startLine.toString().length)) : 1;
+				const hashContext = hashContexts.get(relativePath);
+				const lineNumberWidth = fileChanges.reduce(
+					(width, change) => Math.max(width, String(change.startLine).length),
+					0,
+				);
 				for (const change of fileChanges) {
 					const beforeFirstLine = change.before.split("\n", 1)[0] ?? "";
 					const afterFirstLine = change.after.split("\n", 1)[0] ?? "";
 					const beforeLine = beforeFirstLine.slice(0, 120);
 					const afterLine = afterFirstLine.slice(0, 120);
-					const beforeRef = useHashLines
-						? `${change.startLine}#${computeLineHash(change.startLine, beforeFirstLine)}`
-						: `${change.startLine.toString().padStart(lineWidth, " ")}:${change.startColumn}`;
-					const afterRef = useHashLines
-						? `${change.startLine}#${computeLineHash(change.startLine, afterFirstLine)}`
-						: `${change.startLine.toString().padStart(lineWidth, " ")}:${change.startColumn}`;
-					const lineSeparator = useHashLines ? ":" : " ";
-					outputLines.push(`-${beforeRef}${lineSeparator}${beforeLine}`);
-					outputLines.push(`+${afterRef}${lineSeparator}${afterLine}`);
+					const beforeRef = hashContext ? `${change.startLine}` : `${change.startLine}:${change.startColumn}`;
+					const afterRef = hashContext ? `${change.startLine}` : `${change.startLine}:${change.startColumn}`;
+					const lineSeparator = hashContext ? ":" : " ";
+					modelOut.push(`-${beforeRef}${lineSeparator}${beforeLine}`);
+					modelOut.push(`+${afterRef}${lineSeparator}${afterLine}`);
+					displayOut.push(formatCodeFrameLine("-", change.startLine, beforeLine, lineNumberWidth));
+					displayOut.push(formatCodeFrameLine("+", change.startLine, afterLine, lineNumberWidth));
 				}
+				return { model: modelOut, display: displayOut };
 			};
 
 			if (isDirectory) {
-				const filesByDirectory = new Map<string, string[]>();
-				for (const relativePath of fileList) {
-					const directory = path.dirname(relativePath).replace(/\\/g, "/");
-					if (!filesByDirectory.has(directory)) {
-						filesByDirectory.set(directory, []);
-					}
-					filesByDirectory.get(directory)!.push(relativePath);
-				}
-				for (const [directory, directoryFiles] of filesByDirectory) {
-					if (directory === ".") {
-						for (const relativePath of directoryFiles) {
-							if (outputLines.length > 0) {
-								outputLines.push("");
-							}
-							const count = fileReplacementCounts.get(relativePath) ?? 0;
-							outputLines.push(`# ${path.basename(relativePath)} (${formatCount("replacement", count)})`);
-							renderChangesForFile(relativePath);
-						}
-						continue;
-					}
-					if (outputLines.length > 0) {
-						outputLines.push("");
-					}
-					outputLines.push(`# ${directory}`);
-					for (const relativePath of directoryFiles) {
-						const count = fileReplacementCounts.get(relativePath) ?? 0;
-						outputLines.push(`## └─ ${path.basename(relativePath)} (${formatCount("replacement", count)})`);
-						renderChangesForFile(relativePath);
-					}
-				}
+				const grouped = formatGroupedFiles(fileList, relativePath => {
+					const rendered = renderChangesForFile(relativePath);
+					const count = fileReplacementCounts.get(relativePath) ?? 0;
+					const hashContext = hashContexts.get(relativePath);
+					const hashSuffix = hashContext ? `#${hashContext.tag}` : "";
+					return {
+						headerSuffix: `${hashSuffix} (${formatCount("replacement", count)})`,
+						modelLines: rendered.model,
+						displayLines: rendered.display,
+						skip: rendered.model.length === 0,
+					};
+				});
+				outputLines.push(...grouped.model);
+				displayLines.push(...grouped.display);
 			} else {
 				for (const relativePath of fileList) {
-					renderChangesForFile(relativePath);
+					const rendered = renderChangesForFile(relativePath);
+					if (rendered.model.length === 0) continue;
+					if (outputLines.length > 0) {
+						outputLines.push("");
+						displayLines.push("");
+					}
+					const hashContext = hashContexts.get(relativePath);
+					if (hashContext) {
+						outputLines.push(formatHashlineHeader(relativePath, hashContext.tag));
+					}
+					outputLines.push(...rendered.model);
+					displayLines.push(...rendered.display);
 				}
 			}
 
@@ -256,225 +397,114 @@ export class AstEditTool implements AgentTool<typeof astEditSchema, AstEditToolD
 				count: fileReplacementCounts.get(filePath) ?? 0,
 			}));
 			if (result.limitReached) {
-				outputLines.push("", "Limit reached; narrow path or increase limit.");
+				outputLines.push("", "Limit reached; narrow paths.");
 			}
-			if (result.parseErrors?.length) {
-				outputLines.push("", ...formatParseErrors(result.parseErrors));
+			if (cappedParseErrors.length) {
+				outputLines.push("", ...formatParseErrors(cappedParseErrors, parseErrorsTotal));
 			}
 
 			// Register pending action so `resolve` can apply or discard these previewed changes
 			if (!result.applied && result.totalReplacements > 0) {
 				const previewReplacementPlural = result.totalReplacements !== 1 ? "s" : "";
 				const previewFilePlural = result.filesTouched !== 1 ? "s" : "";
-				this.session.pendingActionStore?.push({
+				queueResolveHandler(this.session, {
 					label: `AST Edit: ${result.totalReplacements} replacement${previewReplacementPlural} in ${result.filesTouched} file${previewFilePlural}`,
 					sourceToolName: this.name,
 					apply: async (_reason: string) => {
-						const applyResult = await astEdit({
+						const applyResult = await runAstEditOnce(multiTargets, resolvedSearchPath, globFilter, {
 							rewrites: normalizedRewrites,
-							lang: params.lang?.trim(),
-							path: resolvedSearchPath,
-							glob: globFilter,
-							selector: params.selector?.trim(),
 							dryRun: false,
-							maxReplacements,
 							maxFiles,
 							failOnParseError: false,
 						});
+						const { errors: cappedApplyParseErrors, total: applyParseErrorsTotal } = capParseErrors(
+							applyResult.parseErrors,
+						);
+						const { record: recordAppliedFile, list: appliedFileList } = createFileRecorder();
+						const appliedFileReplacementCounts = new Map<string, number>();
+						for (const fileChange of applyResult.fileChanges) {
+							const relativePath = formatPath(fileChange.path);
+							recordAppliedFile(relativePath);
+							appliedFileReplacementCounts.set(
+								relativePath,
+								(appliedFileReplacementCounts.get(relativePath) ?? 0) + fileChange.count,
+							);
+						}
+						for (const change of applyResult.changes) {
+							recordAppliedFile(formatPath(change.path));
+						}
+						// The preview minted tags from pre-apply content; the rewrite just
+						// invalidated them. Re-record post-apply snapshots (canonical keys)
+						// so the model's next hashline edit anchors against fresh tags.
+						const freshTagLines: string[] = [];
+						if (useHashLines) {
+							const snapshotStore = getEditStore(this.session);
+							for (const relativePath of appliedFileList) {
+								const appliedAbsolutePath = path.resolve(this.session.cwd, relativePath);
+								try {
+									const fullText = normalizeToLF(await Bun.file(appliedAbsolutePath).text());
+									const freshTag = snapshotStore.recordSnapshot(appliedAbsolutePath, fullText);
+									freshTagLines.push(formatHashlineHeader(relativePath, freshTag));
+								} catch {
+									// File disappeared between apply and re-read; skip its tag.
+								}
+							}
+						}
+						const appliedFileReplacements = appliedFileList.map(filePath => ({
+							path: filePath,
+							count: appliedFileReplacementCounts.get(filePath) ?? 0,
+						}));
 						const appliedDetails: AstEditToolDetails = {
 							totalReplacements: applyResult.totalReplacements,
 							filesTouched: applyResult.filesTouched,
 							filesSearched: applyResult.filesSearched,
 							applied: applyResult.applied,
 							limitReached: applyResult.limitReached,
-							parseErrors: applyResult.parseErrors,
+							...(cappedApplyParseErrors.length > 0
+								? { parseErrors: cappedApplyParseErrors, parseErrorsTotal: applyParseErrorsTotal }
+								: {}),
 							scopePath,
-							files: fileList,
-							fileReplacements,
+							files: appliedFileList,
+							fileReplacements: appliedFileReplacements,
 						};
+						const stalePreview =
+							applyResult.totalReplacements !== result.totalReplacements ||
+							applyResult.filesTouched !== result.filesTouched ||
+							fileList.some(
+								filePath => appliedFileReplacementCounts.get(filePath) !== fileReplacementCounts.get(filePath),
+							) ||
+							appliedFileList.some(
+								filePath => fileReplacementCounts.get(filePath) !== appliedFileReplacementCounts.get(filePath),
+							);
+						if (stalePreview) {
+							const staleText =
+								applyResult.totalReplacements === 0
+									? `Preview is stale / no longer matches; no replacements were applied. Preview expected ${result.totalReplacements} replacement${previewReplacementPlural} in ${result.filesTouched} file${previewFilePlural}.`
+									: applyResult.totalReplacements < result.totalReplacements
+										? `Preview is stale / no longer matches; only ${applyResult.totalReplacements} of ${result.totalReplacements} replacements were applied in ${applyResult.filesTouched} of ${result.filesTouched} files.`
+										: `Preview is stale / no longer matches; applied ${applyResult.totalReplacements} replacements but preview expected ${result.totalReplacements}.`;
+							const staleWithTags =
+								freshTagLines.length > 0 ? `${staleText}\n${freshTagLines.join("\n")}` : staleText;
+							return { ...toolResult(appliedDetails).text(staleWithTags).done(), isError: true };
+						}
 						const appliedReplacementPlural = applyResult.totalReplacements !== 1 ? "s" : "";
 						const appliedFilePlural = applyResult.filesTouched !== 1 ? "s" : "";
-						const text = `Applied ${applyResult.totalReplacements} replacement${appliedReplacementPlural} in ${applyResult.filesTouched} file${appliedFilePlural}.`;
+						const appliedText = `Applied ${applyResult.totalReplacements} replacement${appliedReplacementPlural} in ${applyResult.filesTouched} file${appliedFilePlural}.`;
+						const text = freshTagLines.length > 0 ? `${appliedText}\n${freshTagLines.join("\n")}` : appliedText;
 						return toolResult(appliedDetails).text(text).done();
 					},
 				});
+				// The renderer's ⟨proposed⟩ badge is TUI-only; this line is the model's
+				// in-result signal that the diff above is staged, not applied.
+				outputLines.unshift(PREVIEW_PENDING_NOTICE, "");
 			}
 
 			const details: AstEditToolDetails = {
 				...baseDetails,
 				fileReplacements,
+				displayContent: displayLines.join("\n"),
 			};
 			return toolResult(details).text(outputLines.join("\n")).done();
 		});
 	}
 }
-
-// =============================================================================
-// TUI Renderer
-// =============================================================================
-
-interface AstEditRenderArgs {
-	ops?: Array<{ pat?: string; out?: string }>;
-	lang?: string;
-	path?: string;
-	selector?: string;
-	limit?: number;
-}
-
-const COLLAPSED_CHANGE_LIMIT = PREVIEW_LIMITS.COLLAPSED_LINES * 2;
-
-export const astEditToolRenderer = {
-	inline: true,
-	renderCall(args: AstEditRenderArgs, _options: RenderResultOptions, uiTheme: Theme): Component {
-		const meta: string[] = [];
-		if (args.lang) meta.push(`lang:${args.lang}`);
-		if (args.path) meta.push(`in ${args.path}`);
-		if (args.limit !== undefined) meta.push(`limit:${args.limit}`);
-		const rewriteCount = args.ops?.length ?? 0;
-		if (rewriteCount > 1) meta.push(`${rewriteCount} rewrites`);
-
-		const description = rewriteCount === 1 ? args.ops?.[0]?.pat : rewriteCount ? `${rewriteCount} rewrites` : "?";
-		const text = renderStatusLine({ icon: "pending", title: "AST Edit", description, meta }, uiTheme);
-		return new Text(text, 0, 0);
-	},
-
-	renderResult(
-		result: { content: Array<{ type: string; text?: string }>; details?: AstEditToolDetails; isError?: boolean },
-		options: RenderResultOptions,
-		uiTheme: Theme,
-		args?: AstEditRenderArgs,
-	): Component {
-		const details = result.details;
-
-		if (result.isError) {
-			const errorText = result.content?.find(c => c.type === "text")?.text || "Unknown error";
-			return new Text(formatErrorMessage(errorText, uiTheme), 0, 0);
-		}
-
-		const totalReplacements = details?.totalReplacements ?? 0;
-		const filesTouched = details?.filesTouched ?? 0;
-		const filesSearched = details?.filesSearched ?? 0;
-		const limitReached = details?.limitReached ?? false;
-
-		if (totalReplacements === 0) {
-			const rewriteCount = args?.ops?.length ?? 0;
-			const description = rewriteCount === 1 ? args?.ops?.[0]?.pat : undefined;
-			const meta = ["0 replacements"];
-			if (details?.scopePath) meta.push(`in ${details.scopePath}`);
-			if (filesSearched > 0) meta.push(`searched ${filesSearched}`);
-			const header = renderStatusLine({ icon: "warning", title: "AST Edit", description, meta }, uiTheme);
-			const lines = [header, formatEmptyMessage("No replacements made", uiTheme)];
-			if (details?.parseErrors?.length) {
-				const capped = details.parseErrors.slice(0, PARSE_ERRORS_LIMIT);
-				for (const err of capped) {
-					lines.push(uiTheme.fg("warning", `  - ${err}`));
-				}
-				if (details.parseErrors.length > PARSE_ERRORS_LIMIT) {
-					lines.push(uiTheme.fg("dim", `  … ${details.parseErrors.length - PARSE_ERRORS_LIMIT} more`));
-				}
-			}
-			return new Text(lines.join("\n"), 0, 0);
-		}
-
-		const summaryParts = [formatCount("replacement", totalReplacements), formatCount("file", filesTouched)];
-		const meta = [...summaryParts];
-		if (details?.scopePath) meta.push(`in ${details.scopePath}`);
-		meta.push(`searched ${filesSearched}`);
-		if (limitReached) meta.push(uiTheme.fg("warning", "limit reached"));
-		const rewriteCount = args?.ops?.length ?? 0;
-		const description = rewriteCount === 1 ? args?.ops?.[0]?.pat : undefined;
-
-		const textContent = result.content?.find(c => c.type === "text")?.text ?? "";
-		const rawLines = textContent.split("\n");
-		const hasSeparators = rawLines.some(line => line.trim().length === 0);
-		const allGroups: string[][] = [];
-		if (hasSeparators) {
-			let current: string[] = [];
-			for (const line of rawLines) {
-				if (line.trim().length === 0) {
-					if (current.length > 0) {
-						allGroups.push(current);
-						current = [];
-					}
-					continue;
-				}
-				current.push(line);
-			}
-			if (current.length > 0) allGroups.push(current);
-		} else {
-			const nonEmpty = rawLines.filter(line => line.trim().length > 0);
-			if (nonEmpty.length > 0) {
-				allGroups.push(nonEmpty);
-			}
-		}
-		const changeGroups = allGroups.filter(
-			group => !group[0]?.startsWith("Safety cap reached") && !group[0]?.startsWith("Parse issues:"),
-		);
-
-		const getCollapsedChangeLimit = (groups: string[][], maxLines: number): number => {
-			if (groups.length === 0) return 0;
-			let usedLines = 0;
-			let count = 0;
-			for (const group of groups) {
-				if (count > 0 && usedLines + group.length > maxLines) break;
-				usedLines += group.length;
-				count += 1;
-				if (usedLines >= maxLines) break;
-			}
-			return count;
-		};
-		const badge = { label: "proposed", color: "warning" as const };
-		const header = renderStatusLine(
-			{ icon: limitReached ? "warning" : "success", title: "AST Edit", description, badge, meta },
-			uiTheme,
-		);
-
-		const extraLines: string[] = [];
-		if (limitReached) {
-			extraLines.push(uiTheme.fg("warning", "limit reached; narrow path or increase limit"));
-		}
-		if (details?.parseErrors?.length) {
-			const total = details.parseErrors.length;
-			const label =
-				total > PARSE_ERRORS_LIMIT
-					? `${PARSE_ERRORS_LIMIT} / ${total} parse issues`
-					: `${total} parse issue${total !== 1 ? "s" : ""}`;
-			extraLines.push(uiTheme.fg("warning", label));
-		}
-		let cached: RenderCache | undefined;
-		return {
-			render(width: number): string[] {
-				const { expanded } = options;
-				const key = new Hasher().bool(expanded).u32(width).digest();
-				if (cached?.key === key) return cached.lines;
-				const maxCollapsed = expanded
-					? changeGroups.length
-					: getCollapsedChangeLimit(changeGroups, COLLAPSED_CHANGE_LIMIT);
-				const changeLines = renderTreeList(
-					{
-						items: changeGroups,
-						expanded,
-						maxCollapsed,
-						itemType: "change",
-						renderItem: group =>
-							group.map(line => {
-								if (line.startsWith("## ")) return uiTheme.fg("dim", line);
-								if (line.startsWith("# ")) return uiTheme.fg("accent", line);
-								if (line.startsWith("+")) return uiTheme.fg("toolDiffAdded", line);
-								if (line.startsWith("-")) return uiTheme.fg("toolDiffRemoved", line);
-								return uiTheme.fg("toolOutput", line);
-							}),
-					},
-					uiTheme,
-				);
-				const rendered = [header, ...changeLines, ...extraLines].map(l => truncateToWidth(l, width, Ellipsis.Omit));
-				cached = { key, lines: rendered };
-				return rendered;
-			},
-			invalidate() {
-				cached = undefined;
-			},
-		};
-	},
-	mergeCallAndResult: true,
-};

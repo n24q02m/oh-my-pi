@@ -2,7 +2,7 @@
  * Default themes for TUI tests using chalk
  */
 import type { EditorTheme, MarkdownTheme, SelectListTheme, SymbolTheme } from "@oh-my-pi/pi-tui";
-import { Chalk } from "chalk";
+import { Chalk } from "@oh-my-pi/pi-utils/chalk";
 
 const chalk = new Chalk({ level: 3 });
 
@@ -48,7 +48,7 @@ const defaultSymbols: SymbolTheme = {
 	spinnerFrames: ["-", "\\", "|", "/"],
 };
 
-export const defaultSelectListTheme: SelectListTheme = {
+const defaultSelectListTheme: SelectListTheme = {
 	selectedPrefix: (text: string) => chalk.blue(text),
 	selectedText: (text: string) => chalk.bold(text),
 	description: (text: string) => chalk.dim(text),

@@ -1,19 +1,49 @@
+import * as AIError from "../error";
 import type { AssistantMessage, AssistantMessageEvent } from "../types";
+
+/** Anything a stream watchdog can consult for in-flight consumer-side local work. */
+export interface LocalWorkSource {
+	readonly hasPendingLocalWork: boolean;
+}
 
 // Generic event stream class for async iteration
 export class EventStream<T, R = T> implements AsyncIterable<T> {
 	queue: T[] = [];
-	waiting: ((value: IteratorResult<T>) => void)[] = [];
+	waiting: Array<{ resolve: (value: IteratorResult<T>) => void; reject: (err: unknown) => void }> = [];
 	done = false;
+	/** True once finalResultPromise has been resolved or rejected. */
+	resultSettled = false;
+	#failed = false;
+	#error: unknown = undefined;
+	/**
+	 * Consumer-side local operations currently in flight for this stream — a
+	 * provider transport waiting on a server-requested local tool bridge
+	 * (e.g. the Cursor exec channel) before it can send the result upstream.
+	 * While non-zero, event silence is attributable to our own pending work,
+	 * not a provider stall; idle watchdogs consult {@link hasPendingLocalWork}.
+	 */
+	#pendingLocalWork = 0;
+	/**
+	 * A downstream stream whose local work also counts as ours — set when this
+	 * stream forwards another stream's events (e.g. the Cursor discovered-id
+	 * retry drains an inner stream), so the watchdog on this stream sees the
+	 * inner exec bridge's busy state instead of aborting a healthy tool run.
+	 */
+	#localWorkDelegate: LocalWorkSource | undefined;
 	finalResultPromise: Promise<R>;
 	resolveFinalResult!: (result: R) => void;
+	rejectFinalResult!: (err: unknown) => void;
 	isComplete: (event: T) => boolean;
 	extractResult: (event: T) => R;
 
 	constructor(isComplete: (event: T) => boolean, extractResult: (event: T) => R) {
-		const { promise, resolve } = Promise.withResolvers<R>();
+		const { promise, resolve, reject } = Promise.withResolvers<R>();
+		// Prevent an unhandled rejection when fail() is called but nobody awaits result().
+		// Callers who do await result() still receive the rejection normally.
+		promise.catch(() => {});
 		this.finalResultPromise = promise;
 		this.resolveFinalResult = resolve;
+		this.rejectFinalResult = reject;
 		this.isComplete = isComplete;
 		this.extractResult = extractResult;
 	}
@@ -23,13 +53,14 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 
 		if (this.isComplete(event)) {
 			this.done = true;
+			this.resultSettled = true;
 			this.resolveFinalResult(this.extractResult(event));
 		}
 
 		// Deliver to waiting consumer or queue it
 		const waiter = this.waiting.shift();
 		if (waiter) {
-			waiter({ value: event, done: false });
+			waiter.resolve({ value: event, done: false });
 		} else {
 			this.queue.push(event);
 		}
@@ -38,7 +69,7 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 	deliver(event: T): void {
 		const waiter = this.waiting.shift();
 		if (waiter) {
-			waiter({ value: event, done: false });
+			waiter.resolve({ value: event, done: false });
 		} else {
 			this.queue.push(event);
 		}
@@ -47,19 +78,40 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 	end(result?: R): void {
 		this.done = true;
 		if (result !== undefined) {
+			this.resultSettled = true;
 			this.resolveFinalResult(result);
+		} else if (!this.resultSettled) {
+			// end() without a terminal value must still settle result() —
+			// otherwise complete()/result() awaits hang forever.
+			this.resultSettled = true;
+			this.rejectFinalResult(
+				new AIError.ProviderResponseError("Stream ended without a final result", { kind: "envelope" }),
+			);
 		}
 		// Notify all waiting consumers that we're done
 		while (this.waiting.length > 0) {
 			const waiter = this.waiting.shift()!;
-			waiter({ value: undefined as any, done: true });
+			waiter.resolve({ value: undefined as any, done: true });
 		}
 	}
 
 	endWaiting(): void {
 		while (this.waiting.length > 0) {
 			const waiter = this.waiting.shift()!;
-			waiter({ value: undefined as any, done: true });
+			waiter.resolve({ value: undefined as any, done: true });
+		}
+	}
+
+	fail(err: unknown): void {
+		if (this.done) return;
+		this.done = true;
+		this.#failed = true;
+		this.#error = err;
+		this.resultSettled = true;
+		this.rejectFinalResult(err);
+		while (this.waiting.length > 0) {
+			const waiter = this.waiting.shift()!;
+			waiter.reject(err);
 		}
 	}
 
@@ -67,10 +119,14 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 		while (true) {
 			if (this.queue.length > 0) {
 				yield this.queue.shift()!;
+			} else if (this.#failed) {
+				throw this.#error;
 			} else if (this.done) {
 				return;
 			} else {
-				const result = await new Promise<IteratorResult<T>>(resolve => this.waiting.push(resolve));
+				const result = await new Promise<IteratorResult<T>>((resolve, reject) =>
+					this.waiting.push({ resolve, reject }),
+				);
 				if (result.done) return;
 				yield result.value;
 			}
@@ -80,25 +136,37 @@ export class EventStream<T, R = T> implements AsyncIterable<T> {
 	result(): Promise<R> {
 		return this.finalResultPromise;
 	}
-}
 
-// Delta events that can be batched for throttling
-type DeltaEvent =
-	| { type: "text_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
-	| { type: "thinking_delta"; contentIndex: number; delta: string; partial: AssistantMessage }
-	| { type: "toolcall_delta"; contentIndex: number; delta: string; partial: AssistantMessage };
+	/** True while local work tracked via {@link trackLocalWork} — on this stream or a forwarded delegate — is pending. */
+	get hasPendingLocalWork(): boolean {
+		return this.#pendingLocalWork > 0 || (this.#localWorkDelegate?.hasPendingLocalWork ?? false);
+	}
 
-function isDeltaEvent(event: AssistantMessageEvent): event is DeltaEvent {
-	return event.type === "text_delta" || event.type === "thinking_delta" || event.type === "toolcall_delta";
+	/**
+	 * Count `source`'s pending local work as this stream's own. Used when this
+	 * stream forwards another's events (Cursor discovered-id retry) so the
+	 * watchdog does not abort a live tool run happening on the inner stream.
+	 * Pass `undefined` to detach once forwarding ends.
+	 */
+	forwardLocalWorkFrom(source: LocalWorkSource | undefined): void {
+		this.#localWorkDelegate = source;
+	}
+
+	/**
+	 * Track a local-work promise so idle watchdogs on this stream do not treat
+	 * the event silence while it is pending as a provider stall.
+	 */
+	async trackLocalWork<TWork>(work: Promise<TWork>): Promise<TWork> {
+		this.#pendingLocalWork++;
+		try {
+			return await work;
+		} finally {
+			this.#pendingLocalWork--;
+		}
+	}
 }
 
 export class AssistantMessageEventStream extends EventStream<AssistantMessageEvent, AssistantMessage> {
-	// Throttling state
-	#deltaBuffer: DeltaEvent[] = [];
-	#flushTimer?: NodeJS.Timeout;
-	#lastFlushTime = 0;
-	readonly #throttleMs = 50; // 20 updates/sec
-
 	constructor() {
 		super(
 			event => event.type === "done" || event.type === "error",
@@ -108,7 +176,7 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 				} else if (event.type === "error") {
 					return event.error;
 				}
-				throw new Error("Unexpected event type for final result");
+				throw new AIError.ProviderResponseError("Unexpected event type for final result", { kind: "envelope" });
 			},
 		);
 	}
@@ -116,94 +184,41 @@ export class AssistantMessageEventStream extends EventStream<AssistantMessageEve
 	override push(event: AssistantMessageEvent): void {
 		if (this.done) return;
 
-		// Check for completion first
+		if (event.type === "error" && event.error.stopReason === "error") {
+			AIError.classifyMessage(event.error);
+		}
+
+		// Completion resolves the final result and still emits the terminal event.
 		if (this.isComplete(event)) {
-			this.#flushDeltas(); // Flush any pending deltas before completing
 			this.done = true;
+			this.resultSettled = true;
 			this.resolveFinalResult(this.extractResult(event));
 		}
 
-		// Delta events get batched and throttled
-		if (isDeltaEvent(event)) {
-			this.#deltaBuffer.push(event);
-			this.#scheduleFlush();
-			return;
-		}
-
-		// Non-delta events flush pending deltas immediately, then emit
-		this.#flushDeltas();
 		this.deliver(event);
 	}
 
 	override end(result?: AssistantMessage): void {
-		this.#flushDeltas();
 		this.done = true;
 		if (result !== undefined) {
+			if (result.stopReason === "error") {
+				AIError.classifyMessage(result);
+			}
+			this.resultSettled = true;
 			this.resolveFinalResult(result);
+		} else if (!this.resultSettled) {
+			// Mirror the base class: a result-less end() must not leave
+			// result() pending forever.
+			this.resultSettled = true;
+			this.rejectFinalResult(
+				new AIError.ProviderResponseError("Stream ended without a final result", { kind: "envelope" }),
+			);
 		}
 		this.endWaiting();
 	}
+}
 
-	#scheduleFlush(): void {
-		if (this.#flushTimer) return; // Already scheduled
-
-		const now = Bun.nanoseconds();
-		const timeSinceLastFlush = (now - this.#lastFlushTime) / 1e6;
-
-		if (timeSinceLastFlush >= this.#throttleMs) {
-			// Flush immediately if throttle window has passed
-			this.#flushDeltas();
-		} else {
-			// Schedule flush for when throttle window expires
-			const delay = this.#throttleMs - timeSinceLastFlush;
-			this.#flushTimer = setTimeout(() => {
-				this.#flushTimer = undefined;
-				this.#flushDeltas();
-			}, delay);
-		}
-	}
-
-	#flushDeltas(): void {
-		if (this.#flushTimer) {
-			clearTimeout(this.#flushTimer);
-			this.#flushTimer = undefined;
-		}
-
-		if (this.#deltaBuffer.length === 0) return;
-
-		// Merge consecutive deltas for the same content block and type
-		const merged = this.#mergeDeltas(this.#deltaBuffer);
-		this.#deltaBuffer = [];
-		this.#lastFlushTime = Bun.nanoseconds();
-
-		for (const event of merged) {
-			this.deliver(event);
-		}
-	}
-
-	#mergeDeltas(deltas: DeltaEvent[]): AssistantMessageEvent[] {
-		if (deltas.length === 0) return [];
-		if (deltas.length === 1) return [deltas[0]];
-
-		const result: AssistantMessageEvent[] = [];
-		let current = deltas[0];
-
-		for (let i = 1; i < deltas.length; i++) {
-			const next = deltas[i];
-			// Can merge if same type, same content index
-			if (next.type === current.type && next.contentIndex === current.contentIndex) {
-				current = {
-					...current,
-					delta: current.delta + next.delta,
-					partial: next.partial, // Use latest partial
-				} as DeltaEvent;
-			} else {
-				result.push(current);
-				current = next;
-			}
-		}
-		result.push(current);
-
-		return result;
-	}
+/** Create an assistant-message event stream for legacy extension providers. */
+export function createAssistantMessageEventStream(): AssistantMessageEventStream {
+	return new AssistantMessageEventStream();
 }

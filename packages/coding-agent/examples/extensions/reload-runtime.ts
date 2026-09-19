@@ -5,10 +5,11 @@
  * tool that queues a follow-up command to trigger reload.
  */
 
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { Type } from "@sinclair/typebox";
+import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
 
 export default function (pi: ExtensionAPI) {
+	const z = pi.zod;
+
 	// Command entrypoint for reload.
 	// Treat reload as terminal for this handler.
 	pi.registerCommand("reload-runtime", {
@@ -25,9 +26,9 @@ export default function (pi: ExtensionAPI) {
 		name: "reload_runtime",
 		label: "Reload Runtime",
 		description: "Reload extensions, skills, prompts, and themes",
-		parameters: Type.Object({}),
+		parameters: z.object({}),
 		async execute() {
-			pi.sendUserMessage("/reload-runtime", { deliverAs: "followUp" });
+			pi.sendUserMessage("/reload-runtime", { deliverAs: "followUp", attribution: "agent" });
 			return {
 				content: [{ type: "text", text: "Queued /reload-runtime as a follow-up command." }],
 				details: {},

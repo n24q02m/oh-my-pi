@@ -1,5 +1,5 @@
 import type { Component } from "../tui";
-import { padding, truncateToWidth } from "../utils";
+import { padding, truncateToWidth, visibleWidth } from "../utils";
 
 /**
  * Text component that truncates to fit viewport width
@@ -8,18 +8,38 @@ export class TruncatedText implements Component {
 	#text: string;
 	#paddingX: number;
 	#paddingY: number;
+	#cachedWidth = -1;
+	#cachedLines: string[] | undefined;
 
 	constructor(text: string, paddingX: number = 0, paddingY: number = 0) {
 		this.#text = text;
 		this.#paddingX = paddingX;
 		this.#paddingY = paddingY;
 	}
-
-	invalidate(): void {
-		// No cached state to invalidate currently
+	/** Return bounded source text and the last-known truncation state. */
+	debugState(): Record<string, unknown> {
+		const newlineIndex = this.#text.indexOf("\n");
+		const firstLine = newlineIndex === -1 ? this.#text : this.#text.slice(0, newlineIndex);
+		const availableWidth = Math.max(1, this.#cachedWidth - this.#paddingX * 2);
+		return {
+			textPreview: this.#text.slice(0, 120),
+			textLength: this.#text.length,
+			previewTruncated: this.#text.length > 120,
+			truncated: newlineIndex !== -1 || (this.#cachedWidth >= 0 && visibleWidth(firstLine) > availableWidth),
+			paddingX: this.#paddingX,
+			paddingY: this.#paddingY,
+		};
 	}
 
-	render(width: number): string[] {
+	invalidate(): void {
+		this.#cachedWidth = -1;
+		this.#cachedLines = undefined;
+	}
+
+	render(width: number): readonly string[] {
+		if (this.#cachedLines && this.#cachedWidth === width) {
+			return this.#cachedLines;
+		}
 		const result: string[] = [];
 
 		// Empty line padded to width
@@ -56,6 +76,8 @@ export class TruncatedText implements Component {
 			result.push(emptyLine);
 		}
 
+		this.#cachedWidth = width;
+		this.#cachedLines = result;
 		return result;
 	}
 }

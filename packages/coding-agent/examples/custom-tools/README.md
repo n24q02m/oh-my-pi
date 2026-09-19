@@ -47,8 +47,6 @@ See [docs/custom-tools.md](../../docs/custom-tools.md) for full documentation.
 **Factory pattern:**
 
 ```typescript
-import { Type } from "@sinclair/typebox";
-import { StringEnum } from "@oh-my-pi/pi-ai";
 import { Text } from "@oh-my-pi/pi-tui";
 import type { CustomToolFactory } from "@oh-my-pi/pi-coding-agent";
 
@@ -56,8 +54,8 @@ const factory: CustomToolFactory = (pi) => ({
 	name: "my_tool",
 	label: "My Tool",
 	description: "Tool description for LLM",
-	parameters: Type.Object({
-		action: StringEnum(["list", "add"] as const),
+	parameters: pi.zod.object({
+		action: pi.zod.enum(["list", "add"]),
 	}),
 
 	// Called on session start/switch/branch/clear
@@ -77,7 +75,6 @@ const factory: CustomToolFactory = (pi) => ({
 
 export default factory;
 ```
-
 **Custom rendering:**
 
 ```typescript
@@ -96,14 +93,12 @@ renderResult(result, { expanded, isPartial }, theme) {
 },
 ```
 
-**Use StringEnum for string parameters** (required for Google API compatibility):
+**Use `z.enum` for discriminated string tool args:**
 
 ```typescript
-import { StringEnum } from "@oh-my-pi/pi-ai";
+const z = pi.zod;
 
-// Good
-action: StringEnum(["list", "add"] as const);
-
-// Bad - doesn't work with Google
-action: Type.Union([Type.Literal("list"), Type.Literal("add")]);
+parameters: z.object({
+	action: z.enum(["list", "add"]),
+});
 ```

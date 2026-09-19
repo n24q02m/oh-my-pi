@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import { getBundledModel } from "@oh-my-pi/pi-ai/models";
 import { complete, stream } from "@oh-my-pi/pi-ai/stream";
 import type { Api, Context, Model, OptionsForApi } from "@oh-my-pi/pi-ai/types";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
@@ -24,7 +24,7 @@ async function testAbortSignal<TApi extends Api>(llm: Model<TApi>, options: Opti
 	let abortFired = false;
 	let text = "";
 	const controller = new AbortController();
-	const response = await stream(llm, context, { ...options, signal: controller.signal });
+	const response = stream(llm, context, { ...options, signal: controller.signal });
 	for await (const event of response) {
 		if (abortFired) return;
 		if (event.type === "text_delta" || event.type === "thinking_delta") {

@@ -1,7 +1,11 @@
 /**
  * Shared types and utilities for web-fetch handlers
  */
+import { scheduler } from "node:timers/promises";
 import { ptree } from "@oh-my-pi/pi-utils";
+import type TurndownService from "@oh-my-pi/pi-utils/turndown";
+
+import type { AgentStorage } from "../../session/agent-storage";
 import { ToolAbortError } from "../../tools/tool-errors";
 
 export { formatNumber } from "@oh-my-pi/pi-utils";
@@ -17,7 +21,12 @@ export interface RenderResult {
 	notes: string[];
 }
 
-export type SpecialHandler = (url: string, timeout: number, signal?: AbortSignal) => Promise<RenderResult | null>;
+export type SpecialHandler = (
+	url: string,
+	timeout: number,
+	signal?: AbortSignal,
+	storage?: AgentStorage | null,
+) => Promise<RenderResult | null>;
 
 export const MAX_OUTPUT_CHARS = 500_000;
 export const MAX_BYTES = 50 * 1024 * 1024;
@@ -62,6 +71,12 @@ export interface LoadPageOptions {
 	body?: string;
 	maxBytes?: number;
 	signal?: AbortSignal;
+	/**
+	 * Return true to skip reading the response body for this content type
+	 * (lowercased mime, no params). The caller is expected to re-fetch the
+	 * payload as binary; this avoids streaming + decoding huge binaries twice.
+	 */
+	skipBodyForContentType?: (contentType: string) => boolean;
 }
 
 export interface LoadPageResult {
@@ -70,6 +85,51 @@ export interface LoadPageResult {
 	finalUrl: string;
 	ok: boolean;
 	status?: number;
+	/** True when the body was cut mid-stream at maxBytes. */
+	truncated?: boolean;
+	/** Last transport-level error message when ok is false. */
+	error?: string;
+	/** True when the body read was skipped via skipBodyForContentType. */
+	bodySkipped?: boolean;
+}
+
+const RETRY_AFTER_MAX_MS = 10_000;
+
+/** Parse a Retry-After header (seconds or HTTP-date) into a bounded delay. */
+function parseRetryAfterMs(value: string | null): number {
+	if (!value) return 1_000;
+	const seconds = Number(value);
+	if (Number.isFinite(seconds)) return Math.min(Math.max(seconds, 0) * 1000, RETRY_AFTER_MAX_MS);
+	const date = Date.parse(value);
+	if (!Number.isNaN(date)) return Math.min(Math.max(date - Date.now(), 0), RETRY_AFTER_MAX_MS);
+	return 1_000;
+}
+
+function charsetFromContentType(header: string): string | undefined {
+	return /charset\s*=\s*"?([\w-]+)"?/i.exec(header)?.[1];
+}
+
+/**
+ * Decode a response body honoring the declared charset (Content-Type header,
+ * then a cheap <meta charset> sniff), falling back to UTF-8.
+ */
+function decodeBody(bytes: Buffer, contentTypeHeader: string): string {
+	let label = charsetFromContentType(contentTypeHeader);
+	if (!label) {
+		// All charsets we can decode are ASCII-compatible in the prefix, so a
+		// latin1 view of the first 2KB is enough to find a <meta charset>.
+		label = /<meta[^>]+charset\s*=\s*["']?([\w-]+)/i.exec(bytes.subarray(0, 2048).toString("latin1"))?.[1];
+	}
+	if (label && !/^utf-?8$/i.test(label)) {
+		try {
+			// Bun.Encoding's union is narrower than the runtime, which accepts
+			// WHATWG labels (shift_jis, euc-kr, gbk, big5, …); unknowns throw here.
+			return new TextDecoder(label as Bun.Encoding).decode(bytes);
+		} catch {
+			// Unknown/unsupported label — fall back to UTF-8.
+		}
+	}
+	return bytes.toString("utf-8");
 }
 
 /**
@@ -78,6 +138,8 @@ export interface LoadPageResult {
 export async function loadPage(url: string, options: LoadPageOptions = {}): Promise<LoadPageResult> {
 	const { timeout = 20, headers = {}, maxBytes = MAX_BYTES, signal, method = "GET", body } = options;
 
+	let lastError: string | undefined;
+	let retried429 = false;
 	for (let attempt = 0; attempt < USER_AGENTS.length; attempt++) {
 		if (signal?.aborted) {
 			throw new ToolAbortError();
@@ -106,8 +168,30 @@ export async function loadPage(url: string, options: LoadPageOptions = {}): Prom
 
 			const response = await fetch(url, requestInit);
 
-			const contentType = response.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() ?? "";
+			const rawContentType = response.headers.get("content-type") ?? "";
+			const contentType = rawContentType.split(";")[0]?.trim().toLowerCase() ?? "";
 			const finalUrl = response.url;
+
+			if (response.status === 429 && !retried429) {
+				// Rate limited: retry once, honoring a bounded Retry-After. The
+				// wait observes the caller's signal so an Esc during the backoff
+				// does not stall for up to the full delay.
+				retried429 = true;
+				const delayMs = parseRetryAfterMs(response.headers.get("retry-after"));
+				void response.body?.cancel().catch(() => {});
+				try {
+					await scheduler.wait(delayMs, { signal });
+				} catch {
+					throw new ToolAbortError();
+				}
+				attempt--; // Reuse the same user agent for the retry.
+				continue;
+			}
+
+			if (response.ok && options.skipBodyForContentType?.(contentType)) {
+				void response.body?.cancel().catch(() => {});
+				return { content: "", contentType, finalUrl, ok: true, status: response.status, bodySkipped: true };
+			}
 
 			const reader = response.body?.getReader();
 			if (!reader) {
@@ -116,6 +200,7 @@ export async function loadPage(url: string, options: LoadPageOptions = {}): Prom
 
 			const chunks: Uint8Array[] = [];
 			let totalSize = 0;
+			let truncated = false;
 
 			while (true) {
 				const { done, value } = await reader.read();
@@ -125,69 +210,58 @@ export async function loadPage(url: string, options: LoadPageOptions = {}): Prom
 				totalSize += value.length;
 
 				if (totalSize > maxBytes) {
-					reader.cancel();
+					truncated = true;
+					void reader.cancel().catch(() => {});
 					break;
 				}
 			}
 
-			const content = Buffer.concat(chunks).toString("utf-8");
+			const content = decodeBody(Buffer.concat(chunks), rawContentType);
 			if (isBotBlocked(response.status, content) && attempt < USER_AGENTS.length - 1) {
 				continue;
 			}
 
 			if (!response.ok) {
-				return { content, contentType, finalUrl, ok: false, status: response.status };
+				return { content, contentType, finalUrl, ok: false, status: response.status, truncated };
 			}
 
-			return { content, contentType, finalUrl, ok: true, status: response.status };
-		} catch {
+			return { content, contentType, finalUrl, ok: true, status: response.status, truncated };
+		} catch (error) {
 			if (signal?.aborted) {
 				throw new ToolAbortError();
 			}
+			lastError = error instanceof Error ? error.message : String(error);
 			if (attempt === USER_AGENTS.length - 1) {
-				return { content: "", contentType: "", finalUrl: url, ok: false };
+				return { content: "", contentType: "", finalUrl: url, ok: false, error: lastError };
 			}
 		}
 	}
 
-	return { content: "", contentType: "", finalUrl: url, ok: false };
+	return { content: "", contentType: "", finalUrl: url, ok: false, error: lastError };
+}
+
+/** Module-level Turndown instance — built lazily on first use. */
+let turndownPromise: Promise<TurndownService> | undefined;
+
+function getTurndown(): Promise<TurndownService> {
+	turndownPromise ||= initTurndown();
+	return turndownPromise;
+}
+
+async function initTurndown(): Promise<TurndownService> {
+	// Lazy import keeps turndown/turndown-plugin-gfm off the startup graph.
+	const { createTurndown } = await import("../../utils/turndown");
+	return createTurndown();
 }
 
 /**
- * Convert basic HTML to markdown
+ * Convert HTML to markdown using Turndown with GFM support.
+ * Strips script/style tags before conversion.
  */
-export function htmlToBasicMarkdown(html: string): string {
-	const stripped = html
-		.replace(/<pre[^>]*><code[^>]*>/g, "\n```\n")
-		.replace(/<\/code><\/pre>/g, "\n```\n")
-		.replace(/<code[^>]*>/g, "`")
-		.replace(/<\/code>/g, "`")
-		.replace(/<strong[^>]*>/g, "**")
-		.replace(/<\/strong>/g, "**")
-		.replace(/<b[^>]*>/g, "**")
-		.replace(/<\/b>/g, "**")
-		.replace(/<em[^>]*>/g, "*")
-		.replace(/<\/em>/g, "*")
-		.replace(/<i[^>]*>/g, "*")
-		.replace(/<\/i>/g, "*")
-		.replace(
-			/<a[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/g,
-			(_, href, text) => `[${text.replace(/<[^>]+>/g, "").trim()}](${href})`,
-		)
-		.replace(/<p[^>]*>/g, "\n\n")
-		.replace(/<\/p>/g, "")
-		.replace(/<br\s*\/?>/g, "\n")
-		.replace(/<li[^>]*>/g, "- ")
-		.replace(/<\/li>/g, "\n")
-		.replace(/<\/?[uo]l[^>]*>/g, "\n")
-		.replace(/<h(\d)[^>]*>/g, (_, n) => `\n${"#".repeat(parseInt(n, 10))} `)
-		.replace(/<\/h\d>/g, "\n")
-		.replace(/<blockquote[^>]*>/g, "\n> ")
-		.replace(/<\/blockquote>/g, "\n")
-		.replace(/<[^>]+>/g, "")
-		.replace(/\n{3,}/g, "\n\n")
-		.trim();
-	return decodeHtmlEntities(stripped);
+export async function htmlToBasicMarkdown(html: string): Promise<string> {
+	const cleaned = html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "");
+	const turndown = await getTurndown();
+	return turndown.turndown(cleaned).trim();
 }
 
 /**
@@ -263,5 +337,18 @@ export function getLocalizedText(value: LocalizedText, defaultLocale?: string): 
 	if (defaultLocale && value[defaultLocale]) return value[defaultLocale];
 	return (
 		value["en-US"] ?? value.en_US ?? value.en ?? Object.values(value).find(v => typeof v === "string") ?? undefined
+	);
+}
+
+/**
+ * Check if content looks like HTML by inspecting the leading tag.
+ */
+export function looksLikeHtml(content: string): boolean {
+	const trimmed = content.trim().toLowerCase();
+	return (
+		trimmed.startsWith("<!doctype") ||
+		trimmed.startsWith("<html") ||
+		trimmed.startsWith("<head") ||
+		trimmed.startsWith("<body")
 	);
 }

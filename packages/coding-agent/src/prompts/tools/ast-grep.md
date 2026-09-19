@@ -1,34 +1,20 @@
-Performs structural code search using AST matching via native ast-grep.
+Structural code search via ast-grep. Use when syntax shape matters more than text (calls, declarations, language constructs).
 
 <instruction>
-- Use this when syntax shape matters more than raw text (calls, declarations, specific language constructs)
-- Prefer a precise `path` scope to keep results targeted and deterministic (`path` accepts files, directories, or glob patterns)
-- Default to language-scoped search in mixed repositories: pair `path` glob + explicit `lang` to avoid parse-noise from non-source files
-- `patterns` is required and must include at least one non-empty AST pattern; `lang` is optional (`lang` is inferred per file extension when omitted)
-- Multiple patterns run in one native pass; results are merged and then `offset`/`limit` are applied to the combined match set
-- Use `selector` only for contextual pattern mode; otherwise provide direct patterns
-- For variadic arguments/fields, use `$$$NAME` (not `$$NAME`)
-- Patterns match AST structure, not text — whitespace/formatting differences are ignored
-- When the same metavariable appears multiple times, all occurrences must match identical code
+- Narrow each call to one language. `pat` is ONE AST pattern; separate calls for unrelated patterns.
+- Set `lang` when extension inference is ambiguous (for example, `cpp` for `.h`); `.cu` and `.cuh` infer as C++.
+- `$NAME` captures one node; `$_` matches without binding; `$$$NAME` zero-or-more; `$$$` zero-or-more unbound.
+  - Use `$$$NAME`, NOT `$$NAME` (invalid). Names UPPERCASE, whole node — `prefix$VAR` fails.
+- Same metavariable twice → MUST match identical code (`$A == $A` matches `x == x`, not `x == y`).
+- Patterns MUST parse as single AST node. Non-standalone → wrap: `class $_ { … }`.
+- C++ expression-statement calls need trailing `;`: `ns::doThing($ARG);`, `$CALLEE($ARG);`.
+- TS: tolerate annotations — `async function $NAME($$$ARGS): $_ { $$$BODY }`.
+- Declaration forms are distinct — `function foo`, method `foo()`, `const foo = () => {}`; search the right form before concluding absence.
+- Loosest existence check: `pat: "executeBash"` with narrow `path`.
 </instruction>
 
-<output>
-- Returns grouped matches with file path, byte range, line/column ranges, and metavariable captures
-- Includes summary counts (`totalMatches`, `filesWithMatches`, `filesSearched`) and parse issues when present
-</output>
-
-<examples>
-- Find all console logging calls in one pass (multi-pattern, scoped):
-  `{"patterns":["console.log($$$)","console.error($$$)"],"lang":"typescript","path":"src/"}`
-- Capture and inspect metavariable bindings from a pattern:
-  `{"patterns":["require($MOD)"],"lang":"javascript","path":"src/"}`
-- Contextual pattern with selector — match only the identifier `foo`, not the whole call:
-  `{"patterns":["foo()"],"selector":"identifier","lang":"typescript","path":"src/utils.ts"}`
-</examples>
-
 <critical>
-- `patterns` is required
-- Set `lang` explicitly to constrain matching when path pattern spans mixed-language trees
-- Avoid repo-root AST scans when the target is language-specific; narrow `path` first
-- If exploration is broad/open-ended across subsystems, use Task tool with explore subagent first
+- AVOID repo-root scans — narrow `path` first.
+- Parse issues = query failure, not absence: fix pattern or tighten `path` before concluding "no matches".
+{{#if eagerDelegation}}- Broad cross-subsystem exploration → {{#if scoutAvailable}}Task tool + scout{{else}}Task tool{{/if}} subagent first.{{/if}}
 </critical>

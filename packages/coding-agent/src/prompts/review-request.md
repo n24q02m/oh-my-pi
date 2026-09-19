@@ -23,24 +23,22 @@ _No files to review._
 
 ### Distribution Guidelines
 
-{{#when agentCount "==" 1}}Use **1 reviewer agent**.{{else}}Spawn **{{agentCount}} reviewer agents** in parallel.{{/when}}
+Use the `task` tool with `agent: "reviewer"` and a `tasks` array.
+{{#when agentCount "==" 1}}Create exactly **1 reviewer task**.{{else}}Spawn **{{agentCount}} reviewer agents** in parallel.{{/when}}
 {{#if multiAgent}}
 Group files by locality, e.g.:
 - Same directory/module → same agent
 - Related functionality → same agent
 - Tests with their implementation files → same agent
-
-You **MUST** use Task tool with `agent: "reviewer"` and `tasks` array.
 {{/if}}
 
 ### Reviewer Instructions
 
-Reviewer **MUST**:
+Reviewer MUST:
 1. Focus ONLY on assigned files
-2. {{#if skipDiff}}**MUST** run `git diff`/`git show` for assigned files{{else}}**MUST** use diff hunks below (**MUST NOT** re-run git diff){{/if}}
-3. **MAY** read full file context as needed via `read`
-4. Call `report_finding` per issue
-5. Call `submit_result` with verdict when done
+2. {{#if skipDiff}}{{diffInstruction}}{{else}}MUST use diff hunks below (NEVER re-run git diff){{/if}}
+3. {{contextInstruction}}
+4. Use incremental `yield` sections for findings and verdict fields; do NOT call a separate finding tool
 
 {{#if skipDiff}}
 ### Diff Previews
@@ -61,4 +59,10 @@ _Full diff too large ({{len files}} files). Showing first ~{{linesPerFile}} line
 <diff>
 {{rawDiff}}
 </diff>
+{{/if}}
+
+{{#if additionalInstructions}}
+### Additional Instructions
+
+{{additionalInstructions}}
 {{/if}}

@@ -1,29 +1,30 @@
-import { type TSchema, Type } from "@sinclair/typebox";
+import { type } from "@oh-my-pi/omptype";
 import type { CommitAgentState } from "../../../commit/agentic/state";
 import { CHANGELOG_CATEGORIES, type ChangelogCategory } from "../../../commit/types";
 import type { CustomTool } from "../../../extensibility/custom-tools/types";
 
-const changelogEntryProperties = CHANGELOG_CATEGORIES.reduce<Record<ChangelogCategory, TSchema>>(
-	(acc, category) => {
-		acc[category] = Type.Optional(Type.Array(Type.String()));
-		return acc;
-	},
-	{} as Record<ChangelogCategory, TSchema>,
-);
+const changelogCategoryProperties = {
+	"Breaking Changes?": "string[]",
+	"Added?": "string[]",
+	"Changed?": "string[]",
+	"Deprecated?": "string[]",
+	"Removed?": "string[]",
+	"Fixed?": "string[]",
+	"Security?": "string[]",
+} as const;
 
-const changelogEntriesSchema = Type.Object(changelogEntryProperties);
-const changelogDeletionsSchema = Type.Object(changelogEntryProperties, {
-	description: "Entries to remove from existing changelog sections (case-insensitive match)",
+const changelogEntriesSchema = type({
+	...changelogCategoryProperties,
 });
 
-const changelogEntrySchema = Type.Object({
-	path: Type.String(),
+const changelogEntrySchema = type({
+	path: "string",
 	entries: changelogEntriesSchema,
-	deletions: Type.Optional(changelogDeletionsSchema),
+	"deletions?": changelogEntriesSchema.describe("entries to remove"),
 });
 
-const proposeChangelogSchema = Type.Object({
-	entries: Type.Array(changelogEntrySchema),
+const proposeChangelogSchema = type({
+	entries: changelogEntrySchema.array(),
 });
 
 interface ChangelogResponse {
@@ -130,8 +131,15 @@ export function createProposeChangelogTool(
 				state.changelogProposal = { entries: normalized };
 			}
 
+			let text = response.valid ? "Changelog entries accepted." : "Changelog validation failed.";
+			if (response.errors.length > 0) {
+				text += `\n\nErrors:\n${response.errors.map(e => `- ${e}`).join("\n")}`;
+			}
+			if (response.warnings.length > 0) {
+				text += `\n\nWarnings:\n${response.warnings.map(w => `- ${w}`).join("\n")}`;
+			}
 			return {
-				content: [{ type: "text", text: JSON.stringify(response, null, 2) }],
+				content: [{ type: "text", text }],
 				details: response,
 			};
 		},

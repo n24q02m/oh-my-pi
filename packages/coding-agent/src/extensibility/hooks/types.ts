@@ -1,28 +1,55 @@
-/**
- * Hook system types.
- *
- * Hooks are TypeScript modules that can subscribe to agent lifecycle events
- * and interact with the user via UI primitives.
- */
-import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { ImageContent, Message, Model, TextContent, ToolResultMessage } from "@oh-my-pi/pi-ai";
+import { type HookMessageRenderer } from "@oh-my-pi/pi-tui/chat/extension-types";
+export { type HookMessageRenderOptions, type HookMessageRenderer } from "@oh-my-pi/pi-tui/chat/extension-types";
+import type { type as ArkType } from "@oh-my-pi/omptype";
+import type * as TypeBox from "@oh-my-pi/omptype/typebox";
+import type * as zod from "@oh-my-pi/omptype/zod";
+import type { ImageContent, Message, Model, TextContent } from "@oh-my-pi/pi-ai";
 import type { Component, TUI } from "@oh-my-pi/pi-tui";
-import type { Rule } from "../../capability/rule";
+import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
+import type { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import type { ModelRegistry } from "../../config/model-registry";
+import type { EditToolDetails } from "@oh-my-pi/pi-tui/tools/edit";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
-import type { Theme } from "../../modes/theme/theme";
-import type { EditToolDetails } from "../../patch";
-import type { CompactionPreparation, CompactionResult } from "../../session/compaction";
-import type { HookMessage } from "../../session/messages";
+import type * as PiCodingAgent from "../../index";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
+import type { CustomMessagePayload } from "../../session/messages";
+import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
+import type { BashToolDetails } from "@oh-my-pi/pi-tui/tools/bash";
+import type { GlobToolDetails } from "@oh-my-pi/pi-tui/tools/glob";
+import type { GrepToolDetails } from "@oh-my-pi/pi-tui/tools/grep";
+import type { ReadToolDetails } from "@oh-my-pi/pi-tui/tools/read";
 import type {
-	BranchSummaryEntry,
-	CompactionEntry,
-	ReadonlySessionManager,
-	SessionEntry,
-	SessionManager,
-} from "../../session/session-manager";
-import type { BashToolDetails, FindToolDetails, GrepToolDetails, ReadToolDetails } from "../../tools";
-import type { TodoItem } from "../../tools/todo-write";
+	AgentEndEvent,
+	AgentStartEvent,
+	AutoCompactionEndEvent,
+	AutoCompactionStartEvent,
+	AutoRetryEndEvent,
+	AutoRetryStartEvent,
+	ContextEvent,
+	SessionBeforeBranchEvent,
+	SessionBeforeBranchResult,
+	SessionBeforeCompactEvent,
+	SessionBeforeCompactResult,
+	SessionBeforeSwitchEvent,
+	SessionBeforeSwitchResult,
+	SessionBeforeTreeEvent,
+	SessionBeforeTreeResult,
+	SessionBranchEvent,
+	SessionCompactEvent,
+	SessionCompactingEvent,
+	SessionCompactingResult,
+	SessionEvent,
+	SessionShutdownEvent,
+	SessionStartEvent,
+	SessionSwitchEvent,
+	SessionTreeEvent,
+	TodoReminderEvent,
+	ToolCallEventResult,
+	ToolResultEventResult,
+	TtsrTriggeredEvent,
+	TurnEndEvent,
+	TurnStartEvent,
+} from "../shared-events";
 
 // Re-export for backward compatibility
 export type { ExecOptions, ExecResult } from "../../exec/exec";
@@ -31,6 +58,11 @@ export type { ExecOptions, ExecResult } from "../../exec/exec";
  * UI context for hooks to request interactive UI from the harness.
  * Each mode (interactive, RPC, print) provides its own implementation.
  */
+// fallow-ignore-next-line code-duplication
+// Parallel to ExtensionUIContext: hooks expose a deliberately narrower UI
+// surface — no terminal-input listener, no editor component override, no
+// theme management — because hooks are invoked from inside the agent loop
+// and must not be able to seize ownership of the editor.
 export interface HookUIContext {
 	/**
 	 * Show a selector and return the user's choice.
@@ -60,8 +92,8 @@ export interface HookUIContext {
 	/**
 	 * Set status text in the footer/status bar.
 	 * Pass undefined as text to clear the status for this key.
-	 * Text can include ANSI escape codes for styling.
-	 * Note: Newlines, tabs, and carriage returns are replaced with spaces.
+	 * ANSI/VT escape sequences and most control characters are stripped; tabs and newlines become spaces.
+	 * Repeated spaces are collapsed and surrounding whitespace is trimmed.
 	 * The combined status line is truncated to terminal width.
 	 * @param key - Unique key to identify this status (e.g., hook name)
 	 * @param text - Status text to display, or undefined to clear
@@ -70,7 +102,8 @@ export interface HookUIContext {
 
 	/**
 	 * Show a custom component with keyboard focus.
-	 * The factory receives TUI, theme, and a done() callback to close the component.
+	 * The factory receives TUI, theme, keybindings, and a done() callback to close the component.
+	 * Matches the interactive controller call shape (same arity as ExtensionUIContext.custom).
 	 * Can be async for fire-and-forget work (don't await the work, just start it).
 	 *
 	 * @param factory - Function that creates the component. Call done() when finished.
@@ -78,14 +111,14 @@ export interface HookUIContext {
 	 *
 	 * @example
 	 * // Sync factory
-	 * const result = await ctx.ui.custom((tui, theme, done) => {
+	 * const result = await ctx.ui.custom((tui, theme, keybindings, done) => {
 	 *   const component = new MyComponent(tui, theme);
 	 *   component.onFinish = (value) => done(value);
 	 *   return component;
 	 * });
 	 *
 	 * // Async factory with fire-and-forget work
-	 * const result = await ctx.ui.custom(async (tui, theme, done) => {
+	 * const result = await ctx.ui.custom(async (tui, theme, keybindings, done) => {
 	 *   const loader = new CancellableLoader(tui, theme.fg("accent"), theme.fg("muted"), "Working...");
 	 *   loader.onAbort = () => done(null);
 	 *   doWork(loader.signal).then(done);  // Don't await - fire and forget
@@ -96,6 +129,7 @@ export interface HookUIContext {
 		factory: (
 			tui: TUI,
 			theme: Theme,
+			keybindings: KeybindingsManager,
 			done: (result: T) => void,
 		) => (Component & { dispose?(): void }) | Promise<Component & { dispose?(): void }>,
 	): Promise<T>;
@@ -118,17 +152,19 @@ export interface HookUIContext {
 	 * Supports Ctrl+G to open external editor ($VISUAL or $EDITOR).
 	 * @param title - Title describing what is being edited
 	 * @param prefill - Optional initial text
+	 * @param options - Optional dialog controls such as an abort signal
+	 * @param editorOptions - Optional editor behavior; `promptStyle` makes Enter submit and Shift+Enter insert a newline
 	 * @returns Edited text, or undefined if cancelled (Escape)
 	 */
-	editor(title: string, prefill?: string): Promise<string | undefined>;
+	editor(
+		title: string,
+		prefill?: string,
+		options?: { signal?: AbortSignal },
+		editorOptions?: { promptStyle?: boolean },
+	): Promise<string | undefined>;
 
 	/**
-	 * Get the current theme for styling text with ANSI codes.
-	 * Use theme.fg() and theme.bg() to style status text.
-	 *
-	 * @example
-	 * const theme = ctx.ui.theme;
-	 * ctx.ui.setStatus("my-hook", theme.fg("success", theme.status.success) + " Ready");
+	 * Get the current theme for styling custom components.
 	 */
 	readonly theme: Theme;
 }
@@ -137,6 +173,11 @@ export interface HookUIContext {
  * Context passed to hook event handlers.
  * For command handlers, see HookCommandContext which extends this with session control methods.
  */
+// fallow-ignore-next-line code-duplication
+// Parallel to ExtensionContext: hooks see a narrower runtime context (no
+// model registry mutation, no system prompt access, no shutdown). The
+// overlap in field names is intentional API symmetry; widening hooks to
+// match extensions would let hooks call methods that deadlock the agent.
 export interface HookContext {
 	/** UI methods for user interaction */
 	ui: HookUIContext;
@@ -165,6 +206,11 @@ export interface HookContext {
  * These methods are not available in event handlers because they can cause
  * deadlocks when called from within the agent loop (e.g., tool_call, context events).
  */
+// fallow-ignore-next-line code-duplication
+// Parallel to ExtensionCommandContext: hooks intentionally omit
+// `switchSession`, `reload`, `compact`, and `getContextUsage` — those are
+// safe only from extension command handlers, not from the hook execution
+// context.
 export interface HookCommandContext extends HookContext {
 	/** Wait for the agent to finish streaming */
 	waitForIdle(): Promise<void>;
@@ -210,138 +256,25 @@ export interface HookCommandContext extends HookContext {
 }
 
 // ============================================================================
-// Session Events
+// Session Events (shared with extensions subsystem)
 // ============================================================================
 
-/** Fired on initial session load */
-export interface SessionStartEvent {
-	type: "session_start";
-}
-
-/** Fired before switching to another session (can be cancelled) */
-export interface SessionBeforeSwitchEvent {
-	type: "session_before_switch";
-	/** Reason for the switch */
-	reason: "new" | "resume" | "fork";
-	/** Session file we're switching to (only for "resume") */
-	targetSessionFile?: string;
-}
-
-/** Fired after switching to another session */
-export interface SessionSwitchEvent {
-	type: "session_switch";
-	/** Reason for the switch */
-	reason: "new" | "resume" | "fork";
-	/** Session file we came from */
-	previousSessionFile: string | undefined;
-}
-
-/** Fired before branching a session (can be cancelled) */
-export interface SessionBeforeBranchEvent {
-	type: "session_before_branch";
-	/** ID of the entry to branch from */
-	entryId: string;
-}
-
-/** Fired after branching a session */
-export interface SessionBranchEvent {
-	type: "session_branch";
-	previousSessionFile: string | undefined;
-}
-
-/** Fired before context compaction (can be cancelled) */
-export interface SessionBeforeCompactEvent {
-	type: "session_before_compact";
-	/** Compaction preparation with messages to summarize, file ops, previous summary, etc. */
-	preparation: CompactionPreparation;
-	/** Branch entries (root to current leaf). Use to inspect custom state or previous compactions. */
-	branchEntries: SessionEntry[];
-	/** Optional user-provided instructions for the summary */
-	customInstructions?: string;
-	/** Abort signal - hooks should pass this to LLM calls and check it periodically */
-	signal: AbortSignal;
-}
-
-/** Fired before compaction summarization to customize prompts/context */
-export interface SessionCompactingEvent {
-	type: "session.compacting";
-	sessionId: string;
-	messages: AgentMessage[];
-}
-
-/** Fired after context compaction */
-export interface SessionCompactEvent {
-	type: "session_compact";
-	compactionEntry: CompactionEntry;
-	/** Whether the compaction entry was provided by a hook */
-	fromExtension: boolean;
-}
-
-/** Fired on process exit (SIGINT/SIGTERM) */
-export interface SessionShutdownEvent {
-	type: "session_shutdown";
-}
-
-/** Preparation data for tree navigation (used by session_before_tree event) */
-export interface TreePreparation {
-	/** Node being switched to */
-	targetId: string;
-	/** Current active leaf (being abandoned), null if no current position */
-	oldLeafId: string | null;
-	/** Common ancestor of target and old leaf, null if no common ancestor */
-	commonAncestorId: string | null;
-	/** Entries to summarize (old leaf back to common ancestor or compaction) */
-	entriesToSummarize: SessionEntry[];
-	/** Whether user chose to summarize */
-	userWantsSummary: boolean;
-}
-
-/** Fired before navigating to a different node in the session tree (can be cancelled) */
-export interface SessionBeforeTreeEvent {
-	type: "session_before_tree";
-	/** Preparation data for the navigation */
-	preparation: TreePreparation;
-	/** Abort signal - honors Escape during summarization (model available via ctx.model) */
-	signal: AbortSignal;
-}
-
-/** Fired after navigating to a different node in the session tree */
-export interface SessionTreeEvent {
-	type: "session_tree";
-	/** The new active leaf, null if navigated to before first entry */
-	newLeafId: string | null;
-	/** Previous active leaf, null if there was no position */
-	oldLeafId: string | null;
-	/** Branch summary entry if one was created */
-	summaryEntry?: BranchSummaryEntry;
-	/** Whether summary came from hook */
-	fromExtension?: boolean;
-}
-
-/** Union of all session event types */
-export type SessionEvent =
-	| SessionStartEvent
-	| SessionBeforeSwitchEvent
-	| SessionSwitchEvent
-	| SessionBeforeBranchEvent
-	| SessionBranchEvent
-	| SessionBeforeCompactEvent
-	| SessionCompactingEvent
-	| SessionCompactEvent
-	| SessionShutdownEvent
-	| SessionBeforeTreeEvent
-	| SessionTreeEvent;
-
-/**
- * Event data for context event.
- * Fired before each LLM call, allowing hooks to modify context non-destructively.
- * Original session messages are NOT modified - only the messages sent to the LLM are affected.
- */
-export interface ContextEvent {
-	type: "context";
-	/** Messages about to be sent to the LLM (deep copy, safe to modify) */
-	messages: AgentMessage[];
-}
+export type {
+	ContextEvent,
+	SessionBeforeBranchEvent,
+	SessionBeforeCompactEvent,
+	SessionBeforeSwitchEvent,
+	SessionBeforeTreeEvent,
+	SessionBranchEvent,
+	SessionCompactEvent,
+	SessionCompactingEvent,
+	SessionEvent,
+	SessionShutdownEvent,
+	SessionStartEvent,
+	SessionSwitchEvent,
+	SessionTreeEvent,
+	TreePreparation,
+} from "../shared-events";
 
 /**
  * Event data for before_agent_start event.
@@ -356,86 +289,18 @@ export interface BeforeAgentStartEvent {
 	images?: ImageContent[];
 }
 
-/**
- * Event data for agent_start event.
- * Fired when an agent loop starts (once per user prompt).
- */
-export interface AgentStartEvent {
-	type: "agent_start";
-}
-
-/**
- * Event data for agent_end event.
- */
-export interface AgentEndEvent {
-	type: "agent_end";
-	messages: AgentMessage[];
-}
-
-/**
- * Event data for turn_start event.
- */
-export interface TurnStartEvent {
-	type: "turn_start";
-	turnIndex: number;
-	timestamp: number;
-}
-
-/**
- * Event data for turn_end event.
- */
-export interface TurnEndEvent {
-	type: "turn_end";
-	turnIndex: number;
-	message: AgentMessage;
-	toolResults: ToolResultMessage[];
-}
-
-/** Event data for auto_compaction_start event. */
-export interface AutoCompactionStartEvent {
-	type: "auto_compaction_start";
-	reason: "threshold" | "overflow";
-}
-
-/** Event data for auto_compaction_end event. */
-export interface AutoCompactionEndEvent {
-	type: "auto_compaction_end";
-	result: CompactionResult | undefined;
-	aborted: boolean;
-	willRetry: boolean;
-	errorMessage?: string;
-}
-
-/** Event data for auto_retry_start event. */
-export interface AutoRetryStartEvent {
-	type: "auto_retry_start";
-	attempt: number;
-	maxAttempts: number;
-	delayMs: number;
-	errorMessage: string;
-}
-
-/** Event data for auto_retry_end event. */
-export interface AutoRetryEndEvent {
-	type: "auto_retry_end";
-	success: boolean;
-	attempt: number;
-	finalError?: string;
-}
-
-/** Event data for ttsr_triggered event. */
-export interface TtsrTriggeredEvent {
-	type: "ttsr_triggered";
-	rules: Rule[];
-}
-
-/** Event data for todo_reminder event. */
-export interface TodoReminderEvent {
-	type: "todo_reminder";
-	todos: TodoItem[];
-	attempt: number;
-	maxAttempts: number;
-}
+export type {
+	AgentEndEvent,
+	AgentStartEvent,
+	AutoCompactionEndEvent,
+	AutoCompactionStartEvent,
+	AutoRetryEndEvent,
+	AutoRetryStartEvent,
+	TodoReminderEvent,
+	TtsrTriggeredEvent,
+	TurnEndEvent,
+	TurnStartEvent,
+} from "../shared-events";
 
 /**
  * Event data for tool_call event.
@@ -496,10 +361,10 @@ export interface GrepToolResultEvent extends ToolResultEventBase {
 	details: GrepToolDetails | undefined;
 }
 
-/** Tool result event for find tool */
-export interface FindToolResultEvent extends ToolResultEventBase {
-	toolName: "find";
-	details: FindToolDetails | undefined;
+/** Tool result event for glob tool */
+export interface GlobToolResultEvent extends ToolResultEventBase {
+	toolName: "glob";
+	details: GlobToolDetails | undefined;
 }
 
 /** Tool result event for custom/unknown tools */
@@ -519,7 +384,7 @@ export type ToolResultEvent =
 	| EditToolResultEvent
 	| WriteToolResultEvent
 	| GrepToolResultEvent
-	| FindToolResultEvent
+	| GlobToolResultEvent
 	| CustomToolResultEvent;
 
 /**
@@ -555,29 +420,7 @@ export interface ContextEventResult {
 	messages?: Message[];
 }
 
-/**
- * Return type for tool_call event handlers.
- * Allows hooks to block tool execution.
- */
-export interface ToolCallEventResult {
-	/** If true, block the tool from executing */
-	block?: boolean;
-	/** Reason for blocking (returned to LLM as error) */
-	reason?: string;
-}
-
-/**
- * Return type for tool_result event handlers.
- * Allows hooks to modify tool results.
- */
-export interface ToolResultEventResult {
-	/** Replacement content array (text and images) */
-	content?: (TextContent | ImageContent)[];
-	/** Replacement details */
-	details?: unknown;
-	/** Override isError flag */
-	isError?: boolean;
-}
+export type { ToolCallEventResult, ToolResultEventResult } from "../shared-events";
 
 /**
  * Return type for before_agent_start event handlers.
@@ -585,68 +428,16 @@ export interface ToolResultEventResult {
  */
 export interface BeforeAgentStartEventResult {
 	/** Message to inject into context (persisted to session, visible in TUI) */
-	message?: Pick<HookMessage, "customType" | "content" | "display" | "details">;
+	message?: CustomMessagePayload;
 }
 
-/** Return type for session_before_switch handlers */
-export interface SessionBeforeSwitchResult {
-	/** If true, cancel the switch */
-	cancel?: boolean;
-}
-
-/** Return type for session_before_branch handlers */
-export interface SessionBeforeBranchResult {
-	/**
-	 * If true, abort the branch entirely. No new session file is created,
-	 * conversation stays unchanged.
-	 */
-	cancel?: boolean;
-	/**
-	 * If true, the branch proceeds (new session file created, session state updated)
-	 * but the in-memory conversation is NOT rewound to the branch point.
-	 *
-	 * Use case: git-checkpoint hook that restores code state separately.
-	 * The hook handles state restoration itself, so it doesn't want the
-	 * agent's conversation to be rewound (which would lose recent context).
-	 *
-	 * - `cancel: true` → nothing happens, user stays in current session
-	 * - `skipConversationRestore: true` → branch happens, but messages stay as-is
-	 * - neither → branch happens AND messages rewind to branch point (default)
-	 */
-	skipConversationRestore?: boolean;
-}
-
-/** Return type for session_before_compact handlers */
-export interface SessionBeforeCompactResult {
-	/** If true, cancel the compaction */
-	cancel?: boolean;
-	/** Custom compaction result - SessionManager adds id/parentId */
-	compaction?: CompactionResult;
-}
-
-/** Return type for session.compacting handlers */
-export interface SessionCompactingResult {
-	/** Additional context lines to include in summary */
-	context?: string[];
-	/** Override the default compaction prompt */
-	prompt?: string;
-	/** Custom data to store in compaction entry */
-	preserveData?: Record<string, unknown>;
-}
-
-/** Return type for session_before_tree handlers */
-export interface SessionBeforeTreeResult {
-	/** If true, cancel the navigation entirely */
-	cancel?: boolean;
-	/**
-	 * Custom summary (skips default summarizer).
-	 * Only used if preparation.userWantsSummary is true.
-	 */
-	summary?: {
-		summary: string;
-		details?: unknown;
-	};
-}
+export type {
+	SessionBeforeBranchResult,
+	SessionBeforeCompactResult,
+	SessionBeforeSwitchResult,
+	SessionBeforeTreeResult,
+	SessionCompactingResult,
+} from "../shared-events";
 
 // ============================================================================
 // Hook API
@@ -656,27 +447,14 @@ export interface SessionBeforeTreeResult {
  * Handler function type for each event.
  * Handlers can return R, undefined, or void (bare return statements).
  */
-// biome-ignore lint/suspicious/noConfusingVoidType: void allows bare return statements in handlers
 export type HookHandler<E, R = undefined> = (event: E, ctx: HookContext) => Promise<R | void> | R | void;
-
-export interface HookMessageRenderOptions {
-	/** Whether the view is expanded */
-	expanded: boolean;
-}
-
-/**
- * Renderer for hook messages.
- * Hooks register these to provide custom TUI rendering for their message types.
- */
-export type HookMessageRenderer<T = unknown> = (
-	message: HookMessage<T>,
-	options: HookMessageRenderOptions,
-	theme: Theme,
-) => Component | undefined;
 
 /**
  * Command registration options.
  */
+// fallow-ignore-next-line code-duplication
+// Parallel to extensions' RegisteredCommand: hooks bind to
+// HookCommandContext and have no argument-completion hook.
 export interface RegisteredCommand {
 	name: string;
 	description?: string;
@@ -728,17 +506,18 @@ export interface HookAPI {
 	 * Use this when you want the LLM to see the message content.
 	 * For hook state that should NOT be sent to the LLM, use appendEntry() instead.
 	 *
-	 * @param message - The message to send
+	 * @param message - The message object to send, or a string shorthand for visible message content
 	 * @param message.customType - Identifier for your hook (used for filtering on reload)
 	 * @param message.content - Message content (string or TextContent/ImageContent array)
 	 * @param message.display - Whether to show in TUI (true = styled display, false = hidden)
 	 * @param message.details - Optional hook-specific metadata (not sent to LLM)
+	 * @param message.attribution - Who initiated the message for billing/attribution semantics ("user" | "agent")
 	 * @param options.triggerTurn - If true and agent is idle, triggers a new LLM turn. Default: false.
 	 *                              If agent is streaming, message is queued and triggerTurn is ignored.
 	 * @param options.deliverAs - How to deliver the message: "steer" or "followUp".
 	 */
 	sendMessage<T = unknown>(
-		message: Pick<HookMessage<T>, "customType" | "content" | "display" | "details">,
+		message: CustomMessagePayload<T>,
 		options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" },
 	): void;
 
@@ -790,11 +569,15 @@ export interface HookAPI {
 	exec(command: string, args: string[], options?: ExecOptions): Promise<ExecResult>;
 
 	/** File logger for error/warning/debug messages */
-	logger: typeof import("@oh-my-pi/pi-utils").logger;
-	/** Injected @sinclair/typebox module */
-	typebox: typeof import("@sinclair/typebox");
+	logger: typeof PiLogger;
+	/** Injected TypeBox shim (legacy/compat — prefer `arktype`). */
+	typebox: typeof TypeBox;
+	/** Injected omptype schema builder for hooks. */
+	arktype: typeof ArkType;
+	/** Injected Zod-compatible omptype builder for hooks. */
+	zod: typeof zod;
 	/** Injected pi-coding-agent exports */
-	pi: typeof import("../..");
+	pi: typeof PiCodingAgent;
 }
 
 /**

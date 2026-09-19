@@ -27,11 +27,11 @@ import { type Settings, settingsCapability } from "../capability/settings";
 import { type SystemPrompt, systemPromptCapability } from "../capability/system-prompt";
 import type { LoadContext, LoadResult } from "../capability/types";
 import {
+	buildExtensionModuleItems,
 	calculateDepth,
 	createSourceMeta,
 	discoverExtensionModulePaths,
 	expandEnvVarsDeep,
-	getExtensionNameFromPath,
 	getProjectPath,
 	getUserPath,
 } from "./helpers";
@@ -48,18 +48,20 @@ async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> 
 	const items: MCPServer[] = [];
 	const warnings: string[] = [];
 
-	// User-level: ~/.gemini/settings.json → mcpServers
-	const userPath = getUserPath(ctx, "gemini", "settings.json");
-	if (userPath) {
-		const result = await loadMCPFromSettings(ctx, userPath, "user");
-		items.push(...result.items);
-		if (result.warnings) warnings.push(...result.warnings);
-	}
-
+	// Load project entries before user entries so a project `enabled: false`
+	// claims its dedupe key before a same-named user server can survive (#7654).
 	// Project-level: .gemini/settings.json → mcpServers
 	const projectPath = getProjectPath(ctx, "gemini", "settings.json");
 	if (projectPath) {
 		const result = await loadMCPFromSettings(ctx, projectPath, "project");
+		items.push(...result.items);
+		if (result.warnings) warnings.push(...result.warnings);
+	}
+
+	// User-level: ~/.gemini/settings.json → mcpServers
+	const userPath = getUserPath(ctx, "gemini", "settings.json");
+	if (userPath) {
+		const result = await loadMCPFromSettings(ctx, userPath, "user");
 		items.push(...result.items);
 		if (result.warnings) warnings.push(...result.warnings);
 	}
@@ -102,6 +104,7 @@ async function loadMCPFromSettings(
 
 		items.push({
 			name,
+			enabled: typeof raw.enabled === "boolean" ? raw.enabled : undefined,
 			command: typeof raw.command === "string" ? raw.command : undefined,
 			args: Array.isArray(raw.args) ? (raw.args as string[]) : undefined,
 			env: raw.env && typeof raw.env === "object" ? (raw.env as Record<string, string>) : undefined,
@@ -110,6 +113,7 @@ async function loadMCPFromSettings(
 			transport: ["stdio", "sse", "http"].includes(raw.type as string)
 				? (raw.type as "stdio" | "sse" | "http")
 				: undefined,
+			timeout: typeof raw.timeout === "number" ? raw.timeout : undefined,
 			_source: createSourceMeta(PROVIDER_ID, path, level),
 		} as MCPServer);
 	}
@@ -237,20 +241,7 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 		projectExtensionsDir ? discoverExtensionModulePaths(ctx, projectExtensionsDir) : Promise.resolve([]),
 	]);
 
-	const items: ExtensionModule[] = [
-		...userPaths.map(extPath => ({
-			name: getExtensionNameFromPath(extPath),
-			path: extPath,
-			level: "user" as const,
-			_source: createSourceMeta(PROVIDER_ID, extPath, "user"),
-		})),
-		...projectPaths.map(extPath => ({
-			name: getExtensionNameFromPath(extPath),
-			path: extPath,
-			level: "project" as const,
-			_source: createSourceMeta(PROVIDER_ID, extPath, "project"),
-		})),
-	];
+	const items = buildExtensionModuleItems(PROVIDER_ID, userPaths, projectPaths);
 
 	return { items, warnings: [] };
 }

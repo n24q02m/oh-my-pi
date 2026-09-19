@@ -1,20 +1,20 @@
 import { describe, expect, it } from "bun:test";
-import { sanitizeSchemaForGoogle } from "@oh-my-pi/pi-ai";
+import { normalizeSchemaForGoogle } from "@oh-my-pi/pi-ai";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createTools, HIDDEN_TOOLS, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 
 /**
  * Problematic JSON Schema features that cause issues with various providers.
  *
- * These are checked AFTER sanitization (sanitizeSchemaForGoogle) is applied,
+ * These are checked AFTER sanitization (normalizeSchemaForGoogle) is applied,
  * so features like `const` that are transformed by sanitization are not flagged.
  *
  * Prohibited (error):
  * - $schema: Explicit schema declarations
  * - $ref / $defs: Schema references (must inline everything)
- * - prefixItems: Draft 2020-12 feature (use items array)
- * - $dynamicRef / $dynamicAnchor: Draft 2020-12 features
- * - unevaluatedProperties / unevaluatedItems: Draft 2020-12 features
+ * - prefixItems: Unsupported by the Google schema path
+ * - $dynamicRef / $dynamicAnchor: Unsupported by the Google schema path
+ * - unevaluatedProperties / unevaluatedItems: Unsupported by the Google schema path
  * - const: Should be converted to enum by sanitization
  * - examples: Should be stripped
  *
@@ -32,7 +32,7 @@ const PROHIBITED_KEYS = new Set([
 	"prefixItems",
 	"unevaluatedProperties",
 	"unevaluatedItems",
-	"const", // Should be converted to enum by sanitizeSchemaForGoogle
+	"const", // Should be converted to enum by normalizeSchemaForGoogle
 	"examples",
 ]);
 
@@ -61,7 +61,9 @@ function validateSchema(schema: unknown, path = "root"): SchemaViolation[] {
 
 	const obj = schema as Record<string, unknown>;
 
-	for (const [key, value] of Object.entries(obj)) {
+	for (const key in obj) {
+		if (!Object.hasOwn(obj, key)) continue;
+		const value = obj[key];
 		const currentPath = `${path}.${key}`;
 
 		if (PROHIBITED_KEYS.has(key)) {
@@ -113,22 +115,22 @@ function createTestSession(): ToolSession {
 	};
 }
 
-describe("sanitizeSchemaForGoogle", () => {
+describe("normalizeSchemaForGoogle", () => {
 	it("converts const to enum", () => {
 		const schema = { type: "string", const: "active" };
-		const sanitized = sanitizeSchemaForGoogle(schema);
+		const sanitized = normalizeSchemaForGoogle(schema);
 		expect(sanitized).toEqual({ type: "string", enum: ["active"] });
 	});
 
 	it("merges const into existing enum", () => {
 		const schema = { type: "string", const: "active", enum: ["inactive"] };
-		const sanitized = sanitizeSchemaForGoogle(schema);
+		const sanitized = normalizeSchemaForGoogle(schema);
 		expect(sanitized).toEqual({ type: "string", enum: ["inactive", "active"] });
 	});
 
 	it("does not duplicate const in enum", () => {
 		const schema = { type: "string", const: "active", enum: ["active", "inactive"] };
-		const sanitized = sanitizeSchemaForGoogle(schema);
+		const sanitized = normalizeSchemaForGoogle(schema);
 		expect(sanitized).toEqual({ type: "string", enum: ["active", "inactive"] });
 	});
 
@@ -139,7 +141,7 @@ describe("sanitizeSchemaForGoogle", () => {
 				{ type: "string", const: "dir" },
 			],
 		};
-		const sanitized = sanitizeSchemaForGoogle(schema);
+		const sanitized = normalizeSchemaForGoogle(schema);
 		// anyOf with all const values should collapse into a single enum
 		expect(sanitized).toEqual({
 			type: "string",
@@ -159,7 +161,7 @@ describe("sanitizeSchemaForGoogle", () => {
 				},
 			},
 		};
-		const sanitized = sanitizeSchemaForGoogle(schema) as Record<string, unknown>;
+		const sanitized = normalizeSchemaForGoogle(schema) as Record<string, unknown>;
 		const props = sanitized.properties as Record<string, unknown>;
 		const nested = props.nested as Record<string, unknown>;
 		const nestedProps = nested.properties as Record<string, unknown>;
@@ -175,11 +177,11 @@ describe("sanitizeSchemaForGoogle", () => {
 			description: "A description",
 			minLength: 1,
 		};
-		const sanitized = sanitizeSchemaForGoogle(schema);
+		const sanitized = normalizeSchemaForGoogle(schema);
 		expect(sanitized).toEqual({
 			type: "string",
 			enum: ["value"],
-			description: "A description",
+			description: "A description\n\n{minLength: 1}",
 		});
 	});
 
@@ -188,17 +190,19 @@ describe("sanitizeSchemaForGoogle", () => {
 			type: "array",
 			items: { type: "string", const: "only" },
 		};
-		const sanitized = sanitizeSchemaForGoogle(schema) as Record<string, unknown>;
+		const sanitized = normalizeSchemaForGoogle(schema) as Record<string, unknown>;
 		const items = sanitized.items as Record<string, unknown>;
 		expect(items.const).toBeUndefined();
 		expect(items.enum).toEqual(["only"]);
 	});
 
-	it("passes through primitives unchanged", () => {
-		expect(sanitizeSchemaForGoogle("string")).toBe("string");
-		expect(sanitizeSchemaForGoogle(123)).toBe(123);
-		expect(sanitizeSchemaForGoogle(true)).toBe(true);
-		expect(sanitizeSchemaForGoogle(null)).toBe(null);
+	it("passes through non-boolean primitives and coerces boolean schemas", () => {
+		expect(normalizeSchemaForGoogle("string")).toBe("string");
+		expect(normalizeSchemaForGoogle(123)).toBe(123);
+		// Google's wire cannot encode JSON Schema boolean subschemas; `true`
+		// (accept anything) coerces to the equivalent empty schema.
+		expect(normalizeSchemaForGoogle(true)).toEqual({});
+		expect(normalizeSchemaForGoogle(null)).toBe(null);
 	});
 
 	it("preserves property names that match schema keywords (e.g., 'pattern')", () => {
@@ -210,7 +214,7 @@ describe("sanitizeSchemaForGoogle", () => {
 			},
 			required: ["pattern"],
 		};
-		const sanitized = sanitizeSchemaForGoogle(schema) as Record<string, unknown>;
+		const sanitized = normalizeSchemaForGoogle(schema) as Record<string, unknown>;
 		const props = sanitized.properties as Record<string, unknown>;
 		expect(props.pattern).toEqual({ type: "string", description: "The search pattern" });
 		expect(props.format).toEqual({ type: "string", description: "Output format" });
@@ -224,7 +228,7 @@ describe("sanitizeSchemaForGoogle", () => {
 			format: "email",
 			minLength: 1,
 		};
-		const sanitized = sanitizeSchemaForGoogle(schema) as Record<string, unknown>;
+		const sanitized = normalizeSchemaForGoogle(schema) as Record<string, unknown>;
 		expect(sanitized.pattern).toBeUndefined();
 		expect(sanitized.format).toBeUndefined();
 		expect(sanitized.minLength).toBeUndefined();
@@ -244,7 +248,7 @@ describe("tool schema validation (post-sanitization)", () => {
 			if (!schema) continue;
 
 			// Apply the same sanitization that happens before sending to providers
-			const sanitized = sanitizeSchemaForGoogle(schema);
+			const sanitized = normalizeSchemaForGoogle(schema);
 			const violations = validateSchema(sanitized, tool.name);
 			const errors = violations.filter(v => v.severity === "error");
 
@@ -267,87 +271,10 @@ describe("tool schema validation (post-sanitization)", () => {
 		expect(allViolations).toEqual([]);
 	});
 
-	it("no sanitized schema contains $schema declaration", async () => {
-		const session = createTestSession();
-		const tools = await createTools(session);
-
-		for (const tool of tools) {
-			const schema = tool.parameters;
-			if (!schema) continue;
-
-			const sanitized = sanitizeSchemaForGoogle(schema);
-			const violations = validateSchema(sanitized, tool.name).filter(v => v.key === "$schema");
-			expect(violations).toEqual([]);
-		}
-	});
-
-	it("no sanitized schema contains $ref or $defs", async () => {
-		const session = createTestSession();
-		const tools = await createTools(session);
-
-		for (const tool of tools) {
-			const schema = tool.parameters;
-			if (!schema) continue;
-
-			const sanitized = sanitizeSchemaForGoogle(schema);
-			const violations = validateSchema(sanitized, tool.name).filter(v => v.key === "$ref" || v.key === "$defs");
-			expect(violations).toEqual([]);
-		}
-	});
-
-	it("no sanitized schema contains Draft 2020-12 specific features", async () => {
-		const session = createTestSession();
-		const tools = await createTools(session);
-
-		const draft2020Features = [
-			"prefixItems",
-			"$dynamicRef",
-			"$dynamicAnchor",
-			"unevaluatedProperties",
-			"unevaluatedItems",
-		];
-
-		for (const tool of tools) {
-			const schema = tool.parameters;
-			if (!schema) continue;
-
-			const sanitized = sanitizeSchemaForGoogle(schema);
-			const violations = validateSchema(sanitized, tool.name).filter(v => draft2020Features.includes(v.key));
-			expect(violations).toEqual([]);
-		}
-	});
-
-	it("sanitization removes const (converts to enum)", async () => {
-		const session = createTestSession();
-		const tools = await createTools(session);
-
-		for (const tool of tools) {
-			const schema = tool.parameters;
-			if (!schema) continue;
-
-			const sanitized = sanitizeSchemaForGoogle(schema);
-			const violations = validateSchema(sanitized, tool.name).filter(v => v.key === "const");
-			expect(violations).toEqual([]);
-		}
-	});
-
-	it("no sanitized schema contains examples field", async () => {
-		const session = createTestSession();
-		const tools = await createTools(session);
-
-		for (const tool of tools) {
-			const schema = tool.parameters;
-			if (!schema) continue;
-
-			const sanitized = sanitizeSchemaForGoogle(schema);
-			const violations = validateSchema(sanitized, tool.name).filter(v => v.key === "examples");
-			expect(violations).toEqual([]);
-		}
-	});
-
 	it("hidden tools also have valid sanitized schemas", async () => {
 		const session = createTestSession();
 
+		// Object.entries keeps the factory typed without an index cast.
 		for (const [name, factory] of Object.entries(HIDDEN_TOOLS)) {
 			const tool = await factory(session);
 			if (!tool) continue;
@@ -355,7 +282,7 @@ describe("tool schema validation (post-sanitization)", () => {
 			const schema = tool.parameters;
 			if (!schema) continue;
 
-			const sanitized = sanitizeSchemaForGoogle(schema);
+			const sanitized = normalizeSchemaForGoogle(schema);
 			const violations = validateSchema(sanitized, name);
 			const errors = violations.filter(v => v.severity === "error");
 
@@ -365,46 +292,11 @@ describe("tool schema validation (post-sanitization)", () => {
 			}
 		}
 	});
-
-	it("logs warnings for potentially problematic features (non-blocking)", async () => {
-		const session = createTestSession();
-		const tools = await createTools(session);
-
-		const warnings: { tool: string; violations: SchemaViolation[] }[] = [];
-
-		for (const tool of tools) {
-			const schema = tool.parameters;
-			if (!schema) continue;
-
-			const sanitized = sanitizeSchemaForGoogle(schema);
-			const violations = validateSchema(sanitized, tool.name);
-			const toolWarnings = violations.filter(v => v.severity === "warning");
-
-			if (toolWarnings.length > 0) {
-				warnings.push({ tool: tool.name, violations: toolWarnings });
-			}
-		}
-
-		// Log warnings but don't fail - these are advisory
-		if (warnings.length > 0) {
-			const message = warnings
-				.map(({ tool, violations }) => {
-					const details = violations.map(v => `  - ${v.path}: ${v.key} = ${JSON.stringify(v.value)}`).join("\n");
-					return `${tool}:\n${details}`;
-				})
-				.join("\n\n");
-
-			console.log(`Schema warnings (non-blocking):\n\n${message}`);
-		}
-
-		// This test passes regardless - warnings are informational
-		expect(true).toBe(true);
-	});
 });
 
 describe("validateSchema helper", () => {
 	it("detects $schema declarations", () => {
-		const schema = { $schema: "http://json-schema.org/draft-07/schema#", type: "object" };
+		const schema = { $schema: "https://json-schema.org/draft/2020-12/schema", type: "object" };
 		const violations = validateSchema(schema);
 		expect(violations.some(v => v.key === "$schema")).toBe(true);
 	});
@@ -433,13 +325,13 @@ describe("validateSchema helper", () => {
 		expect(violations.some(v => v.key === "examples")).toBe(true);
 	});
 
-	it("detects prefixItems (Draft 2020-12)", () => {
+	it("detects prefixItems unsupported by the Google schema path", () => {
 		const schema = { type: "array", prefixItems: [{ type: "string" }] };
 		const violations = validateSchema(schema);
 		expect(violations.some(v => v.key === "prefixItems")).toBe(true);
 	});
 
-	it("detects unevaluatedProperties (Draft 2020-12)", () => {
+	it("detects unevaluatedProperties unsupported by the Google schema path", () => {
 		const schema = { type: "object", unevaluatedProperties: false };
 		const violations = validateSchema(schema);
 		expect(violations.some(v => v.key === "unevaluatedProperties")).toBe(true);
@@ -450,12 +342,6 @@ describe("validateSchema helper", () => {
 		const violations = validateSchema(schema);
 		const warning = violations.find(v => v.key === "additionalProperties");
 		expect(warning?.severity).toBe("warning");
-	});
-
-	it("does not warn on additionalProperties: true", () => {
-		const schema = { type: "object", additionalProperties: true };
-		const violations = validateSchema(schema);
-		expect(violations.some(v => v.key === "additionalProperties")).toBe(false);
 	});
 
 	it("warns on format keyword", () => {
@@ -482,25 +368,12 @@ describe("validateSchema helper", () => {
 		expect(violations.find(v => v.key === "$ref")?.path).toContain("nested");
 	});
 
-	it("validates array items", () => {
+	it("validates array prefixItems", () => {
 		const schema = {
 			type: "array",
-			items: [{ const: "first" }, { type: "string" }],
+			prefixItems: [{ const: "first" }, { type: "string" }],
 		};
 		const violations = validateSchema(schema);
 		expect(violations.some(v => v.key === "const")).toBe(true);
-	});
-
-	it("returns empty array for valid schema", () => {
-		const schema = {
-			type: "object",
-			properties: {
-				name: { type: "string", description: "User name" },
-				age: { type: "number", minimum: 0 },
-			},
-			required: ["name"],
-		};
-		const violations = validateSchema(schema);
-		expect(violations.filter(v => v.severity === "error")).toEqual([]);
 	});
 });

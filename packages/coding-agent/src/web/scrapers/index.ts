@@ -21,6 +21,7 @@ import { handleDevTo } from "./devto";
 import { handleDiscogs } from "./discogs";
 import { handleDiscourse } from "./discourse";
 import { handleDockerHub } from "./dockerhub";
+import { handleDocsRs } from "./docs-rs";
 import { handleFdroid } from "./fdroid";
 import { handleFirefoxAddons } from "./firefox-addons";
 import { handleFlathub } from "./flathub";
@@ -90,10 +91,10 @@ export {
 	handleBluesky,
 	handleBrew,
 	handleCheatSh,
-	handleCisaKev,
 	handleChocolatey,
-	handleClojars,
 	handleChooseALicense,
+	handleCisaKev,
+	handleClojars,
 	handleCoinGecko,
 	handleCratesIo,
 	handleCrossref,
@@ -101,9 +102,10 @@ export {
 	handleDiscogs,
 	handleDiscourse,
 	handleDockerHub,
+	handleDocsRs,
 	handleFdroid,
-	handleFlathub,
 	handleFirefoxAddons,
+	handleFlathub,
 	handleGitHub,
 	handleGitHubGist,
 	handleGitLab,
@@ -127,8 +129,8 @@ export {
 	handleOllama,
 	handleOpenCorporates,
 	handleOpenLibrary,
-	handleOrcid,
 	handleOpenVsx,
+	handleOrcid,
 	handleOsv,
 	handlePackagist,
 	handlePubDev,
@@ -140,13 +142,13 @@ export {
 	handleRepology,
 	handleRfc,
 	handleRubyGems,
-	handleSecEdgar,
 	handleSearchcode,
+	handleSecEdgar,
 	handleSemanticScholar,
 	handleSnapcraft,
 	handleSourcegraph,
-	handleSpotify,
 	handleSpdx,
+	handleSpotify,
 	handleStackOverflow,
 	handleTerraform,
 	handleTldr,
@@ -185,6 +187,7 @@ export const specialHandlers: SpecialHandler[] = [
 	handleStackOverflow,
 	handleDevTo,
 	handleMDN,
+	handleDocsRs,
 	handleReadTheDocs,
 	handleSearchcode,
 	handleSourcegraph,

@@ -11,7 +11,7 @@ import * as path from "node:path";
 import { getProjectDir, logger } from "@oh-my-pi/pi-utils";
 
 import type { Settings } from "../config/settings";
-import { clearCache as clearFsCache, cacheStats as fsCacheStats, invalidate as invalidateFs } from "./fs";
+import { clearCache as clearFsCache, findRepoRoot, cacheStats as fsCacheStats, invalidate as invalidateFs } from "./fs";
 import type {
 	Capability,
 	CapabilityInfo,
@@ -38,6 +38,21 @@ const providerMeta = new Map<string, { displayName: string; description: string 
 
 /** Disabled providers (by ID) */
 const disabledProviders = new Set<string>();
+
+/** Enabled providers (by ID) */
+const enabledProviders = new Set<string>();
+
+/** Foreign tools whose user-level (~/...) configs are opt-in */
+const FOREIGN_USER_PROVIDERS: Record<string, true> = {
+	cursor: true,
+	codex: true,
+	claude: true,
+	"claude-plugins": true,
+	gemini: true,
+	opencode: true,
+	windsurf: true,
+	github: true,
+};
 
 /** Settings manager for persistence (if set) */
 let settings: Settings | null = null;
@@ -102,17 +117,24 @@ async function loadImpl<T>(
 	capability: Capability<T>,
 	providers: Provider<T>[],
 	ctx: LoadContext,
-	options: LoadOptions,
+	options: LoadOptions<T>,
 ): Promise<CapabilityResult<T>> {
 	const allItems: Array<T & { _source: SourceMeta; _shadowed?: boolean }> = [];
+	const suppressedItems = new Set<T & { _source: SourceMeta; _shadowed?: boolean }>();
+	const disabledItems = new Set<T & { _source: SourceMeta; _shadowed?: boolean }>();
 	const allWarnings: string[] = [];
 	const contributingProviders: string[] = [];
+	const disabledExtensionIds = new Set<string>(
+		options.disabledExtensions ?? settings?.get("disabledExtensions") ?? [],
+	);
 
 	const results = await Promise.all(
 		providers.map(async provider => {
 			try {
-				const result = await logger.timeAsync(`capability:${capability.id}:${provider.id}`, () =>
-					provider.load(ctx),
+				const result = await logger.time(
+					`capability:${capability.id}:${provider.id}`,
+					provider.load.bind(provider),
+					ctx,
 				);
 				return { provider, result };
 			} catch (error) {
@@ -136,36 +158,96 @@ async function loadImpl<T>(
 			allWarnings.push(...result.warnings.map(w => `[${provider.displayName}] ${w}`));
 		}
 
-		if (result.items.length > 0) {
-			contributingProviders.push(provider.id);
-
-			for (const item of result.items) {
-				const itemWithSource = item as T & { _source: SourceMeta };
-				if (itemWithSource._source) {
-					itemWithSource._source.providerName = provider.displayName;
-					allItems.push(itemWithSource as T & { _source: SourceMeta; _shadowed?: boolean });
-				} else {
-					allWarnings.push(`[${provider.displayName}] Item missing _source metadata, skipping`);
-				}
+		let contributedItemCount = 0;
+		for (const item of result.items) {
+			const itemWithSource = item as T & { _source: SourceMeta };
+			if (!itemWithSource._source) {
+				allWarnings.push(`[${provider.displayName}] Item missing _source metadata, skipping`);
+				continue;
 			}
+
+			const extensionId = capability.toExtensionId?.(itemWithSource);
+			const isDisabled = extensionId !== undefined && disabledExtensionIds.has(extensionId);
+			if (isDisabled && !options.includeDisabled) {
+				continue;
+			}
+
+			if (options.filter && !options.filter(itemWithSource)) {
+				continue;
+			}
+
+			if (isDisabled) {
+				disabledItems.add(itemWithSource);
+			}
+
+			if (options.suppress?.(itemWithSource)) {
+				// Suppressed items still claim their dedupe key below, so a
+				// suppressed higher-priority item shadows same-key lower-priority
+				// ones, but they never survive or equivalence-shadow survivors.
+				itemWithSource._source.providerName = provider.displayName;
+				const suppressed = itemWithSource as T & { _source: SourceMeta; _shadowed?: boolean };
+				suppressedItems.add(suppressed);
+				allItems.push(suppressed);
+				continue;
+			}
+
+			itemWithSource._source.providerName = provider.displayName;
+			allItems.push(itemWithSource as T & { _source: SourceMeta; _shadowed?: boolean });
+			contributedItemCount += 1;
+		}
+
+		if (contributedItemCount > 0) {
+			contributingProviders.push(provider.id);
 		}
 	}
 
-	// Deduplicate by key (first wins = highest priority)
-	const seen = new Map<string, number>();
+	// Deduplicate by key or semantic equivalence (first wins = highest priority)
+	const seen = new Set<string>();
 	const deduped: Array<T & { _source: SourceMeta }> = [];
+	const equivalent = capability.equivalent;
 
-	for (let i = 0; i < allItems.length; i++) {
-		const item = allItems[i];
+	for (const item of allItems) {
 		const key = capability.key(item);
+
+		if (disabledItems.has(item)) {
+			// Disabled rows never claim their key or equivalence class, so they
+			// can't shadow an enabled survivor (issue #11870). But when an
+			// earlier enabled item already owns the key or an equivalent
+			// identity, the disabled row is a lower-priority loser: mark it
+			// shadowed so the dashboard treats it as a shadowed no-op instead of
+			// an independently toggleable row.
+			const keySeen = key !== undefined && seen.has(key);
+			const aliasSeen =
+				!keySeen &&
+				equivalent !== undefined &&
+				deduped.some(existing => !disabledItems.has(existing) && equivalent(existing, item));
+			if (keySeen || aliasSeen) item._shadowed = true;
+			if (!suppressedItems.has(item)) deduped.push(item);
+			continue;
+		}
+
+		if (suppressedItems.has(item)) {
+			// Claim key ownership (same-name precedence, including disabled
+			// state) without surviving or equivalence-shadowing survivors.
+			if (key !== undefined) seen.add(key);
+			continue;
+		}
 
 		if (key === undefined) {
 			deduped.push(item);
-		} else if (!seen.has(key)) {
-			seen.set(key, i);
-			deduped.push(item);
-		} else {
+			continue;
+		}
+
+		const keySeen = seen.has(key);
+		seen.add(key);
+		const aliasSeen =
+			!keySeen &&
+			equivalent !== undefined &&
+			deduped.some(existing => !disabledItems.has(existing) && equivalent(existing, item));
+		if (keySeen || aliasSeen) {
 			item._shadowed = true;
+		} else {
+			deduped.push(item);
 		}
 	}
 
@@ -185,7 +267,7 @@ async function loadImpl<T>(
 
 	return {
 		items: deduped,
-		all: allItems,
+		all: suppressedItems.size > 0 ? allItems.filter(item => !suppressedItems.has(item)) : allItems,
 		warnings: allWarnings,
 		providers: contributingProviders,
 	};
@@ -194,7 +276,7 @@ async function loadImpl<T>(
 /**
  * Filter providers based on options and disabled state.
  */
-function filterProviders<T>(capability: Capability<T>, options: LoadOptions): Provider<T>[] {
+function filterProviders<T>(capability: Capability<T>, options: LoadOptions<T>): Provider<T>[] {
 	let providers = (capability.providers as Provider<T>[]).filter(p => !disabledProviders.has(p.id));
 
 	if (options.providers) {
@@ -212,7 +294,10 @@ function filterProviders<T>(capability: Capability<T>, options: LoadOptions): Pr
 /**
  * Load a capability by ID.
  */
-export async function loadCapability<T>(capabilityId: string, options: LoadOptions = {}): Promise<CapabilityResult<T>> {
+export async function loadCapability<T>(
+	capabilityId: string,
+	options: LoadOptions<T> = {},
+): Promise<CapabilityResult<T>> {
 	const capability = capabilities.get(capabilityId) as Capability<T> | undefined;
 	if (!capability) {
 		throw new Error(`Unknown capability: "${capabilityId}"`);
@@ -220,7 +305,11 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 
 	const cwd = options.cwd ?? getProjectDir();
 	const home = os.homedir();
-	const ctx: LoadContext = { cwd, home };
+	const repoRoot = await findRepoRoot(cwd);
+	const ctx: LoadContext = { cwd, home, repoRoot };
+	if (options.providers) ctx.explicitProviders = new Set(options.providers);
+	if (options.includeDisabled) ctx.includeOptOutUserSources = true;
+	if (options.extensionRoots !== undefined) ctx.extensionRoots = options.extensionRoots;
 	const providers = filterProviders(capability, options);
 
 	return await loadImpl(capability, providers, ctx, options);
@@ -229,6 +318,41 @@ export async function loadCapability<T>(capabilityId: string, options: LoadOptio
 // =============================================================================
 // Provider Enable/Disable API
 // =============================================================================
+
+/** Whether `providerId` is a foreign tool whose `~/` config is opt-in. */
+export function isForeignUserProvider(providerId: string): boolean {
+	return FOREIGN_USER_PROVIDERS[providerId] === true;
+}
+
+/**
+ * Check whether a user-level (~/...) config source is enabled.
+ * Native (.omp) and .agents directories are enabled by default.
+ * Foreign tool directories (~/.cursor, ~/.codex, ~/.claude, etc.) are opt-in
+ * via `enabledProviders`. Project-level (cwd) config is unaffected; see
+ * {@link isProviderEnabled} for the whole-provider switch.
+ */
+export function isUserSourceEnabled(source: string, ctx?: LoadContext): boolean {
+	const id = source.replace(/^\./, "");
+	if (disabledProviders.has(id)) return false;
+	if (FOREIGN_USER_PROVIDERS[id] !== true) return true;
+	if (ctx?.explicitProviders?.has(id) || ctx?.includeOptOutUserSources) return true;
+	if (enabledProviders.has(id) || enabledProviders.has("*") || enabledProviders.has("all")) return true;
+	if (id === "claude-plugins" && enabledProviders.has("claude")) return true;
+	if (id === "claude" && process.env.CLAUDE_CONFIG_DIR?.trim()) return true;
+	return false;
+}
+
+/** Opt a foreign provider's `~/` config in. */
+export function enableUserSource(providerId: string): void {
+	enabledProviders.add(providerId);
+	persistEnabledProviders();
+}
+
+/** Opt a foreign provider's `~/` config out (project config keeps loading). */
+export function disableUserSource(providerId: string): void {
+	enabledProviders.delete(providerId);
+	persistEnabledProviders();
+}
 
 /**
  * Initialize capability system with settings manager for persistence.
@@ -242,6 +366,12 @@ export function initializeWithSettings(activeSettings: Settings): void {
 	for (const id of disabled) {
 		disabledProviders.add(id);
 	}
+	// Load enabled providers from settings
+	const enabled = settings.get("enabledProviders");
+	enabledProviders.clear();
+	for (const id of enabled) {
+		enabledProviders.add(id);
+	}
 }
 
 /**
@@ -250,6 +380,15 @@ export function initializeWithSettings(activeSettings: Settings): void {
 function persistDisabledProviders(): void {
 	if (settings) {
 		settings.set("disabledProviders", Array.from(disabledProviders));
+	}
+}
+
+/**
+ * Persist current enabled providers to settings.
+ */
+function persistEnabledProviders(): void {
+	if (settings) {
+		settings.set("enabledProviders", Array.from(enabledProviders));
 	}
 }
 
@@ -270,7 +409,9 @@ export function enableProvider(providerId: string): void {
 }
 
 /**
- * Check if a provider is enabled.
+ * Check if a provider is enabled (the whole-provider switch backed by
+ * `disabledProviders`). Foreign `~/` config additionally needs
+ * {@link isUserSourceEnabled}.
  */
 export function isProviderEnabled(providerId: string): boolean {
 	return !disabledProviders.has(providerId);
@@ -292,6 +433,24 @@ export function setDisabledProviders(providerIds: string[]): void {
 		disabledProviders.add(id);
 	}
 	persistDisabledProviders();
+}
+
+/**
+ * Get list of all explicitly enabled provider IDs.
+ */
+export function getEnabledProviders(): string[] {
+	return Array.from(enabledProviders);
+}
+
+/**
+ * Set enabled providers from a list (replaces current set).
+ */
+export function setEnabledProviders(providerIds: string[]): void {
+	enabledProviders.clear();
+	for (const id of providerIds) {
+		enabledProviders.add(id);
+	}
+	persistEnabledProviders();
 }
 
 // =============================================================================
@@ -396,6 +555,16 @@ export function getAllProvidersInfo(): ProviderInfo[] {
  * Reset all caches. Call after chdir or filesystem changes.
  */
 export function reset(): void {
+	clearFsCache();
+}
+
+/**
+ * Reset capability registry settings and provider state. Test-only.
+ */
+export function resetCapabilityForTests(): void {
+	settings = null;
+	disabledProviders.clear();
+	enabledProviders.clear();
 	clearFsCache();
 }
 

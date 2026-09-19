@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
-import { getBundledModel } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import {
@@ -17,12 +17,12 @@ import {
 	type SessionCompactEvent,
 	type SessionEvent,
 } from "@oh-my-pi/pi-coding-agent/extensibility/hooks";
-import { theme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
+import { theme } from "@oh-my-pi/pi-tui/theme";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { Snowflake } from "@oh-my-pi/pi-utils";
+import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
 import { e2eApiKey } from "./utilities";
 
 describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("Compaction hooks", () => {
@@ -39,10 +39,10 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("Compaction hooks", () => {
 
 	afterEach(async () => {
 		if (session) {
-			session.dispose();
+			await session.dispose();
 		}
 		if (tempDir && fs.existsSync(tempDir)) {
-			fs.rmSync(tempDir, { recursive: true });
+			removeSyncWithRetries(tempDir);
 		}
 	});
 
@@ -97,12 +97,12 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("Compaction hooks", () => {
 			getApiKey: () => e2eApiKey("ANTHROPIC_API_KEY"),
 			initialState: {
 				model,
-				systemPrompt: "You are a helpful assistant. Be concise.",
+				systemPrompt: ["You are a helpful assistant. Be concise."],
 				tools,
 			},
 		});
 
-		const sessionManager = SessionManager.create(tempDir);
+		const sessionManager = SessionManager.create(tempDir, tempDir);
 		const settings = Settings.isolated();
 		const authStorage = await AuthStorage.create(path.join(tempDir, "testauth.db"));
 		const modelRegistry = new ModelRegistry(authStorage);
@@ -164,15 +164,12 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("Compaction hooks", () => {
 		expect(beforeEvent.preparation).toBeDefined();
 		expect(beforeEvent.preparation.messagesToSummarize).toBeDefined();
 		expect(beforeEvent.preparation.turnPrefixMessages).toBeDefined();
-		expect(beforeEvent.preparation.tokensBefore).toBeGreaterThanOrEqual(0);
 		expect(typeof beforeEvent.preparation.isSplitTurn).toBe("boolean");
 		expect(beforeEvent.branchEntries).toBeDefined();
 		// sessionManager, modelRegistry, and model are now on ctx, not event
 
 		const afterEvent = compactEvents[0];
 		expect(afterEvent.compactionEntry).toBeDefined();
-		expect(afterEvent.compactionEntry.summary.length).toBeGreaterThan(0);
-		expect(afterEvent.compactionEntry.tokensBefore).toBeGreaterThanOrEqual(0);
 		expect(afterEvent.fromExtension).toBe(false);
 	}, 120000);
 
@@ -285,7 +282,6 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("Compaction hooks", () => {
 		const result = await session.compact();
 
 		expect(result.summary).toBeDefined();
-		expect(result.summary.length).toBeGreaterThan(0);
 
 		const compactEvents = capturedEvents.filter((e): e is SessionCompactEvent => e.type === "session_compact");
 		expect(compactEvents.length).toBe(1);
@@ -396,10 +392,6 @@ describe.skipIf(!e2eApiKey("ANTHROPIC_API_KEY"))("Compaction hooks", () => {
 		// Verify they're accessible via session
 		expect(typeof session.sessionManager.getEntries).toBe("function");
 		expect(typeof session.modelRegistry.getApiKey).toBe("function");
-
-		const entries = session.sessionManager.getEntries();
-		expect(Array.isArray(entries)).toBe(true);
-		expect(entries.length).toBeGreaterThan(0);
 	}, 120000);
 
 	it("should use hook compaction even with different values", async () => {

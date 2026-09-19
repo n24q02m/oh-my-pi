@@ -1,66 +1,66 @@
 //! Brush-based shell execution exported via N-API.
-//!
-//! # Overview
-//! Executes shell commands in a non-interactive brush-core shell, streaming
-//! output back to JavaScript via a threadsafe callback.
-//!
-//! # Example
-//! ```ignore
-//! const shell = new natives.Shell();
-//! const result = await shell.run({ command: "ls" }, (chunk) => {
-//!   console.log(chunk);
-//! });
-//! ```
 
-#[cfg(windows)]
-use std::collections::HashSet;
-use std::{
-	collections::HashMap,
-	fs,
-	io::{self, Write},
-	str,
-	sync::Arc,
-	time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-#[cfg(windows)]
-mod windows;
-
-use brush_builtins::{BuiltinSet, default_builtins};
-use brush_core::{
-	CreateOptions, ExecutionContext, ExecutionControlFlow, ExecutionExitCode, ExecutionResult,
-	ProcessGroupPolicy, Shell as BrushShell, ShellValue, ShellVariable, builtins,
-	env::EnvironmentScope,
-	openfiles::{self, OpenFile, OpenFiles},
-	sys, traps,
-};
-use clap::Parser;
 use napi::{
+	Env, Result,
 	bindgen_prelude::*,
-	threadsafe_function::{ThreadsafeFunction, ThreadsafeFunctionCallMode},
-	tokio::{
-		self,
-		sync::{Mutex as TokioMutex, mpsc},
-		time,
-	},
+	threadsafe_function::{ThreadsafeFunction, UnknownReturnValue},
 };
 use napi_derive::napi;
-use tokio::io::AsyncReadExt as _;
-use tokio_util::sync::CancellationToken;
-#[cfg(windows)]
-use windows::configure_windows_path;
+use pi_shell::{
+	MinimizerResult as CoreMinimizerResult, Shell as CoreShell,
+	ShellExecuteOptions as CoreShellExecuteOptions, ShellOptions as CoreShellOptions,
+	ShellRunOptions as CoreShellRunOptions, ShellRunResult as CoreShellRunResult,
+	execute_shell as core_execute_shell, minimizer,
+};
 
 use crate::task;
 
-struct ShellSessionCore {
-	shell:         BrushShell,
-	current_abort: Option<task::AbortToken>,
+/// N-API opt-in handle for the minimizer.
+#[napi(object)]
+#[derive(Debug, Clone, Default)]
+pub struct MinimizerOptions {
+	/// Master switch. Absent / false = disabled.
+	pub enabled:              Option<bool>,
+	/// Optional path to a TOML settings file whose values override
+	/// field-level defaults. `~` is expanded.
+	pub settings_path:        Option<String>,
+	/// Optional xxHash64 digest (hex) of the settings file contents. When
+	/// supplied, the engine refuses to honor a settings file whose hash does
+	/// not match — a lightweight trust gate for agent-controllable paths.
+	pub settings_hash:        Option<String>,
+	/// Opt-in allowlist of program names (e.g. `"git"`). When empty or
+	/// absent, all built-in filters are active.
+	pub only:                 Option<Vec<String>>,
+	/// Program names explicitly excluded from minimization.
+	pub except:               Option<Vec<String>>,
+	/// Maximum captured bytes per command before the engine falls back to
+	/// the raw, un-minimized output. Default 4 MiB.
+	pub max_capture_bytes:    Option<u32>,
+	/// Source-outline level for `cat <source-file>` minimization. Accepts
+	/// `"default"` (current behavior) or `"aggressive"` (strip function bodies).
+	pub source_outline_level: Option<String>,
+	/// Kill-switch to fall back to the pre-PR (legacy) filter behavior for
+	/// grep / find / pytest. When `Some(true)`, filters that opted into the
+	/// always-shrink Tier 1 / Tier 2 behavior skip the new code path. When
+	/// `None`, defers to the `OMP_MINIMIZER_LEGACY_FILTERS` env var.
+	pub legacy_filters:       Option<bool>,
 }
 
-#[derive(Clone)]
-struct ShellConfig {
-	session_env:   Option<HashMap<String, String>>,
-	snapshot_path: Option<String>,
+impl From<MinimizerOptions> for minimizer::MinimizerOptions {
+	fn from(value: MinimizerOptions) -> Self {
+		Self {
+			enabled:              value.enabled,
+			settings_path:        value.settings_path,
+			settings_hash:        value.settings_hash,
+			only:                 value.only,
+			except:               value.except,
+			max_capture_bytes:    value.max_capture_bytes,
+			source_outline_level: value.source_outline_level,
+			legacy_filters:       value.legacy_filters,
+		}
+	}
 }
 
 /// Options for configuring a persistent shell session.
@@ -70,16 +70,18 @@ pub struct ShellOptions {
 	pub session_env:   Option<HashMap<String, String>>,
 	/// Optional snapshot file to source on session creation.
 	pub snapshot_path: Option<String>,
+	/// Optional per-command output minimizer configuration.
+	pub minimizer:     Option<MinimizerOptions>,
 }
 
-/// Options for running a shell command (internal, lifetime-free).
-struct ShellRunConfig {
-	/// Command string to execute in the shell.
-	command: String,
-	/// Working directory for the command.
-	cwd:     Option<String>,
-	/// Environment variables to apply for this command only.
-	env:     Option<HashMap<String, String>>,
+impl From<ShellOptions> for CoreShellOptions {
+	fn from(value: ShellOptions) -> Self {
+		Self {
+			session_env:   value.session_env,
+			snapshot_path: value.snapshot_path,
+			minimizer:     value.minimizer.map(Into::into),
+		}
+	}
 }
 
 /// Options for running a shell command.
@@ -92,145 +94,9 @@ pub struct ShellRunOptions<'env> {
 	/// Environment variables to apply for this command only.
 	pub env:        Option<HashMap<String, String>>,
 	/// Timeout in milliseconds before cancelling the command.
-	#[napi(js_name = "timeoutMs")]
 	pub timeout_ms: Option<u32>,
 	/// Abort signal for cancelling the operation.
 	pub signal:     Option<Unknown<'env>>,
-}
-
-/// Result of running a shell command.
-#[napi(object)]
-pub struct ShellRunResult {
-	/// Exit code when the command completes normally.
-	pub exit_code: Option<i32>,
-	/// Whether the command was cancelled via abort.
-	pub cancelled: bool,
-	/// Whether the command timed out before completion.
-	pub timed_out: bool,
-}
-
-/// Persistent brush-core shell session.
-#[napi]
-pub struct Shell {
-	session: Arc<TokioMutex<Option<ShellSessionCore>>>,
-	config:  ShellConfig,
-}
-
-#[napi]
-impl Shell {
-	#[napi(constructor)]
-	/// Create a new shell session from optional configuration.
-	///
-	/// The options set session-scoped environment variables and a snapshot path.
-	pub fn new(options: Option<ShellOptions>) -> Self {
-		let config = options.map_or_else(
-			|| ShellConfig { session_env: None, snapshot_path: None },
-			|opt| ShellConfig { session_env: opt.session_env, snapshot_path: opt.snapshot_path },
-		);
-		Self { session: Arc::new(TokioMutex::new(None)), config }
-	}
-
-	/// Run a shell command using the provided options.
-	///
-	/// The `on_chunk` callback receives streamed stdout/stderr output. Returns
-	/// the exit code when the command completes, or flags when cancelled or
-	/// timed out.
-	#[napi]
-	pub fn run<'e>(
-		&self,
-		env: &'e Env,
-		options: ShellRunOptions<'e>,
-		#[napi(ts_arg_type = "((chunk: string) => void) | undefined | null")] on_chunk: Option<
-			ThreadsafeFunction<String>,
-		>,
-	) -> Result<PromiseRaw<'e, ShellRunResult>> {
-		let ct = task::CancelToken::new(options.timeout_ms, options.signal);
-		let session = self.session.clone();
-		let config = self.config.clone();
-
-		let run_config =
-			ShellRunConfig { command: options.command, cwd: options.cwd, env: options.env };
-
-		task::future(env, "shell.run", async move {
-			run_shell_session(session, config, run_config, on_chunk, ct).await
-		})
-	}
-
-	/// Abort all running commands for this shell session.
-	///
-	/// Returns `Ok(())` even when no commands are running.
-	#[napi]
-	pub async fn abort(&self) -> Result<()> {
-		if let Some(session) = self.session.lock().await.as_ref()
-			&& let Some(at) = &session.current_abort
-		{
-			at.abort(task::AbortReason::Signal);
-		}
-		Ok(())
-	}
-}
-
-/// Run a shell command within a persistent session.
-async fn run_shell_session(
-	session: Arc<TokioMutex<Option<ShellSessionCore>>>,
-	config: ShellConfig,
-	run_config: ShellRunConfig,
-	on_chunk: Option<ThreadsafeFunction<String>>,
-	mut ct: task::CancelToken,
-) -> Result<ShellRunResult> {
-	let tokio_cancel = CancellationToken::new();
-
-	let mut run_task = tokio::spawn({
-		let session = session.clone();
-		let tokio_cancel = tokio_cancel.clone();
-		let at = ct.emplace_abort_token();
-		async move {
-			let mut session_guard = session.lock().await;
-
-			let session = match &mut *session_guard {
-				Some(session) => session,
-				None => session_guard.insert(create_session(&config).await?),
-			};
-			session.current_abort = Some(at);
-			run_shell_command(session, &run_config, on_chunk, tokio_cancel).await
-		}
-	});
-
-	let res = tokio::select! {
-		res = &mut run_task => res,
-		reason = ct.wait() => {
-			tokio_cancel.cancel();
-			let graceful = time::timeout(Duration::from_secs(2), &mut run_task).await;
-			if graceful.is_err() {
-				run_task.abort();
-				let _ = run_task.await;
-			}
-			// Use try_lock to avoid deadlocking if another task holds the session.
-			// If we can't acquire the lock, the session will be cleaned up when the
-			// holding task finishes.
-			if let Ok(mut guard) = session.try_lock() {
-				*guard = None;
-			}
-			return Ok(ShellRunResult {
-				exit_code: None,
-				cancelled: matches!(reason, task::AbortReason::Signal),
-				timed_out: matches!(reason, task::AbortReason::Timeout),
-			});
-		}
-	};
-	let res =
-		res.unwrap_or_else(|e| Err(Error::from_reason(format!("Shell execution task failed: {e}"))));
-
-	let keepalive = res.as_ref().is_ok_and(session_keepalive);
-	if keepalive {
-		// Clear abort token when command completes
-		if let Some(session_core) = session.lock().await.as_mut() {
-			session_core.current_abort = None;
-		}
-	} else {
-		*session.lock().await = None;
-	}
-	Ok(ShellRunResult { exit_code: Some(exit_code(&res?)), cancelled: false, timed_out: false })
 }
 
 /// Options for executing a shell command via brush-core.
@@ -245,24 +111,148 @@ pub struct ShellExecuteOptions<'env> {
 	/// Environment variables to apply once per session.
 	pub session_env:   Option<HashMap<String, String>>,
 	/// Timeout in milliseconds before cancelling the command.
-	#[napi(js_name = "timeoutMs")]
 	pub timeout_ms:    Option<u32>,
 	/// Optional snapshot file to source on session creation.
-	#[napi(js_name = "snapshotPath")]
 	pub snapshot_path: Option<String>,
+	/// Optional per-command output minimizer configuration.
+	pub minimizer:     Option<MinimizerOptions>,
 	/// Abort signal for cancelling the operation.
 	pub signal:        Option<Unknown<'env>>,
 }
 
-/// Result of executing a shell command via brush-core.
+/// Telemetry for a single minimization.
+///
+/// Surfaced when the minimizer actually rewrote the command's output. The
+/// session layer is expected to persist `original_text` via its
+/// `ArtifactManager`, splice the resulting `artifact://<id>` reference
+/// into `text`, and replace any previously streamed raw output with the
+/// minimized text.
 #[napi(object)]
-pub struct ShellExecuteResult {
+pub struct MinimizerResult {
+	/// Dispatch label produced by the minimizer (e.g. `"git"`,
+	/// `"pipeline:gradle"`, `"pipeline+builtin"`).
+	pub filter:        String,
+	/// The minimized replacement text. Callers that streamed raw chunks
+	/// during execution should clear and replace their accumulated output
+	/// with this text.
+	pub text:          String,
+	/// The full original capture, before minimization.
+	pub original_text: String,
+	/// Captured byte length before minimization.
+	pub input_bytes:   u32,
+	/// Byte length of the minimized text the consumer received.
+	pub output_bytes:  u32,
+}
+
+impl From<CoreMinimizerResult> for MinimizerResult {
+	fn from(value: CoreMinimizerResult) -> Self {
+		Self {
+			filter:        value.filter,
+			text:          value.text,
+			original_text: value.original_text,
+			input_bytes:   value.input_bytes,
+			output_bytes:  value.output_bytes,
+		}
+	}
+}
+
+/// Result of running a shell command.
+#[napi(object)]
+pub struct ShellRunResult {
 	/// Exit code when the command completes normally.
 	pub exit_code: Option<i32>,
 	/// Whether the command was cancelled via abort.
 	pub cancelled: bool,
 	/// Whether the command timed out before completion.
 	pub timed_out: bool,
+
+	/// When the minimizer rewrote the captured output, this carries the
+	/// original buffer + telemetry so the session layer can persist it as
+	/// an artifact and splice an `artifact://<id>` reference into the
+	/// minimized text shown to the agent. `None` when nothing was rewritten.
+	pub minimized:   Option<MinimizerResult>,
+	/// Shell working directory after command completion.
+	pub working_dir: Option<String>,
+}
+
+impl From<CoreShellRunResult> for ShellRunResult {
+	fn from(value: CoreShellRunResult) -> Self {
+		Self {
+			exit_code:   value.exit_code,
+			cancelled:   value.cancelled,
+			timed_out:   value.timed_out,
+			minimized:   value.minimized.map(Into::into),
+			working_dir: value.working_dir,
+		}
+	}
+}
+
+/// Persistent brush-core shell session.
+#[napi]
+pub struct Shell {
+	inner: Arc<CoreShell>,
+}
+
+#[napi]
+impl Shell {
+	/// Create a new shell session from optional configuration.
+	///
+	/// The options set session-scoped environment variables and a snapshot path.
+	#[napi(constructor)]
+	pub fn new(options: Option<ShellOptions>) -> Self {
+		Self { inner: Arc::new(CoreShell::new(options.map(Into::into))) }
+	}
+
+	/// Run a shell command using the provided options.
+	///
+	/// The `on_chunk` callback receives streamed stdout/stderr output. Returns
+	/// the exit code when the command completes, or flags when cancelled or
+	/// timed out.
+	#[napi]
+	pub fn run<'env>(
+		&self,
+		env: &'env Env,
+		options: ShellRunOptions<'env>,
+		#[napi(ts_arg_type = "((error: Error | null, chunk: string) => void) | undefined | null")]
+		on_chunk: Option<ThreadsafeFunction<String, UnknownReturnValue>>,
+	) -> Result<PromiseRaw<'env, ShellRunResult>> {
+		let cancel_token = task::CancelToken::new(options.timeout_ms, options.signal);
+		let inner = Arc::clone(&self.inner);
+		let run_options = CoreShellRunOptions {
+			command:    options.command,
+			cwd:        options.cwd,
+			env:        options.env,
+			timeout_ms: options.timeout_ms,
+		};
+		task::future(env, "shell.run", async move {
+			let (chunk_tx, drain_handle) = bridge_chunks(on_chunk);
+			let result = inner
+				.run(run_options, chunk_tx, cancel_token.into_core())
+				.await
+				.map(Into::into)
+				.map_err(|err| Error::from_reason(err.to_string()));
+			await_drain(drain_handle, &result).await;
+			result
+		})
+	}
+
+	/// Abort all running commands for this shell session.
+	///
+	/// Returns `Ok(())` even when no commands are running.
+	#[napi]
+	pub async fn abort(&self) -> Result<()> {
+		self.inner.abort().await;
+		Ok(())
+	}
+
+	/// Count live background jobs (`&`/`nohup` children still running) on this
+	/// session. Completed jobs are reaped first. The host uses this to retain a
+	/// per-call shell whose background processes are still running instead of
+	/// dropping it (which would SIGKILL them via kill-on-drop).
+	#[napi]
+	pub async fn live_background_job_count(&self) -> u32 {
+		self.inner.live_background_job_count().await
+	}
 }
 
 /// Execute a brush shell command.
@@ -270,764 +260,449 @@ pub struct ShellExecuteResult {
 /// Creates a fresh session for each call. The `on_chunk` callback receives
 /// streamed stdout/stderr output. Returns the exit code when the command
 /// completes, or flags when cancelled or timed out.
-#[napi(js_name = "executeShell")]
+#[napi]
 pub fn execute_shell<'env>(
 	env: &'env Env,
 	options: ShellExecuteOptions<'env>,
-	#[napi(ts_arg_type = "((chunk: string) => void) | undefined | null")] on_chunk: Option<
-		ThreadsafeFunction<String>,
-	>,
-) -> Result<PromiseRaw<'env, ShellExecuteResult>> {
-	let config =
-		ShellConfig { session_env: options.session_env, snapshot_path: options.snapshot_path };
-	let run_config =
-		ShellRunConfig { command: options.command, cwd: options.cwd, env: options.env };
-
-	let ct = task::CancelToken::new(options.timeout_ms, options.signal);
+	#[napi(ts_arg_type = "((error: Error | null, chunk: string) => void) | undefined | null")]
+	on_chunk: Option<ThreadsafeFunction<String, UnknownReturnValue>>,
+) -> Result<PromiseRaw<'env, ShellRunResult>> {
+	let cancel_token = task::CancelToken::new(options.timeout_ms, options.signal);
+	let exec_options = CoreShellExecuteOptions {
+		command:       options.command,
+		cwd:           options.cwd,
+		env:           options.env,
+		session_env:   options.session_env,
+		timeout_ms:    options.timeout_ms,
+		snapshot_path: options.snapshot_path,
+		minimizer:     options.minimizer.map(Into::into),
+	};
 	task::future(env, "shell.execute", async move {
-		run_shell_oneshot(config, run_config, on_chunk, ct).await
+		let (chunk_tx, drain_handle) = bridge_chunks(on_chunk);
+		let result = core_execute_shell(exec_options, chunk_tx, cancel_token.into_core())
+			.await
+			.map(Into::into)
+			.map_err(|err| Error::from_reason(err.to_string()));
+		await_drain(drain_handle, &result).await;
+		result
 	})
 }
 
-/// Run a shell command in a fresh session (one-shot execution).
-async fn run_shell_oneshot(
-	config: ShellConfig,
-	run_config: ShellRunConfig,
-	on_chunk: Option<ThreadsafeFunction<String>>,
-	ct: task::CancelToken,
-) -> Result<ShellExecuteResult> {
-	let tokio_cancel = CancellationToken::new();
+/// Capacity (in chunks) of the queue between the pipe readers and the JS
+/// forwarding pump. One queued chunk is at most one pipe read (≤64 KiB), so
+/// the Rust side of the bridge holds ~4 MiB worst case before the readers'
+/// `send_async` parks — which in turn parks the child on its stdout/stderr
+/// pipe (ordinary pipe backpressure) instead of buffering the surplus in
+/// process memory (#4078).
+const BRIDGE_QUEUE_CHUNKS: usize = 64;
 
-	let mut task = tokio::spawn({
-		let tokio_cancel = tokio_cancel.clone();
-		async move {
-			let mut session = create_session(&config).await?;
-			run_shell_command(&mut session, &run_config, on_chunk, tokio_cancel).await
-		}
-	});
-
-	let run_result = tokio::select! {
-		result = &mut task => result,
-		reason = ct.wait() => {
-			tokio_cancel.cancel();
-			let graceful = time::timeout(Duration::from_secs(2), &mut task).await;
-			if graceful.is_err() {
-				task.abort();
-				let _ = task.await;
-			}
-			return Ok(ShellExecuteResult {
-				exit_code: None,
-				cancelled: matches!(reason, task::AbortReason::Signal),
-				timed_out: matches!(reason, task::AbortReason::Timeout),
-			})
-		},
+fn bridge_chunks(
+	on_chunk: Option<ThreadsafeFunction<String, UnknownReturnValue>>,
+) -> (Option<flume::Sender<String>>, Option<napi::tokio::task::JoinHandle<()>>) {
+	let Some(on_chunk) = on_chunk else {
+		return (None, None);
 	};
-
-	let res = run_result
-		.unwrap_or_else(|e| Err(Error::from_reason(format!("Shell execution task failed: {e}"))));
-
-	Ok(ShellExecuteResult { exit_code: Some(exit_code(&res?)), cancelled: false, timed_out: false })
+	let (tx, rx) = flume::bounded::<String>(BRIDGE_QUEUE_CHUNKS);
+	let handle = napi::tokio::spawn(pump_chunks(rx, async move |payload: String| {
+		// `call_async` resolves only after the JS callback ran, so at most
+		// one batch sits in the napi queue at a time and the JS event loop's
+		// actual consumption rate backpressures the whole pipeline. An error
+		// means the JS side is gone (env teardown) — stop forwarding.
+		on_chunk.call_async(Ok(payload)).await.is_ok()
+	}));
+	(Some(tx), Some(handle))
 }
 
-fn null_file() -> Result<OpenFile> {
-	openfiles::null().map_err(|err| Error::from_reason(format!("Failed to create null file: {err}")))
-}
-
-const fn exit_code(result: &ExecutionResult) -> i32 {
-	match result.exit_code {
-		ExecutionExitCode::Success => 0,
-		ExecutionExitCode::GeneralError => 1,
-		ExecutionExitCode::InvalidUsage => 2,
-		ExecutionExitCode::Unimplemented => 99,
-		ExecutionExitCode::CannotExecute => 126,
-		ExecutionExitCode::NotFound => 127,
-		ExecutionExitCode::Interrupted => 130,
-		ExecutionExitCode::Custom(code) => code as i32,
-	}
-}
-
-#[cfg(windows)]
-fn normalize_env_key(key: &str) -> &str {
-	if key.eq_ignore_ascii_case("PATH") {
-		"PATH"
-	} else {
-		key
-	}
-}
-
-#[cfg(not(windows))]
-const fn normalize_env_key(key: &str) -> &str {
-	key
-}
-
-#[cfg(windows)]
-fn merge_path_values(existing: &str, incoming: &str) -> String {
-	let mut merged = Vec::new();
-	let mut seen = HashSet::new();
-	push_unique_paths(&mut merged, &mut seen, existing);
-	push_unique_paths(&mut merged, &mut seen, incoming);
-
-	std::env::join_paths(merged.iter())
-		.map(|paths| paths.to_string_lossy().to_string())
-		.unwrap_or_else(|_| merged.join(";"))
-}
-
-#[cfg(windows)]
-fn push_unique_paths(merged: &mut Vec<String>, seen: &mut HashSet<String>, value: &str) {
-	for segment in std::env::split_paths(value) {
-		let segment_str = segment.to_string_lossy().to_string();
-		let normalized = normalize_path_segment(&segment_str);
-		if normalized.is_empty() {
-			continue;
-		}
-		if seen.insert(normalized) {
-			merged.push(segment_str);
-		}
-	}
-}
-
-#[cfg(windows)]
-fn normalize_path_segment(segment: &str) -> String {
-	let trimmed = segment.trim().trim_matches('"');
-	if trimmed.is_empty() {
-		return String::new();
-	}
-
-	let mut normalized = std::path::PathBuf::new();
-	for component in std::path::Path::new(trimmed).components() {
-		normalized.push(component.as_os_str());
-	}
-
-	normalized.to_string_lossy().to_ascii_lowercase()
-}
-
-#[cfg(not(windows))]
-fn merge_path_values(_existing: &str, incoming: &str) -> String {
-	incoming.to_string()
-}
-
-async fn create_session(config: &ShellConfig) -> Result<ShellSessionCore> {
-	let create_options = CreateOptions {
-		interactive: false,
-		login: false,
-		no_profile: true,
-		no_rc: true,
-		do_not_inherit_env: true,
-		builtins: default_builtins(BuiltinSet::BashMode),
-		..Default::default()
-	};
-
-	let mut shell = BrushShell::new(create_options)
-		.await
-		.map_err(|err| Error::from_reason(format!("Failed to initialize shell: {err}")))?;
-
-	if let Some(exec_builtin) = shell.builtin_mut("exec") {
-		exec_builtin.disabled = true;
-	}
-	if let Some(suspend_builtin) = shell.builtin_mut("suspend") {
-		suspend_builtin.disabled = true;
-	}
-	shell.register_builtin("sleep", builtins::builtin::<SleepCommand>());
-	shell.register_builtin("timeout", builtins::builtin::<TimeoutCommand>());
-
-	let mut merged_path: Option<String> = None;
-	for (key, value) in std::env::vars() {
-		let normalized_key = normalize_env_key(&key);
-		if should_skip_env_var(normalized_key) {
-			continue;
-		}
-		if normalized_key == "PATH" {
-			merged_path = Some(match merged_path {
-				Some(existing) => merge_path_values(&existing, &value),
-				None => value,
-			});
-			continue;
-		}
-		let mut var = ShellVariable::new(ShellValue::String(value));
-		var.export();
-		shell
-			.env
-			.set_global(normalized_key, var)
-			.map_err(|err| Error::from_reason(format!("Failed to set env: {err}")))?;
-	}
-
-	#[cfg(windows)]
-	if merged_path.is_none() {
-		if let Some(value) = std::env::var_os("Path").or_else(|| std::env::var_os("PATH")) {
-			merged_path = Some(value.to_string_lossy().to_string());
-		}
-	}
-
-	if let Some(path_value) = merged_path {
-		let mut var = ShellVariable::new(ShellValue::String(path_value));
-		var.export();
-		shell
-			.env
-			.set_global("PATH", var)
-			.map_err(|err| Error::from_reason(format!("Failed to set env: {err}")))?;
-	}
-
-	if let Some(env) = config.session_env.as_ref() {
-		for (key, value) in env {
-			let normalized_key = normalize_env_key(key);
-			if should_skip_env_var(normalized_key) {
-				continue;
-			}
-			let mut var = ShellVariable::new(ShellValue::String(value.clone()));
-			var.export();
-			shell
-				.env
-				.set_global(normalized_key, var)
-				.map_err(|err| Error::from_reason(format!("Failed to set env: {err}")))?;
-		}
-	}
-
-	#[cfg(windows)]
-	configure_windows_path(&mut shell)?;
-
-	if let Some(snapshot_path) = config.snapshot_path.as_ref() {
-		source_snapshot(&mut shell, snapshot_path).await?;
-	}
-
-	Ok(ShellSessionCore { shell, current_abort: None })
-}
-
-async fn source_snapshot(shell: &mut BrushShell, snapshot_path: &str) -> Result<()> {
-	let mut params = shell.default_exec_params();
-	params.set_fd(OpenFiles::STDIN_FD, null_file()?);
-	params.set_fd(OpenFiles::STDOUT_FD, null_file()?);
-	params.set_fd(OpenFiles::STDERR_FD, null_file()?);
-
-	let escaped = snapshot_path.replace('\'', "'\\''");
-	let command = format!("source '{escaped}'");
-	shell
-		.run_string(command, &params)
-		.await
-		.map_err(|err| Error::from_reason(format!("Failed to source snapshot: {err}")))?;
-	Ok(())
-}
-
-async fn run_shell_command(
-	session: &mut ShellSessionCore,
-	options: &ShellRunConfig,
-	on_chunk: Option<ThreadsafeFunction<String>>,
-	cancel_token: CancellationToken,
-) -> Result<ExecutionResult> {
-	if let Some(cwd) = options.cwd.as_deref() {
-		session
-			.shell
-			.set_working_dir(cwd)
-			.map_err(|err| Error::from_reason(format!("Failed to set cwd: {err}")))?;
-	}
-
-	let (reader_file, writer_file) = pipe_to_files("output")?;
-
-	let stdout_file = OpenFile::from(
-		writer_file
-			.try_clone()
-			.map_err(|err| Error::from_reason(format!("Failed to clone pipe: {err}")))?,
-	);
-	let stderr_file = OpenFile::from(writer_file);
-
-	let mut params = session.shell.default_exec_params();
-	params.set_fd(OpenFiles::STDIN_FD, null_file()?);
-	params.set_fd(OpenFiles::STDOUT_FD, stdout_file);
-	params.set_fd(OpenFiles::STDERR_FD, stderr_file);
-	params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
-	params.set_cancel_token(cancel_token.clone());
-
-	let mut env_scope_pushed = false;
-	if let Some(env) = options.env.as_ref() {
-		session.shell.env.push_scope(EnvironmentScope::Command);
-		env_scope_pushed = true;
-		for (key, value) in env {
-			let normalized_key = normalize_env_key(key);
-			if should_skip_env_var(normalized_key) {
-				continue;
-			}
-			let mut var = ShellVariable::new(ShellValue::String(value.clone()));
-			var.export();
-			if let Err(err) = session
-				.shell
-				.env
-				.add(normalized_key, var, EnvironmentScope::Command)
-			{
-				let _ = session.shell.env.pop_scope(EnvironmentScope::Command);
-				return Err(Error::from_reason(format!("Failed to set env: {err}")));
+/// Drain `rx`, greedily coalescing queued chunks into ≤64 KiB batches, and
+/// feed each batch to `forward`, awaiting its completion before pulling more.
+/// Returns when `rx` disconnects (all senders dropped) or `forward` reports
+/// the consumer is gone; dropping `rx` then disconnects the channel so
+/// parked/future senders fail fast and the pipe readers keep draining the
+/// child instead of wedging it.
+async fn pump_chunks(rx: flume::Receiver<String>, mut forward: impl AsyncFnMut(String) -> bool) {
+	// Hard cap on one coalesced batch so the JS main thread never sees a
+	// multi-MB napi callback (a giant single string would stall sanitize +
+	// tail-buffer maintenance for the whole copy).
+	const MAX_BATCH_BYTES: usize = 64 * 1024;
+	// Initial capacity sized for typical bursty pipe output. Re-allocated
+	// each batch because `String` ownership is moved into the napi call.
+	const INITIAL_BATCH_CAP: usize = 8 * 1024;
+	let mut batch = String::with_capacity(INITIAL_BATCH_CAP);
+	while let Ok(first) = rx.recv_async().await {
+		batch.push_str(&first);
+		// Greedily drain everything already queued. Child processes that
+		// write byte-at-a-time (printf-style progress, llama-cli token
+		// streams) otherwise produce one napi callback per `write(2)`,
+		// saturating the JS main thread (~200% CPU observed) and leaving
+		// the queue draining long after the child exits.
+		while batch.len() < MAX_BATCH_BYTES {
+			match rx.try_recv() {
+				Ok(more) => batch.push_str(&more),
+				Err(_) => break,
 			}
 		}
-	}
-
-	let reader_cancel = CancellationToken::new();
-	let (activity_tx, mut activity_rx) = mpsc::channel::<()>(1);
-	let mut reader_handle = tokio::spawn({
-		let reader_cancel = reader_cancel.clone();
-		async move {
-			read_output(reader_file, on_chunk, reader_cancel, activity_tx).await;
-			Result::<()>::Ok(())
-		}
-	});
-	let cancel_bridge = tokio::spawn({
-		let cancel_token = cancel_token.clone();
-		let reader_cancel = reader_cancel.clone();
-		async move {
-			cancel_token.cancelled().await;
-			reader_cancel.cancel();
-		}
-	});
-	let result = session
-		.shell
-		.run_string(options.command.clone(), &params)
-		.await;
-
-	if cancel_token.is_cancelled() {
-		terminate_background_jobs(&session.shell);
-	}
-
-	if env_scope_pushed {
-		session
-			.shell
-			.env
-			.pop_scope(EnvironmentScope::Command)
-			.map_err(|err| Error::from_reason(format!("Failed to pop env scope: {err}")))?;
-	}
-
-	drop(params);
-
-	// The foreground command can complete while background jobs keep the
-	// stdout/stderr pipe open. Don't hang forever waiting for EOF; drain output
-	// for a short period, then cancel.
-	const POST_EXIT_IDLE: Duration = Duration::from_millis(250);
-	const POST_EXIT_MAX: Duration = Duration::from_secs(2);
-
-	let mut reader_finished = false;
-	let mut idle_timer = Box::pin(time::sleep(POST_EXIT_IDLE));
-	let mut max_timer = Box::pin(time::sleep(POST_EXIT_MAX));
-
-	loop {
-		tokio::select! {
-			res = &mut reader_handle => {
-				let _ = res;
-				reader_finished = true;
-				break;
-			}
-			msg = activity_rx.recv() => {
-				if msg.is_none() {
-					break;
-				}
-				idle_timer.as_mut().reset(time::Instant::now() + POST_EXIT_IDLE);
-			}
-			() = &mut idle_timer => break,
-			() = &mut max_timer => break,
-		}
-	}
-
-	if !reader_finished {
-		reader_cancel.cancel();
-		let _ = reader_handle.await;
-	}
-	cancel_bridge.abort();
-	let _ = cancel_bridge.await;
-
-	result.map_err(|err| Error::from_reason(format!("Shell execution failed: {err}")))
-}
-
-#[cfg(unix)]
-fn terminate_background_jobs(shell: &BrushShell) {
-	if shell.jobs.jobs.is_empty() {
-		return;
-	}
-	let Ok(signal) = "TERM".parse::<traps::TrapSignal>() else {
-		return;
-	};
-	let mut pgids = Vec::new();
-	for job in &shell.jobs.jobs {
-		if let Some(pid) = job.process_group_id().or_else(|| job.representative_pid()) {
-			let _ = sys::signal::kill_process(pid, signal);
-			pgids.push(pid);
-		}
-	}
-	if pgids.is_empty() {
-		return;
-	}
-	tokio::spawn(async move {
-		time::sleep(Duration::from_millis(500)).await;
-		let Ok(signal) = "KILL".parse::<traps::TrapSignal>() else {
+		let payload = std::mem::replace(&mut batch, String::with_capacity(INITIAL_BATCH_CAP));
+		if !forward(payload).await {
 			return;
-		};
-		for pid in pgids {
-			let _ = sys::signal::kill_process(pid, signal);
-		}
-	});
-}
-
-#[cfg(windows)]
-fn terminate_background_jobs(shell: &BrushShell) {
-	if shell.jobs.jobs.is_empty() {
-		return;
-	}
-	let Ok(signal) = "TERM".parse::<traps::TrapSignal>() else {
-		return;
-	};
-	let mut pids = Vec::new();
-	for job in &shell.jobs.jobs {
-		if let Some(pid) = job.process_group_id().or_else(|| job.representative_pid()) {
-			let _ = sys::signal::kill_process(pid, signal);
-			pids.push(pid);
 		}
 	}
-	if pids.is_empty() {
-		return;
-	}
-	tokio::spawn(async move {
-		time::sleep(Duration::from_millis(500)).await;
-		let Ok(signal) = "KILL".parse::<traps::TrapSignal>() else {
-			return;
-		};
-		for pid in pids {
-			let _ = sys::signal::kill_process(pid, signal);
-		}
-	});
 }
 
-fn should_skip_env_var(key: &str) -> bool {
-	if key.starts_with("BASH_FUNC_") && key.ends_with("%%") {
-		return true;
-	}
+/// Upper bound on how long to wait for the chunk-forwarding pump after an
+/// interrupted run resolves. Native cancellation may detach a pipe reader whose
+/// sender never closes when a grandchild inherited stdout; waiting for channel
+/// disconnect would then wedge the run promise past its requested timeout
+/// (#10308). Successful and failed runs remain unbounded so every chunk already
+/// accepted by the bridge reaches JavaScript before the result resolves.
+const INTERRUPTED_DRAIN_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 
-	matches!(
-		key,
-		"BASH_ENV"
-			| "ENV"
-			| "HISTFILE"
-			| "HISTTIMEFORMAT"
-			| "HISTCMD"
-			| "PS0"
-			| "PS1"
-			| "PS2"
-			| "PS4"
-			| "BRUSH_PS_ALT"
-			| "READLINE_LINE"
-			| "READLINE_POINT"
-			| "BRUSH_VERSION"
-			| "BASH"
-			| "BASHOPTS"
-			| "BASH_ALIASES"
-			| "BASH_ARGV0"
-			| "BASH_CMDS"
-			| "BASH_SOURCE"
-			| "BASH_SUBSHELL"
-			| "BASH_VERSINFO"
-			| "BASH_VERSION"
-			| "SHELLOPTS"
-			| "SHLVL"
-			| "SHELL"
-			| "COMP_WORDBREAKS"
-			| "DIRSTACK"
-			| "EPOCHREALTIME"
-			| "EPOCHSECONDS"
-			| "FUNCNAME"
-			| "GROUPS"
-			| "IFS"
-			| "LINENO"
-			| "MACHTYPE"
-			| "OSTYPE"
-			| "OPTERR"
-			| "OPTIND"
-			| "PIPESTATUS"
-			| "PPID"
-			| "PWD"
-			| "OLDPWD"
-			| "RANDOM"
-			| "SRANDOM"
-			| "SECONDS"
-			| "UID"
-			| "EUID"
-			| "HOSTNAME"
-			| "HOSTTYPE"
-	)
-}
-
-const fn session_keepalive(result: &ExecutionResult) -> bool {
-	match result.next_control_flow {
-		ExecutionControlFlow::Normal => true,
-		ExecutionControlFlow::BreakLoop { .. } => false,
-		ExecutionControlFlow::ContinueLoop { .. } => false,
-		ExecutionControlFlow::ReturnFromFunctionOrScript => false,
-		ExecutionControlFlow::ExitShell => false,
-	}
-}
-
-async fn read_output(
-	reader: fs::File,
-	on_chunk: Option<ThreadsafeFunction<String>>,
-	cancel_token: CancellationToken,
-	activity: mpsc::Sender<()>,
+/// Finish forwarding accepted output after a native shell run resolves.
+///
+/// Normal completion and errors drain without a deadline to preserve every
+/// accepted chunk. Cancellation and timeout are bounded because an orphaned
+/// pipe reader can otherwise keep a sender alive forever; aborting the pump
+/// drops its `flume::Receiver`, disconnecting that reader.
+async fn await_drain(
+	handle: Option<napi::tokio::task::JoinHandle<()>>,
+	result: &Result<ShellRunResult>,
 ) {
-	const REPLACEMENT: &str = "\u{FFFD}";
-	const BUF: usize = 4096;
-	let mut buf = [0u8; BUF + 4]; // +4 for max UTF-8 char
-	let mut it = 0;
+	let Some(mut handle) = handle else {
+		return;
+	};
+	if !matches!(result, Ok(result) if result.cancelled || result.timed_out) {
+		let _ = handle.await;
+		return;
+	}
+	if napi::tokio::time::timeout(INTERRUPTED_DRAIN_SHUTDOWN_TIMEOUT, &mut handle)
+		.await
+		.is_err()
+	{
+		handle.abort();
+		let _ = handle.await;
+	}
+}
 
-	let reader = tokio::fs::File::from_std(reader);
-	tokio::pin!(reader);
+#[cfg(test)]
+mod tests {
+	use std::{
+		sync::{
+			Arc,
+			atomic::{AtomicBool, Ordering},
+		},
+		time::Duration,
+	};
 
-	loop {
-		let read_future = reader.read(&mut buf[it..BUF]);
-		tokio::pin!(read_future);
-		let n = match tokio::select! {
-			res = &mut read_future => res,
-			() = cancel_token.cancelled() => break,
-		} {
-			Ok(0) => break, // EOF
-			Ok(n) => n,
-			Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-			Err(_) => break,
-		};
-		if n > 0 {
-			let _ = activity.try_send(());
-		}
-		it += n;
+	use flume;
+	use pi_shell::{
+		ShellRunOptions as CoreShellRunOptions,
+		cancel::{AbortReason, CancelToken},
+	};
+	use tokio::time;
 
-		// Consume as much of `pending` as is decodable *right now*.
-		while it > 0 {
-			let pending = &buf[..it];
-			match str::from_utf8(pending) {
-				Ok(text) => {
-					emit_chunk(text, on_chunk.as_ref());
-					it = 0;
-					break;
-				},
-				Err(err) => {
-					let p = err.valid_up_to();
-					if p > 0 {
-						// SAFETY: [..p] is guaranteed valid UTF-8 by valid_up_to().
-						let text = unsafe { str::from_utf8_unchecked(&pending[..p]) };
-						emit_chunk(text, on_chunk.as_ref());
-						// copy p..it to the beginning of the buffer
-						buf.copy_within(p..it, 0);
-						it -= p;
-					}
+	use super::{
+		BRIDGE_QUEUE_CHUNKS, CoreShell, INTERRUPTED_DRAIN_SHUTDOWN_TIMEOUT, ShellRunResult,
+		await_drain, pump_chunks,
+	};
 
-					match err.error_len() {
-						Some(p) => {
-							// Invalid byte sequence: emit replacement and drop those
-							// bytes.
-							emit_chunk(REPLACEMENT, on_chunk.as_ref());
-							// copy p..it to the beginning of the buffer
-							buf.copy_within(p..it, 0);
-							it -= p;
-							// continue loop in case more bytes remain after the
-							// invalid sequence
-						},
-						None => {
-							// Incomplete UTF-8 sequence at end: keep bytes for next
-							// read.
-							break;
-						},
-					}
-				},
+	/// Regression for #4078: the reader→JS bridge queue must stay bounded when
+	/// the JS side (here: a deliberately slow `forward`) cannot keep up with a
+	/// fast producer, and backpressure must never drop or reorder chunks. On
+	/// the pre-fix bridge (`flume::unbounded` + fire-and-forget
+	/// `ThreadsafeFunctionCallMode::NonBlocking`) the same harness accumulates
+	/// the producer's entire surplus in the queue (measured: a 32 MiB stream
+	/// queued all `33_554_432` bytes while the consumer stalled).
+	#[tokio::test(flavor = "multi_thread")]
+	async fn bridge_pump_bounds_queue_and_delivers_all_bytes() {
+		const CHUNKS: usize = 512;
+		const CHUNK_BYTES: usize = 4096;
+		let (tx, rx) = flume::bounded::<String>(BRIDGE_QUEUE_CHUNKS);
+		let producer = tokio::spawn(async move {
+			let mut expected = String::with_capacity(CHUNKS * CHUNK_BYTES);
+			let mut max_queued = 0usize;
+			for i in 0..CHUNKS {
+				let chunk = format!("[{i:06}]{}", "x".repeat(CHUNK_BYTES - 8));
+				expected.push_str(&chunk);
+				tx.send_async(chunk)
+					.await
+					.expect("pump should outlive the producer");
+				max_queued = max_queued.max(tx.len());
 			}
-		}
+			(expected, max_queued)
+		});
+
+		let mut received = String::with_capacity(CHUNKS * CHUNK_BYTES);
+		time::timeout(
+			Duration::from_secs(30),
+			pump_chunks(rx, async |payload: String| {
+				received.push_str(&payload);
+				// Emulate a busy JS event loop: each napi callback takes a while.
+				time::sleep(Duration::from_micros(500)).await;
+				true
+			}),
+		)
+		.await
+		.expect("pump should finish once the producer hangs up");
+
+		let (expected, max_queued) = producer.await.expect("producer task");
+		assert!(
+			max_queued <= BRIDGE_QUEUE_CHUNKS,
+			"bridge queue grew past its bound: {max_queued} chunks",
+		);
+		assert_eq!(received.len(), expected.len(), "bytes were dropped or duplicated");
+		assert_eq!(received, expected, "chunks must arrive losslessly and in order");
 	}
 
-	// Flush whatever is left at EOF (including an incomplete final sequence).
-	for chunk in buf[..it].utf8_chunks() {
-		let valid = chunk.valid();
-		if !valid.is_empty() {
-			emit_chunk(valid, on_chunk.as_ref());
+	/// When the JS side dies (`forward` fails: threadsafe function aborted on
+	/// env teardown), the pump must drop its receiver so parked and future
+	/// sends fail fast — the pipe readers keep draining the child instead of
+	/// wedging it on a full bridge queue.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn bridge_pump_death_disconnects_channel_without_blocking_senders() {
+		let (tx, rx) = flume::bounded::<String>(4);
+		let pump = tokio::spawn(pump_chunks(rx, async |_payload: String| false));
+		let producer = tokio::spawn(async move {
+			let mut disconnected = 0usize;
+			for _ in 0..64 {
+				if tx.send_async("x".repeat(1024)).await.is_err() {
+					disconnected += 1;
+				}
+			}
+			disconnected
+		});
+		let disconnected = time::timeout(Duration::from_secs(5), producer)
+			.await
+			.expect("sends must not park once the consumer died")
+			.expect("producer task");
+		assert!(disconnected > 0, "channel should disconnect after the pump stops");
+		time::timeout(Duration::from_secs(5), pump)
+			.await
+			.expect("pump should exit after forward fails")
+			.expect("pump task");
+	}
+
+	/// A successful run must wait for every accepted bridge chunk even when a
+	/// slow JavaScript consumer takes longer than the interrupted-run bound.
+	/// Bounding this path reports success while silently dropping queued output.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn await_drain_preserves_slow_output_after_success() {
+		let (tx, rx) = flume::bounded::<String>(BRIDGE_QUEUE_CHUNKS);
+		let forwarded = Arc::new(AtomicBool::new(false));
+		let observed = Arc::clone(&forwarded);
+		let handle = napi::tokio::spawn(pump_chunks(rx, async move |_payload: String| {
+			time::sleep(INTERRUPTED_DRAIN_SHUTDOWN_TIMEOUT + Duration::from_millis(100)).await;
+			observed.store(true, Ordering::Release);
+			true
+		}));
+		tx.send("accepted".to_string())
+			.expect("pump should be connected");
+		drop(tx);
+		let result = Ok(ShellRunResult {
+			exit_code:   Some(0),
+			cancelled:   false,
+			timed_out:   false,
+			minimized:   None,
+			working_dir: None,
+		});
+
+		time::timeout(
+			INTERRUPTED_DRAIN_SHUTDOWN_TIMEOUT + Duration::from_secs(2),
+			await_drain(Some(handle), &result),
+		)
+		.await
+		.expect("successful completion must drain slow accepted output");
+		assert!(
+			forwarded.load(Ordering::Acquire),
+			"accepted output was dropped before success returned"
+		);
+	}
+
+	/// Regression for #10308: a grandchild that inherits the stdout pipe keeps a
+	/// pipe-reader task alive after an interrupted run resolves, so one
+	/// bridge-queue sender is never dropped and `pump_chunks` never sees channel
+	/// disconnect. `await_drain` must return after the interrupted-run bound and
+	/// abort the pump instead of wedging the native promise forever.
+	#[tokio::test(flavor = "multi_thread")]
+	async fn await_drain_returns_when_a_reader_orphans_a_sender_after_timeout() {
+		let (tx, rx) = flume::bounded::<String>(BRIDGE_QUEUE_CHUNKS);
+		let orphan = tx.clone();
+		let handle = napi::tokio::spawn(pump_chunks(rx, async |_payload: String| true));
+		drop(tx);
+		let result = Ok(ShellRunResult {
+			exit_code:   None,
+			cancelled:   false,
+			timed_out:   true,
+			minimized:   None,
+			working_dir: None,
+		});
+		let started = time::Instant::now();
+		time::timeout(
+			INTERRUPTED_DRAIN_SHUTDOWN_TIMEOUT + Duration::from_secs(2),
+			await_drain(Some(handle), &result),
+		)
+		.await
+		.expect("await_drain must return when an interrupted reader orphans a sender");
+		assert!(
+			started.elapsed() >= INTERRUPTED_DRAIN_SHUTDOWN_TIMEOUT,
+			"await_drain returned before its bound; the drain was not actually blocked",
+		);
+		// The pump was aborted, so its receiver is dropped: the orphaned sender
+		// now observes a disconnected channel instead of parking forever.
+		assert!(
+			orphan.send("late".to_string()).is_err(),
+			"aborting the pump must disconnect the channel"
+		);
+	}
+
+	mod child_session_action_tests {
+		use pi_shell::{ChildSessionAction, child_session_action};
+
+		#[test]
+		fn interactive_with_terminal_stdin_takes_foreground() {
+			assert_eq!(child_session_action(true, true, false), ChildSessionAction::TakeForeground);
+			assert_eq!(child_session_action(true, true, true), ChildSessionAction::TakeForeground);
 		}
-		if !chunk.invalid().is_empty() {
-			emit_chunk(REPLACEMENT, on_chunk.as_ref());
+
+		#[test]
+		fn non_terminal_stdin_detaches_regardless_of_pipeline() {
+			assert_eq!(child_session_action(true, false, false), ChildSessionAction::DetachSession);
+			// A leading-new-pgroup stage of a pipeline still detaches: setsid
+			// keeps it off the host's controlling tty.
+			assert_eq!(child_session_action(true, false, true), ChildSessionAction::DetachSession);
+		}
+
+		#[test]
+		fn non_interactive_with_terminal_stdin_does_nothing() {
+			assert_eq!(child_session_action(false, true, false), ChildSessionAction::None);
+		}
+
+		#[test]
+		fn non_interactive_terminal_stdin_in_pipeline_does_nothing() {
+			assert_eq!(child_session_action(false, true, true), ChildSessionAction::None);
+		}
+
+		#[test]
+		fn embedded_host_with_non_terminal_stdin_detaches() {
+			assert_eq!(child_session_action(false, false, false), ChildSessionAction::DetachSession);
+		}
+
+		#[test]
+		fn pipeline_stage_with_non_terminal_stdin_detaches() {
+			// Regression: an interactive child inside a pipeline (`zsh -i | awk`)
+			// must not stay in the host session and seize its tty. Pre-fix this
+			// returned `None`, leaving the stage attached and able to SIGTTIN the
+			// host.
+			assert_eq!(child_session_action(false, false, true), ChildSessionAction::DetachSession);
 		}
 	}
-}
-
-fn emit_chunk(text: &str, callback: Option<&ThreadsafeFunction<String>>) {
-	if let Some(callback) = callback {
-		callback.call(Ok(text.to_string()), ThreadsafeFunctionCallMode::NonBlocking);
-	}
-}
-
-fn pipe_to_files(label: &str) -> Result<(fs::File, fs::File)> {
-	let (r, w) = os_pipe::pipe()
-		.map_err(|err| Error::from_reason(format!("Failed to create {label} pipe: {err}")))?;
 
 	#[cfg(unix)]
-	let (r, w): (fs::File, fs::File) = {
-		use std::os::unix::io::{FromRawFd, IntoRawFd};
-		let r = r.into_raw_fd();
-		let w = w.into_raw_fd();
-		// SAFETY: We just obtained these fds from os_pipe and own them
-		// exclusively.
-		unsafe { (FromRawFd::from_raw_fd(r), FromRawFd::from_raw_fd(w)) }
-	};
+	#[tokio::test(flavor = "multi_thread")]
+	async fn embedded_external_command_runs_in_its_own_session() {
+		let shell = CoreShell::new(None);
+		let (tx, rx) = flume::unbounded::<String>();
+		let handle = tokio::spawn(async move {
+			shell
+				.run(
+					CoreShellRunOptions {
+						command:    "sh -c 'printf \"%d\\n\" \"$$\"; sleep 0.5'".to_string(),
+						cwd:        None,
+						env:        None,
+						timeout_ms: None,
+					},
+					Some(tx),
+					CancelToken::default(),
+				)
+				.await
+		});
+		let child_pid = time::timeout(Duration::from_secs(5), rx.recv_async())
+			.await
+			.expect("timed out waiting for child pid")
+			.expect("missing child pid chunk")
+			.trim()
+			.parse::<i32>()
+			.expect("child pid parses");
+		// SAFETY: `getsid(0)` only queries the current process session; the
+		// return value is checked below. Inside a PID namespace (e.g. the
+		// containerized CI runner) the host's session leader can live outside
+		// the namespace, so `getsid(0)` legitimately reports 0 — only -1 is a
+		// real failure. The meaningful invariant is that the child detached
+		// into its own session (`child_sid == child_pid`, distinct from host).
+		let host_sid = unsafe { libc::getsid(0) };
+		assert!(host_sid >= 0, "getsid(0) failed: {}", std::io::Error::last_os_error());
+		// SAFETY: `child_pid` is a live positive PID reported by the child; the
+		// return value is checked below.
+		let child_sid = unsafe { libc::getsid(child_pid) };
+		assert!(child_sid > 0, "getsid({child_pid}) failed: {}", std::io::Error::last_os_error());
+		let result = handle
+			.await
+			.expect("shell task panicked")
+			.expect("shell run");
+		assert_eq!(result.exit_code, Some(0));
+		assert_ne!(child_sid, host_sid);
+		assert_eq!(child_sid, child_pid);
+	}
 
-	#[cfg(windows)]
-	let (r, w): (fs::File, fs::File) = {
-		use std::os::windows::io::{FromRawHandle, IntoRawHandle};
-		let r = r.into_raw_handle();
-		let w = w.into_raw_handle();
-		// SAFETY: We just obtained these handles from os_pipe and own them
-		// exclusively.
-		unsafe { (FromRawHandle::from_raw_handle(r), FromRawHandle::from_raw_handle(w)) }
-	};
+	#[tokio::test]
+	async fn read_output_stops_when_cancelled_before_pipe_eof() {
+		let shell = CoreShell::new(None);
+		let mut cancel = CancelToken::default();
+		let abort = cancel.emplace_abort_token();
+		let handle = tokio::spawn(async move {
+			shell
+				.run(
+					CoreShellRunOptions {
+						command:    "sh -c 'sleep 30 & wait'".to_string(),
+						cwd:        None,
+						env:        None,
+						timeout_ms: None,
+					},
+					None,
+					cancel,
+				)
+				.await
+		});
 
-	Ok((r, w))
-}
+		time::sleep(Duration::from_millis(10)).await;
+		abort.abort(AbortReason::Signal);
+		let result = time::timeout(Duration::from_secs(3), handle)
+			.await
+			.expect("shell run should stop after cancellation")
+			.expect("shell task should not panic")
+			.expect("shell run should return");
+		assert!(result.cancelled);
+	}
 
-#[derive(Parser)]
-#[command(disable_help_flag = true)]
-struct SleepCommand {
-	#[arg(required = true)]
-	durations: Vec<String>,
-}
+	#[tokio::test(flavor = "multi_thread")]
+	async fn timeout_drains_pipeline_output_before_stopping_reader() {
+		let shell = CoreShell::new(None);
+		let (tx, rx) = flume::unbounded::<String>();
+		// `tail` runs as an in-process builtin, so cancellation kills only the
+		// external `yes`; tail then sees EOF and flushes its final 5 lines into
+		// the post-cancel reader grace window. The deadline must be generous
+		// enough that `yes` has demonstrably spawned and produced before the
+		// timeout fires — a 50ms budget lost that race on cold CI runners and
+		// tail flushed an empty ring buffer.
+		const TIMEOUT_MS: u32 = 750;
+		let result = shell
+			.run(
+				CoreShellRunOptions {
+					command:    "yes x | tail -5".to_string(),
+					cwd:        None,
+					env:        None,
+					timeout_ms: Some(TIMEOUT_MS),
+				},
+				Some(tx),
+				CancelToken::new(Some(TIMEOUT_MS)),
+			)
+			.await
+			.expect("shell run");
 
-impl builtins::Command for SleepCommand {
-	type Error = brush_core::Error;
-
-	fn execute(
-		&self,
-		context: ExecutionContext<'_>,
-	) -> impl Future<Output = std::result::Result<ExecutionResult, brush_core::Error>> + Send {
-		let durations = self.durations.clone();
-		async move {
-			if context.is_cancelled() {
-				return Ok(ExecutionExitCode::Interrupted.into());
-			}
-			let mut total = Duration::from_millis(0);
-			for duration in &durations {
-				let Some(parsed) = parse_duration(duration) else {
-					let _ = writeln!(context.stderr(), "sleep: invalid time interval '{duration}'");
-					return Ok(ExecutionResult::new(1));
-				};
-				total += parsed;
-			}
-			let sleep = time::sleep(total);
-			tokio::pin!(sleep);
-			if let Some(cancel_token) = context.cancel_token() {
-				tokio::select! {
-					() = &mut sleep => Ok(ExecutionResult::success()),
-					() = cancel_token.cancelled() => Ok(ExecutionExitCode::Interrupted.into()),
-				}
-			} else {
-				sleep.await;
-				Ok(ExecutionResult::success())
-			}
+		let mut output = String::new();
+		while let Ok(chunk) = rx.recv_async().await {
+			output.push_str(&chunk);
 		}
+
+		assert!(result.timed_out);
+		assert_eq!(output.lines().filter(|line| *line == "x").count(), 5);
 	}
-}
-
-#[derive(Parser)]
-#[command(disable_help_flag = true)]
-struct TimeoutCommand {
-	#[arg(required = true)]
-	duration: String,
-	#[arg(required = true, num_args = 1.., trailing_var_arg = true)]
-	command:  Vec<String>,
-}
-
-impl builtins::Command for TimeoutCommand {
-	type Error = brush_core::Error;
-
-	fn execute(
-		&self,
-		context: ExecutionContext<'_>,
-	) -> impl Future<Output = std::result::Result<ExecutionResult, brush_core::Error>> + Send {
-		let duration = self.duration.clone();
-		let command = self.command.clone();
-		async move {
-			if context.is_cancelled() {
-				return Ok(ExecutionExitCode::Interrupted.into());
-			}
-			let Some(timeout) = parse_duration(&duration) else {
-				let _ = writeln!(context.stderr(), "timeout: invalid time interval '{duration}'");
-				return Ok(ExecutionResult::new(125));
-			};
-			if command.is_empty() {
-				let _ = writeln!(context.stderr(), "timeout: missing command");
-				return Ok(ExecutionResult::new(125));
-			}
-
-			let child_cancel = CancellationToken::new();
-			let mut params = context.params.clone();
-			params.process_group_policy = ProcessGroupPolicy::NewProcessGroup;
-			params.set_cancel_token(child_cancel.clone());
-
-			let mut command_line = String::new();
-			for (idx, arg) in command.iter().enumerate() {
-				if idx > 0 {
-					command_line.push(' ');
-				}
-				command_line.push_str(&quote_arg(arg));
-			}
-
-			let cancel_token = context.cancel_token();
-			let run_future = context.shell.run_string(command_line, &params);
-			tokio::pin!(run_future);
-
-			if let Some(cancel_token) = cancel_token {
-				tokio::select! {
-					result = &mut run_future => result,
-					() = time::sleep(timeout) => {
-						child_cancel.cancel();
-						// Wait briefly for the child to exit after cancellation.
-						let _ = time::timeout(Duration::from_secs(2), &mut run_future).await;
-						Ok(ExecutionResult::new(124))
-					},
-					() = cancel_token.cancelled() => {
-						child_cancel.cancel();
-						Ok(ExecutionExitCode::Interrupted.into())
-					},
-				}
-			} else {
-				tokio::select! {
-					result = &mut run_future => result,
-					() = time::sleep(timeout) => {
-						child_cancel.cancel();
-						// Wait briefly for the child to exit after cancellation.
-						let _ = time::timeout(Duration::from_secs(2), &mut run_future).await;
-						Ok(ExecutionResult::new(124))
-					},
-				}
-			}
-		}
-	}
-}
-fn parse_duration(input: &str) -> Option<Duration> {
-	let trimmed = input.trim();
-	if trimmed.is_empty() {
-		return None;
-	}
-	let (number, multiplier) = match trimmed.chars().last()? {
-		's' => (&trimmed[..trimmed.len() - 1], 1.0),
-		'm' => (&trimmed[..trimmed.len() - 1], 60.0),
-		'h' => (&trimmed[..trimmed.len() - 1], 3600.0),
-		'd' => (&trimmed[..trimmed.len() - 1], 86400.0),
-		ch if ch.is_ascii_alphabetic() => return None,
-		_ => (trimmed, 1.0),
-	};
-	let value = number.parse::<f64>().ok()?;
-	if value.is_sign_negative() {
-		return None;
-	}
-	let millis = value * multiplier * 1000.0;
-	if !millis.is_finite() || millis < 0.0 {
-		return None;
-	}
-	Some(Duration::from_millis(millis.round() as u64))
-}
-
-fn quote_arg(arg: &str) -> String {
-	if arg.is_empty() {
-		return "''".to_string();
-	}
-	let safe = arg
-		.chars()
-		.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/' | ':' | '+'));
-	if safe {
-		return arg.to_string();
-	}
-	let escaped = arg.replace('\'', "'\"'\"'");
-	format!("'{escaped}'")
 }
