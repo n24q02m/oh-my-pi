@@ -1,8 +1,8 @@
 import { describe, expect, it } from "bun:test";
-import { getBundledModel } from "@oh-my-pi/pi-ai/models";
+import { type } from "@oh-my-pi/omptype";
 import { complete } from "@oh-my-pi/pi-ai/stream";
 import type { Api, Context, Model, OptionsForApi, Tool } from "@oh-my-pi/pi-ai/types";
-import { Type } from "@sinclair/typebox";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
@@ -16,8 +16,8 @@ const oauthTokens = await Promise.all([
 const [anthropicOAuthToken, githubCopilotToken, geminiCliToken, antigravityToken, openaiCodexToken] = oauthTokens;
 
 // Simple calculate tool
-const calculateSchema = Type.Object({
-	expression: Type.String({ description: "The mathematical expression to evaluate" }),
+const calculateSchema = type({
+	expression: "string",
 });
 
 const calculateTool: Tool = {
@@ -32,7 +32,7 @@ async function testToolCallWithoutResult<TApi extends Api>(
 ) {
 	// Step 1: Create context with the calculate tool
 	const context: Context = {
-		systemPrompt: "You are a helpful assistant. Use the calculate tool when asked to perform calculations.",
+		systemPrompt: ["You are a helpful assistant. Use the calculate tool when asked to perform calculations."],
 		messages: [],
 		tools: [calculateTool],
 	};
@@ -109,7 +109,7 @@ describe("Tool Call Without Result Tests", () => {
 
 	describe.skipIf(!e2eApiKey("OPENAI_API_KEY"))("OpenAI Completions Provider", () => {
 		const model: Model<"openai-completions"> = {
-			...getBundledModel("openai", "gpt-4o-mini")!,
+			...(getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">)!,
 			api: "openai-completions",
 		};
 
@@ -123,7 +123,7 @@ describe("Tool Call Without Result Tests", () => {
 	});
 
 	describe.skipIf(!e2eApiKey("OPENAI_API_KEY"))("OpenAI Responses Provider", () => {
-		const model = getBundledModel("openai", "gpt-5-mini");
+		const model = getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">;
 
 		it(
 			"should filter out tool calls without corresponding tool results",

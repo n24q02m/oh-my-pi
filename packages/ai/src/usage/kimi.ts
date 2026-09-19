@@ -1,25 +1,28 @@
+import { toNumber } from "@oh-my-pi/pi-catalog/utils";
 import { $env } from "@oh-my-pi/pi-utils";
+import { getKimiCommonHeaders } from "../registry/oauth/kimi";
 import type {
+	CredentialRankingStrategy,
 	UsageAmount,
-	UsageCache,
 	UsageFetchContext,
 	UsageFetchParams,
 	UsageLimit,
 	UsageProvider,
 	UsageReport,
-	UsageStatus,
 	UsageWindow,
 } from "../usage";
 import { isRecord } from "../utils";
-import { getKimiCommonHeaders, refreshKimiToken } from "../utils/oauth/kimi";
+import { parseIsoTimestamp, usageStatus } from "./shared";
+
+// (Refresh is the sole responsibility of AuthStorage; no provider-direct refresh here.)
 
 const DEFAULT_BASE_URL = "https://api.kimi.com/coding/v1";
 const USAGE_PATH = "usages";
-const DEFAULT_CACHE_TTL_MS = 60_000;
 
 interface KimiUsagePayload {
 	usage?: unknown;
 	limits?: unknown;
+	totalQuota?: unknown;
 }
 
 type KimiUsageRow = {
@@ -28,19 +31,7 @@ type KimiUsageRow = {
 	limit?: number;
 	remaining?: number;
 	resetsAt?: number;
-	resetInMs?: number;
 	window?: UsageWindow;
-};
-
-const toNumber = (value: unknown): number | undefined => {
-	if (typeof value === "number" && Number.isFinite(value)) return value;
-	if (typeof value === "string") {
-		const trimmed = value.trim();
-		if (!trimmed) return undefined;
-		const parsed = Number(trimmed);
-		if (Number.isFinite(parsed)) return parsed;
-	}
-	return undefined;
 };
 
 function normalizeBaseUrl(baseUrl?: string): string {
@@ -54,31 +45,26 @@ function buildUsageUrl(baseUrl: string): string {
 	return `${normalized}${USAGE_PATH}`;
 }
 
-function parseResetTimes(data: Record<string, unknown>, nowMs: number): Pick<UsageWindow, "resetsAt" | "resetInMs"> {
+function parseResetTime(data: Record<string, unknown>, nowMs: number): number | undefined {
 	const timeKeys = ["reset_at", "resetAt", "reset_time", "resetTime"] as const;
 	for (const key of timeKeys) {
 		const value = data[key];
 		if (typeof value === "string" && value.trim()) {
-			const parsed = Date.parse(value);
-			if (Number.isFinite(parsed)) {
-				return { resetsAt: parsed, resetInMs: parsed - nowMs };
-			}
+			const parsed = parseIsoTimestamp(value);
+			if (parsed !== undefined) return parsed;
 		}
 		if (typeof value === "number" && Number.isFinite(value)) {
-			const parsed = value > 1_000_000_000_000 ? value : value * 1000;
-			return { resetsAt: parsed, resetInMs: parsed - nowMs };
+			return value > 1_000_000_000_000 ? value : value * 1000;
 		}
 	}
 
 	const secondsKeys = ["reset_in", "resetIn", "ttl", "window"] as const;
 	for (const key of secondsKeys) {
 		const seconds = toNumber(data[key]);
-		if (seconds !== undefined) {
-			return { resetsAt: nowMs + seconds * 1000, resetInMs: seconds * 1000 };
-		}
+		if (seconds !== undefined) return nowMs + seconds * 1000;
 	}
 
-	return {};
+	return undefined;
 }
 
 function formatDurationLabel(duration: number, timeUnit: string): string | undefined {
@@ -93,26 +79,44 @@ function formatDurationLabel(duration: number, timeUnit: string): string | undef
 	return undefined;
 }
 
+const MINUTE_MS = 60_000;
+const HOUR_MS = 3_600_000;
+const DAY_MS = 86_400_000;
+
+/**
+ * Status-line and ranking consumers match on canonical window ids ("5h",
+ * "7d"), so derive the id from the reported span: the 300-minute burst window
+ * surfaces as "5h" instead of "300time_unit_minute". Mirrors the
+ * intervalWindowId convention in minimax-code.ts.
+ */
+function canonicalWindowId(durationMs: number): string {
+	if (durationMs > 0 && durationMs % DAY_MS === 0) return `${durationMs / DAY_MS}d`;
+	if (durationMs > 0 && durationMs % HOUR_MS === 0) return `${durationMs / HOUR_MS}h`;
+	const minutes = Math.round(durationMs / MINUTE_MS);
+	return minutes > 0 ? `${minutes}m` : "default";
+}
+
 function buildWindow(windowData: Record<string, unknown>, nowMs: number): UsageWindow | undefined {
 	const duration = toNumber(windowData.duration);
 	const timeUnit = typeof windowData.timeUnit === "string" ? windowData.timeUnit : "";
 	const label = duration !== undefined && timeUnit ? formatDurationLabel(duration, timeUnit) : undefined;
-	const resets = parseResetTimes(windowData, nowMs);
+	const resetsAt = parseResetTime(windowData, nowMs);
 
-	if (duration === undefined && !label && !resets.resetsAt && !resets.resetInMs) return undefined;
+	if (duration === undefined && !label && !resetsAt) return undefined;
 	let durationMs: number | undefined;
 	if (duration !== undefined) {
-		if (timeUnit.toUpperCase().includes("MINUTE")) durationMs = duration * 60_000;
-		else if (timeUnit.toUpperCase().includes("HOUR")) durationMs = duration * 3_600_000;
-		else if (timeUnit.toUpperCase().includes("DAY")) durationMs = duration * 86_400_000;
+		if (timeUnit.toUpperCase().includes("MINUTE")) durationMs = duration * MINUTE_MS;
+		else if (timeUnit.toUpperCase().includes("HOUR")) durationMs = duration * HOUR_MS;
+		else if (timeUnit.toUpperCase().includes("DAY")) durationMs = duration * DAY_MS;
+		else if (timeUnit.toUpperCase().includes("WEEK")) durationMs = duration * 7 * DAY_MS;
 		else if (timeUnit.toUpperCase().includes("SECOND")) durationMs = duration * 1000;
 	}
 
 	return {
-		id: duration !== undefined && timeUnit ? `${duration}${timeUnit.toLowerCase()}` : "default",
+		id: durationMs !== undefined ? canonicalWindowId(durationMs) : "default",
 		label: label ?? "Usage window",
 		durationMs,
-		...resets,
+		resetsAt,
 	};
 }
 
@@ -125,7 +129,7 @@ function buildUsageRow(data: Record<string, unknown>, defaultLabel: string, nowM
 	}
 
 	if (used === undefined && limit === undefined) return null;
-	const resets = parseResetTimes(data, nowMs);
+	const resetsAt = parseResetTime(data, nowMs);
 	return {
 		label:
 			typeof data.name === "string" && data.name
@@ -136,8 +140,7 @@ function buildUsageRow(data: Record<string, unknown>, defaultLabel: string, nowM
 		used,
 		limit,
 		remaining,
-		resetsAt: resets.resetsAt,
-		resetInMs: resets.resetInMs,
+		resetsAt,
 	};
 }
 
@@ -154,24 +157,22 @@ function buildUsageAmount(row: KimiUsageRow): UsageAmount {
 	return amount;
 }
 
-function buildUsageStatus(amount: UsageAmount): UsageStatus {
-	if (amount.usedFraction === undefined) return "unknown";
-	if (amount.usedFraction >= 1) return "exhausted";
-	if (amount.usedFraction >= 0.9) return "warning";
-	return "ok";
-}
-
 function toUsageLimit(row: KimiUsageRow, provider: string, index: number, accountId?: string): UsageLimit {
-	const window: UsageWindow | undefined =
-		row.window ??
-		(row.resetsAt || row.resetInMs
+	// Kimi puts `resetTime` on the limit `detail`, not on `window`, so a
+	// window built from `duration`/`timeUnit` alone carries no resetsAt.
+	// Fall back to the row-level reset so `omp usage` can render
+	// "resets in …" for the 5h window too.
+	const window: UsageWindow | undefined = row.window
+		? row.window.resetsAt !== undefined || row.resetsAt === undefined
+			? row.window
+			: { ...row.window, resetsAt: row.resetsAt }
+		: row.resetsAt
 			? {
 					id: "default",
 					label: "Usage window",
 					resetsAt: row.resetsAt,
-					resetInMs: row.resetInMs,
 				}
-			: undefined);
+			: undefined;
 
 	const amount = buildUsageAmount(row);
 	return {
@@ -185,7 +186,7 @@ function toUsageLimit(row: KimiUsageRow, provider: string, index: number, accoun
 		},
 		window,
 		amount,
-		status: buildUsageStatus(amount),
+		status: usageStatus(amount.usedFraction),
 	};
 }
 
@@ -195,8 +196,23 @@ function parseUsagePayload(payload: unknown, nowMs: number): { rows: KimiUsageRo
 	const rows: KimiUsageRow[] = [];
 
 	if (isRecord(data.usage)) {
-		const summary = buildUsageRow(data.usage, "Total quota", nowMs);
-		if (summary) rows.push(summary);
+		const summary = buildUsageRow(data.usage, "Weekly limit", nowMs);
+		if (summary) {
+			// Kimi Code's aggregate quota resets weekly, but the payload carries
+			// only `resetTime` and no duration. Attach the canonical weekly
+			// window explicitly so status-line/ranking consumers recognize it.
+			summary.window = { id: "7d", label: "7 Day", resetsAt: summary.resetsAt };
+			rows.push(summary);
+		}
+	}
+
+	if (isRecord(data.totalQuota)) {
+		const windowData = isRecord(data.totalQuota.window) ? data.totalQuota.window : {};
+		const total = buildUsageRow(data.totalQuota, "Total quota", nowMs);
+		if (total) {
+			total.window = buildWindow(windowData, nowMs);
+			rows.push(total);
+		}
 	}
 
 	if (Array.isArray(data.limits)) {
@@ -223,31 +239,6 @@ function parseUsagePayload(payload: unknown, nowMs: number): { rows: KimiUsageRo
 	return { rows, raw: data };
 }
 
-function resolveCacheExpiry(report: UsageReport | null, nowMs: number): number {
-	if (!report) return nowMs + DEFAULT_CACHE_TTL_MS;
-	const resetCandidates = report.limits
-		.map(limit => limit.window?.resetsAt)
-		.filter((value): value is number => typeof value === "number" && Number.isFinite(value));
-	if (resetCandidates.length === 0) return nowMs + DEFAULT_CACHE_TTL_MS;
-	return Math.min(nowMs + DEFAULT_CACHE_TTL_MS, Math.min(...resetCandidates));
-}
-
-async function getCachedReport(cache: UsageCache, key: string, nowMs: number): Promise<UsageReport | null | undefined> {
-	const cached = await cache.get(key);
-	if (!cached) return undefined;
-	if (cached.expiresAt <= nowMs) return undefined;
-	return cached.value;
-}
-
-async function setCachedReport(
-	cache: UsageCache,
-	key: string,
-	report: UsageReport | null,
-	expiresAt: number,
-): Promise<void> {
-	await cache.set(key, { value: report, expiresAt });
-}
-
 export const kimiUsageProvider: UsageProvider = {
 	id: "kimi-code",
 	supports(params: UsageFetchParams): boolean {
@@ -258,37 +249,26 @@ export const kimiUsageProvider: UsageProvider = {
 		const { credential } = params;
 		if (credential.type !== "oauth") return null;
 
-		let accessToken = credential.accessToken;
+		const accessToken = credential.accessToken;
 		if (!accessToken) return null;
 
-		const nowMs = ctx.now();
+		const nowMs = Date.now();
+		// AuthStorage refreshes OAuth credentials pre-emptively (60s skew). If the
+		// usage probe lands with an expired token, short-circuit rather than POST
+		// the broker sentinel back to Kimi — the next cycle will carry a freshly
+		// refreshed credential.
 		if (credential.expiresAt !== undefined && credential.expiresAt <= nowMs) {
-			if (!credential.refreshToken) {
-				ctx.logger?.warn("Kimi usage token expired, no refresh token", { provider: params.provider });
-				return null;
-			}
-			try {
-				ctx.logger?.debug("Kimi usage token expired, refreshing", { provider: params.provider });
-				const refreshed = await refreshKimiToken(credential.refreshToken);
-				accessToken = refreshed.access;
-			} catch (error) {
-				ctx.logger?.warn("Kimi usage token refresh failed", { provider: params.provider, error: String(error) });
-				return null;
-			}
+			ctx.logger?.debug("Kimi usage token expired; skipping probe", { provider: params.provider });
+			return null;
 		}
 
 		const baseUrl = normalizeBaseUrl(params.baseUrl);
-		const accountKey = credential.accountId ?? credential.email ?? "unknown";
-		const cacheKey = `usage:kimi-code:${accountKey}:${baseUrl}`;
-		const cached = await getCachedReport(ctx.cache, cacheKey, nowMs);
-		if (cached !== undefined) return cached;
-
 		const url = buildUsageUrl(baseUrl);
 		let payload: unknown;
 		try {
 			const response = await ctx.fetch(url, {
 				headers: {
-					...(await getKimiCommonHeaders()),
+					...getKimiCommonHeaders(),
 					Authorization: `Bearer ${accessToken}`,
 				},
 				signal: params.signal,
@@ -316,13 +296,25 @@ export const kimiUsageProvider: UsageProvider = {
 			fetchedAt: nowMs,
 			limits,
 			metadata: {
+				accountId: credential.accountId,
 				endpoint: url,
 			},
 			raw: parsed.raw,
 		};
 
-		const expiresAt = resolveCacheExpiry(report, nowMs);
-		await setCachedReport(ctx.cache, cacheKey, report, expiresAt);
 		return report;
+	},
+};
+
+/** Ranks Kimi OAuth accounts by the canonical 5-hour and 7-day quota windows. */
+export const kimiRankingStrategy: CredentialRankingStrategy = {
+	findWindowLimits: report => ({
+		primary: report.limits.find(limit => limit.window?.id === "5h"),
+		secondary: report.limits.find(limit => limit.window?.id === "7d"),
+	}),
+	scopeLimits: report => report.limits.filter(limit => limit.window?.id === "5h" || limit.window?.id === "7d"),
+	windowDefaults: {
+		primaryMs: 5 * HOUR_MS,
+		secondaryMs: 7 * DAY_MS,
 	},
 };

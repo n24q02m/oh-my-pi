@@ -1,72 +1,31 @@
+import { SEARCH_PROVIDER_OPTIONS, type SearchProviderId } from "@oh-my-pi/pi-tui/tools/web-search";
+
+/** Default hard timeout for each web-search provider transport. */
+export const DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS = 60;
+
+/** Maximum configurable hard timeout for each web-search provider transport. */
+export const MAX_WEB_SEARCH_TIMEOUT_SECONDS = 300;
+
 /**
- * Web Search Types
- *
- * Unified types for web search responses across supported providers.
+ * Auto-resolution priority order. Derived from {@link SEARCH_PROVIDER_OPTIONS}
+ * (minus `auto`) so the settings/setup dropdown and `resolveProviderChain()`
+ * share one source of truth and never drift apart.
  */
+export const SEARCH_PROVIDER_ORDER: readonly SearchProviderId[] = SEARCH_PROVIDER_OPTIONS.flatMap(option =>
+	option.value === "auto" ? [] : [option.value],
+);
 
-/** Supported web search providers */
-export type SearchProviderId =
-	| "exa"
-	| "brave"
-	| "jina"
-	| "kimi"
-	| "zai"
-	| "anthropic"
-	| "perplexity"
-	| "gemini"
-	| "codex"
-	| "synthetic";
+/** Concrete provider choices (no `auto` sentinel) — for list-valued settings like order/exclude. */
+export const SEARCH_PROVIDER_CHOICES = SEARCH_PROVIDER_OPTIONS.filter(option => option.value !== "auto");
 
-/** Source returned by search (all providers) */
-export interface SearchSource {
-	title: string;
-	url: string;
-	snippet?: string;
-	/** ISO date string or relative ("2d ago") */
-	publishedDate?: string;
-	/** Age in seconds for consistent formatting */
-	ageSeconds?: number;
-	author?: string;
+export const SEARCH_PROVIDER_PREFERENCES = ["auto", ...SEARCH_PROVIDER_ORDER] as const;
+
+export function isSearchProviderId(value: string): value is SearchProviderId {
+	return SEARCH_PROVIDER_ORDER.includes(value as SearchProviderId);
 }
 
-/** Citation with text reference (anthropic, perplexity) */
-export interface SearchCitation {
-	url: string;
-	title: string;
-	citedText?: string;
-}
-
-/** Usage metrics */
-export interface SearchUsage {
-	inputTokens?: number;
-	outputTokens?: number;
-	/** Anthropic: number of web search requests made */
-	searchRequests?: number;
-	/** Perplexity: combined token count */
-	totalTokens?: number;
-}
-
-/** Unified response across providers */
-export interface SearchResponse {
-	provider: SearchProviderId | "none";
-	/** Synthesized answer text (anthropic, perplexity) */
-	answer?: string;
-	/** Search result sources */
-	sources: SearchSource[];
-	/** Text citations with context */
-	citations?: SearchCitation[];
-	/** Intermediate search queries (anthropic) */
-	searchQueries?: string[];
-	/** Follow-up question suggestions (provider-dependent) */
-	relatedQuestions?: string[];
-	/** Token usage metrics */
-	usage?: SearchUsage;
-	/** Model used */
-	model?: string;
-	/** Request ID for debugging */
-	requestId?: string;
-	/** Authentication mode used by the provider (e.g. oauth, api-key) */
-	authMode?: string;
+export function isSearchProviderPreference(value: string): value is SearchProviderId | "auto" {
+	return SEARCH_PROVIDER_PREFERENCES.includes(value as SearchProviderId | "auto");
 }
 
 /** Provider-specific error with optional HTTP status */
@@ -404,6 +363,7 @@ export interface PerplexityResponse {
 	choices: PerplexityChoice[];
 	citations?: string[] | null;
 	search_results?: PerplexitySearchResult[] | null;
+	related_questions?: string[] | null;
 	type?: PerplexityCompletionResponseType | null;
 	status?: PerplexityCompletionResponseStatus | null;
 }

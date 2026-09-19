@@ -4,13 +4,15 @@
  * Handles `omp q`/`omp web-search` subcommands for testing web search providers.
  */
 
-import { APP_NAME } from "@oh-my-pi/pi-utils";
-import chalk from "chalk";
-import { initTheme, theme } from "../modes/theme/theme";
-import { runSearchQuery, type SearchParams } from "../web/search/index";
+import { APP_NAME, getProjectDir } from "@oh-my-pi/pi-utils";
+import chalk from "@oh-my-pi/pi-utils/chalk";
+import { applyProviderGlobalsFromSettings } from "../config/provider-globals";
+import { Settings } from "../config/settings";
+import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
+import { runSearchQuery, type SearchQueryParams } from "../web/search/index";
 import { SEARCH_PROVIDER_ORDER } from "../web/search/provider";
-import { renderSearchResult } from "../web/search/render";
-import type { SearchProviderId } from "../web/search/types";
+import { renderSearchResult } from "@oh-my-pi/pi-tui/tools/web-search";
+import type { SearchProviderId } from "@oh-my-pi/pi-tui/tools/web-search";
 
 export interface SearchCommandArgs {
 	query: string;
@@ -85,21 +87,21 @@ export async function runSearchCommand(cmd: SearchCommandArgs): Promise<void> {
 		process.exit(1);
 	}
 
+	const settings = await Settings.init({ cwd: getProjectDir() });
+	applyProviderGlobalsFromSettings(settings);
+
 	await initTheme();
 
-	const params: SearchParams = {
+	const params: SearchQueryParams = {
 		query: cmd.query,
 		provider: cmd.provider,
 		recency: cmd.recency,
 		limit: cmd.limit,
-		no_fallback: cmd.provider !== undefined && cmd.provider !== "auto",
 	};
 
 	const result = await runSearchQuery(params);
 	const component = renderSearchResult(result, { expanded: cmd.expanded, isPartial: false }, theme, {
 		query: cmd.query,
-		provider: cmd.provider,
-		allowLongAnswer: true,
 		maxAnswerLines: cmd.expanded ? undefined : 6,
 	});
 
@@ -123,13 +125,20 @@ ${chalk.bold("Arguments:")}
 
 ${chalk.bold("Options:")}
   --provider <name>   Provider: ${PROVIDERS.join(", ")}
-  --recency <value>   Recency filter (Brave/Perplexity): ${RECENCY_OPTIONS.join(", ")}
+  --recency <value>   Recency filter (when supported): ${RECENCY_OPTIONS.join(", ")}
   -l, --limit <n>     Max results to return
   --compact           Render condensed output
   -h, --help          Show this help
 
+${chalk.bold("Query directives:")}
+  site:/-site:  after:/before: (YYYY-MM-DD)  inurl:  intitle:  filetype:
+  "exact phrase"  -term  OR
+  Mapped to native provider filters where available, otherwise applied as a
+  lenient post-filter (a constraint matching nothing is relaxed, not fatal).
+
 ${chalk.bold("Examples:")}
   ${APP_NAME} q --provider=exa "what's the color of the sky"
   ${APP_NAME} q --provider=brave --recency=week "latest TypeScript 5.7 changes"
+  ${APP_NAME} q 'transformer scaling site:arxiv.org after:2024 -site:reddit.com'
 `);
 }

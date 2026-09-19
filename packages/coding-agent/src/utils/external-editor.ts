@@ -1,22 +1,55 @@
 /**
  * Utilities for launching an external text editor ($VISUAL / $EDITOR).
  */
-import { spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $env, Snowflake } from "@oh-my-pi/pi-utils";
+import { $env, $which, Snowflake } from "@oh-my-pi/pi-utils";
 
-/** Returns the user's preferred editor command, or undefined if not configured. */
+/**
+ * Returns the user's preferred editor command, or a platform default.
+ *
+ * Resolution order:
+ *   1. `$VISUAL`
+ *   2. `$EDITOR`
+ *   3. `notepad` on Windows (always present in `%SystemRoot%\System32`)
+ *
+ * POSIX returns `undefined` when neither variable is set so the caller can
+ * surface a warning that nudges the user to configure one.
+ */
 export function getEditorCommand(): string | undefined {
-	return $env.VISUAL || $env.EDITOR || undefined;
+	const configured = $env.VISUAL?.trim() || $env.EDITOR?.trim();
+	if (configured) return configured;
+	if (process.platform === "win32") return "notepad";
+	return undefined;
 }
 
 export interface OpenInEditorOptions {
 	/** File extension for the temp file (default: ".md"). */
 	extension?: string;
-	/** Custom stdio configuration (default: all "inherit"). */
-	stdio?: [number | "inherit", number | "inherit", number | "inherit"];
+	/** Keep the file's trailing newline instead of trimming it from the returned text. */
+	trimTrailingNewline?: boolean;
+}
+
+/** Subprocess argv and Windows quoting mode used to launch an external editor. */
+export interface EditorSpawnCommand {
+	cmd: string[];
+	windowsVerbatimArguments: boolean;
+}
+
+/** Resolves shell argv without letting the host runtime re-quote the editor command. */
+export function resolveEditorSpawnCommand(
+	editorCmd: string,
+	tmpFile: string,
+	platform: NodeJS.Platform = process.platform,
+): EditorSpawnCommand {
+	const windows = platform === "win32";
+	// cmd.exe strips the outer /s /c quote pair; Bun must pass the embedded
+	// editor/path quotes verbatim instead of applying argv escaping to them.
+	const cmd = windows
+		? ["cmd.exe", "/d", "/s", "/c", `"${editorCmd} "${tmpFile}""`]
+		: [$which("sh") ?? "sh", "-c", `${editorCmd} "$1"`, "sh", tmpFile];
+	return { cmd, windowsVerbatimArguments: windows };
 }
 
 /**
@@ -36,17 +69,22 @@ export async function openInEditor(
 	try {
 		await Bun.write(tmpFile, content);
 
-		const [editor, ...editorArgs] = editorCmd.split(" ");
-		const stdio = options?.stdio ?? ["inherit", "inherit", "inherit"];
-
-		const child = spawn(editor, [...editorArgs, tmpFile], { stdio });
-		const exitCode = await new Promise<number>((resolve, reject) => {
-			child.once("exit", (code, signal) => resolve(code ?? (signal ? -1 : 0)));
-			child.once("error", error => reject(error));
+		const spawnCommand = resolveEditorSpawnCommand(editorCmd, tmpFile);
+		// Inherit the real pane pty so terminal editors (including emacsclient,
+		// which resolves the device via ttyname) render into the visible pane.
+		const child = Bun.spawn(spawnCommand.cmd, {
+			stdin: "inherit",
+			stdout: "inherit",
+			stderr: "inherit",
+			windowsVerbatimArguments: spawnCommand.windowsVerbatimArguments,
 		});
-
+		const exitCode = await child.exited;
 		if (exitCode === 0) {
-			return (await Bun.file(tmpFile).text()).replace(/\n$/, "");
+			const text = await Bun.file(tmpFile).text();
+			if (options?.trimTrailingNewline === false) {
+				return text;
+			}
+			return text.replace(/\n$/, "");
 		}
 		return null;
 	} finally {

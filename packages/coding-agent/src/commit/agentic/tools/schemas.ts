@@ -1,31 +1,11 @@
-import { Type } from "@sinclair/typebox";
+import { type } from "@oh-my-pi/omptype";
 
-export const commitTypeSchema = Type.Union([
-	Type.Literal("feat"),
-	Type.Literal("fix"),
-	Type.Literal("refactor"),
-	Type.Literal("perf"),
-	Type.Literal("docs"),
-	Type.Literal("test"),
-	Type.Literal("build"),
-	Type.Literal("ci"),
-	Type.Literal("chore"),
-	Type.Literal("style"),
-	Type.Literal("revert"),
-]);
+export const commitTypeSchema = type(
+	"'feat' | 'fix' | 'refactor' | 'perf' | 'docs' | 'test' | 'build' | 'ci' | 'chore' | 'style' | 'revert'",
+);
 
-export const detailSchema = Type.Object({
-	text: Type.String(),
-	changelog_category: Type.Optional(
-		Type.Union([
-			Type.Literal("Added"),
-			Type.Literal("Changed"),
-			Type.Literal("Fixed"),
-			Type.Literal("Deprecated"),
-			Type.Literal("Removed"),
-			Type.Literal("Security"),
-			Type.Literal("Breaking Changes"),
-		]),
-	),
-	user_visible: Type.Optional(Type.Boolean()),
+export const detailSchema = type({
+	text: "string",
+	"changelog_category?": "'Added' | 'Changed' | 'Fixed' | 'Deprecated' | 'Removed' | 'Security' | 'Breaking Changes'",
+	"user_visible?": "boolean",
 });

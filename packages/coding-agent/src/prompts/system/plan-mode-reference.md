@@ -1,14 +1,14 @@
 ## Existing Plan
 
-Plan file from previous session: `{{planFilePath}}`
+Approved plan inlined below; durable copy at `{{planFilePath}}` (identical content).
 
-<details>
-<summary>Plan contents</summary>
-
+<plan path="{{planFilePath}}">
 {{planContent}}
-</details>
+</plan>
 
 <instruction>
-If this plan is relevant to current work and not complete, you **MUST** continue executing it.
-If the plan is stale or unrelated, you **MUST** ignore it.
+Relevant to current work and incomplete → MUST continue executing.
+Stale or unrelated → MUST ignore.
+NEVER re-read `{{planFilePath}}` while the inline plan is intact.
+Inline content compressed, expired, or unrecoverable → NEVER stop; read `{{planFilePath}}`.
 </instruction>

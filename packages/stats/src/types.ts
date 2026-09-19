@@ -1,4 +1,7 @@
-import type { AssistantMessage, StopReason, Usage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, ServiceTier, ServiceTierByFamily, StopReason, Usage } from "@oh-my-pi/pi-ai";
+import type { AgentType } from "./shared-types";
+
+export * from "./shared-types";
 
 /**
  * Extracted stats from an assistant message.
@@ -30,124 +33,38 @@ export interface MessageStats {
 	errorMessage: string | null;
 	/** Token usage */
 	usage: Usage;
+	/** Which agent produced this message (main agent, task subagent, advisor) */
+	agentType: AgentType;
+	/**
+	 * Ingest refused to price this request: a scheduled (time-based) card with no
+	 * recoverable request timestamp, so `usage.cost.total` of 0 is unknown spend
+	 * rather than a free request. Always written by `rowToMessageStats`; optional
+	 * only because session fixtures that stand in for ingest input are typed as
+	 * `MessageStats` too.
+	 */
+	costUnpriced?: boolean;
+}
+
+/**
+ * Session-recorded token usage before pricing: counters are coerced to numbers
+ * because their columns are NOT NULL, but `cost` is only present when the
+ * session entry actually recorded one. Absence is meaningful — `resolveStoredCost`
+ * estimates a request with no recorded price, whereas a recorded zero is a real
+ * charge that scheduled cards freeze. `costUnpriced` is omitted because it is a
+ * decision of the ingest path, not something the parser or a caller supplies.
+ */
+export interface MessageStatsInput extends Omit<MessageStats, "usage" | "costUnpriced"> {
+	usage: Omit<Usage, "cost"> & { cost?: Partial<Usage["cost"]> };
 }
 
 /**
  * Full details of a request, including content.
  */
 export interface RequestDetails extends MessageStats {
-	messages: any[]; // The full conversation history or just the last turn
-	output: any; // The model's response
-}
-
-/**
- * Aggregated stats for a model or folder.
- */
-export interface AggregatedStats {
-	/** Total number of requests */
-	totalRequests: number;
-	/** Number of successful requests */
-	successfulRequests: number;
-	/** Number of failed requests */
-	failedRequests: number;
-	/** Error rate (0-1) */
-	errorRate: number;
-	/** Total input tokens */
-	totalInputTokens: number;
-	/** Total output tokens */
-	totalOutputTokens: number;
-	/** Total cache read tokens */
-	totalCacheReadTokens: number;
-	/** Total cache write tokens */
-	totalCacheWriteTokens: number;
-	/** Cache hit rate (0-1) */
-	cacheRate: number;
-	/** Total cost */
-	totalCost: number;
-	/** Average duration in ms */
-	avgDuration: number | null;
-	/** Average TTFT in ms */
-	avgTtft: number | null;
-	/** Average tokens per second (output tokens / duration) */
-	avgTokensPerSecond: number | null;
-	/** Time range */
-	firstTimestamp: number;
-	lastTimestamp: number;
-}
-
-/**
- * Stats grouped by model.
- */
-export interface ModelStats extends AggregatedStats {
-	model: string;
-	provider: string;
-}
-
-/**
- * Stats grouped by folder.
- */
-export interface FolderStats extends AggregatedStats {
-	folder: string;
-}
-
-/**
- * Time series data point.
- */
-export interface TimeSeriesPoint {
-	/** Bucket timestamp (start of hour/day) */
-	timestamp: number;
-	/** Request count */
-	requests: number;
-	/** Error count */
-	errors: number;
-	/** Total tokens */
-	tokens: number;
-	/** Total cost */
-	cost: number;
-}
-
-/**
- * Model usage time series data point (daily buckets).
- */
-export interface ModelTimeSeriesPoint {
-	/** Bucket timestamp (start of day) */
-	timestamp: number;
-	/** Model name */
-	model: string;
-	/** Provider name */
-	provider: string;
-	/** Request count */
-	requests: number;
-}
-
-/**
- * Model performance time series data point (daily buckets).
- */
-export interface ModelPerformancePoint {
-	/** Bucket timestamp (start of day) */
-	timestamp: number;
-	/** Model name */
-	model: string;
-	/** Provider name */
-	provider: string;
-	/** Request count */
-	requests: number;
-	/** Average TTFT in ms */
-	avgTtft: number | null;
-	/** Average tokens per second */
-	avgTokensPerSecond: number | null;
-}
-
-/**
- * Overall dashboard stats.
- */
-export interface DashboardStats {
-	overall: AggregatedStats;
-	byModel: ModelStats[];
-	byFolder: FolderStats[];
-	timeSeries: TimeSeriesPoint[];
-	modelSeries: ModelTimeSeriesPoint[];
-	modelPerformanceSeries: ModelPerformancePoint[];
+	/** The full conversation history or just the last turn. */
+	messages: unknown[];
+	/** The model's response. */
+	output: unknown;
 }
 
 /**
@@ -170,4 +87,149 @@ export interface SessionMessageEntry {
 	message: AssistantMessage | { role: "user" | "toolResult" };
 }
 
-export type SessionEntry = SessionHeader | SessionMessageEntry | { type: string };
+export interface SessionServiceTierChangeEntry {
+	type: "service_tier_change";
+	id: string;
+	parentId?: string | null;
+	timestamp: string;
+	serviceTier: ServiceTierByFamily | ServiceTier | null;
+}
+
+export interface SessionModelUsageEntry {
+	type: "model_usage";
+	id: string;
+	parentId: string | null;
+	timestamp: string;
+	purpose: string;
+	role?: string;
+	api: string;
+	provider: string;
+	model: string;
+	usage: Usage;
+	stopReason?: StopReason;
+	errorMessage?: string;
+}
+
+/**
+ * Custom journal entry (`tool_execution_start`, `session_exit`, …). Mirrors
+ * the coding-agent shape structurally — stats never imports coding-agent.
+ */
+export interface SessionCustomEntry {
+	type: "custom";
+	id?: string;
+	parentId?: string | null;
+	timestamp?: string;
+	customType: string;
+	data?: Record<string, unknown>;
+}
+
+/** Structural variants the trace builder matches on beyond messages. */
+export interface SessionTypedEntry {
+	type: "session_init" | "compaction" | "model_change" | "mode_change" | "reset_boundary";
+	id?: string;
+	parentId?: string | null;
+	timestamp?: string;
+	[key: string]: unknown;
+}
+
+export type SessionEntry =
+	| SessionHeader
+	| SessionMessageEntry
+	| SessionServiceTierChangeEntry
+	| SessionModelUsageEntry
+	| SessionCustomEntry
+	| SessionTypedEntry
+	| { type: string };
+
+/**
+ * Behavioral stats extracted from a single user message.
+ */
+export interface UserMessageStats {
+	/** Database ID */
+	id?: number;
+	/** Session file path */
+	sessionFile: string;
+	/** Entry ID within the session */
+	entryId: string;
+	/** Folder/project path */
+	folder: string;
+	/** Unix timestamp in ms */
+	timestamp: number;
+	/** Model that responded to this user message, if linked */
+	model: string | null;
+	/** Provider that responded to this user message, if linked */
+	provider: string | null;
+	/** Total characters of message text */
+	chars: number;
+	/** Whitespace-delimited word count */
+	words: number;
+	/** Yelling sentences (> 50% uppercase letters) */
+	yelling: number;
+	/** Profanity hits */
+	profanity: number;
+	/** Catch-all upset signal: drama runs + `noooo`/`ughh`/... + `dude` + `:(` */
+	anguish: number;
+	/** Corrective negation ("no", "nope", "thats not what i meant") */
+	negation: number;
+	/** User repeating themselves ("i meant", "still doesnt work", "like i said") */
+	repetition: number;
+	/** Second-person reproach ("you didnt", "why did you", "stop X-ing") */
+	blame: number;
+}
+
+/**
+ * Pair emitted by the parser when it sees an assistant message whose
+ * `parentId` points to a user message that wasn't parsed in the same pass
+ * (e.g. user prompt landed in an earlier incremental sync). The aggregator
+ * applies the link to the persisted `user_messages` row so it stops showing
+ * up in the "unknown" model bucket.
+ */
+export interface UserMessageLink {
+	sessionFile: string;
+	entryId: string;
+	model: string;
+	provider: string;
+}
+
+/**
+ * One tool call extracted from an assistant message's `toolCall` content
+ * blocks. `callsInTurn` records how many calls that assistant turn contained
+ * so aggregation can split the turn's real provider usage evenly per call.
+ */
+export interface ToolCallStats {
+	/** Session file path */
+	sessionFile: string;
+	/** Assistant-message entry ID that emitted the call */
+	entryId: string;
+	/** Provider-assigned tool call ID (unique within a session) */
+	toolCallId: string;
+	/** Folder/project path (extracted from session filename) */
+	folder: string;
+	/** Tool name */
+	toolName: string;
+	/** Model that emitted the call */
+	model: string;
+	/** Provider name */
+	provider: string;
+	/** Assistant-message timestamp (Unix ms) */
+	timestamp: number;
+	/** Which agent produced the call */
+	agentType: AgentType;
+	/** Total tool calls in the same assistant turn (>= 1) */
+	callsInTurn: number;
+	/** Serialized argument characters */
+	argsChars: number;
+}
+
+/**
+ * Result linkage emitted when the parser sees a `toolResult` message entry.
+ * Applied as an UPDATE on the persisted tool-call row — results can land in a
+ * later incremental sync pass than the call that produced them.
+ */
+export interface ToolResultLink {
+	sessionFile: string;
+	toolCallId: string;
+	/** Text characters fed back into context */
+	resultChars: number;
+	isError: boolean;
+}

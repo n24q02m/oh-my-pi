@@ -1,411 +1,135 @@
-import {
-	type GenerateContentConfig,
-	type GenerateContentParameters,
-	GoogleGenAI,
-	type ThinkingConfig,
-	ThinkingLevel,
-} from "@google/genai";
+import { resolveVertexEndpointHost } from "@oh-my-pi/pi-catalog/hosts";
 import { $env } from "@oh-my-pi/pi-utils";
-import { calculateCost } from "../models";
-import type {
-	Api,
-	AssistantMessage,
-	Context,
-	Model,
-	StreamFunction,
-	StreamOptions,
-	TextContent,
-	ThinkingContent,
-	ToolCall,
-} from "../types";
-import { AssistantMessageEventStream } from "../utils/event-stream";
-import { finalizeErrorMessage, type RawHttpRequestDump } from "../utils/http-inspector";
-import type { GoogleThinkingLevel } from "./google-gemini-cli";
+import * as AIError from "../error";
+import type { Context, Model, StreamFunction } from "../types";
+import type { AssistantMessageEventStream } from "../utils/event-stream";
+import { getVertexAccessToken } from "./google-auth";
 import {
-	convertMessages,
-	convertTools,
-	isThinkingPart,
-	mapStopReason,
-	mapToolChoice,
-	retainThoughtSignature,
+	buildGoogleGenerateContentParams,
+	type GoogleGenAIRequestPlan,
+	type GoogleSharedStreamOptions,
+	streamGoogleGenAI,
 } from "./google-shared";
 
-export interface GoogleVertexOptions extends StreamOptions {
-	toolChoice?: "auto" | "none" | "any";
-	thinking?: {
-		enabled: boolean;
-		budgetTokens?: number; // -1 for dynamic, 0 to disable
-		level?: GoogleThinkingLevel;
-	};
+export interface GoogleVertexOptions extends GoogleSharedStreamOptions {
 	project?: string;
 	location?: string;
 }
 
-interface GoogleVertexSamplingConfig extends GenerateContentConfig {
-	topP?: number;
-	topK?: number;
-	minP?: number;
-	presencePenalty?: number;
-	repetitionPenalty?: number;
-}
-
 const API_VERSION = "v1";
-
-const THINKING_LEVEL_MAP: Record<GoogleThinkingLevel, ThinkingLevel> = {
-	THINKING_LEVEL_UNSPECIFIED: ThinkingLevel.THINKING_LEVEL_UNSPECIFIED,
-	MINIMAL: ThinkingLevel.MINIMAL,
-	LOW: ThinkingLevel.LOW,
-	MEDIUM: ThinkingLevel.MEDIUM,
-	HIGH: ThinkingLevel.HIGH,
-};
-
-// Counter for generating unique tool call IDs
-let toolCallCounter = 0;
 
 export const streamGoogleVertex: StreamFunction<"google-vertex"> = (
 	model: Model<"google-vertex">,
 	context: Context,
 	options?: GoogleVertexOptions,
 ): AssistantMessageEventStream => {
-	const stream = new AssistantMessageEventStream();
+	return streamGoogleGenAI({
+		model,
+		options,
+		api: "google-vertex",
+		retainTextSignature: true,
+		prepare: async (): Promise<GoogleGenAIRequestPlan> => {
+			const apiKey = resolveApiKey(options);
+			const params = buildGoogleGenerateContentParams(model, context, options ?? {});
+			params.config ||= {};
+			if (!params.config.safetySettings) {
+				params.config.safetySettings = [
+					{
+						category: "HARM_CATEGORY_HATE_SPEECH",
+						threshold: "OFF",
+					},
+					{
+						category: "HARM_CATEGORY_DANGEROUS_CONTENT",
+						threshold: "OFF",
+					},
+					{
+						category: "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+						threshold: "OFF",
+					},
+					{
+						category: "HARM_CATEGORY_HARASSMENT",
+						threshold: "OFF",
+					},
+				];
+			}
+			const baseHeaders: Record<string, string> = {
+				...model.headers,
+				...options?.headers,
+			};
+			// Vertex AI ignores a `serviceTier` request-body field (unlike the direct
+			// Gemini API); priority must travel as a request header. Only `priority`
+			// has a documented Vertex request control — `flex` has none, so it's a no-op.
+			if (options?.serviceTier === "priority") {
+				baseHeaders["X-Vertex-AI-LLM-Shared-Request-Type"] = "priority";
+			}
 
-	(async () => {
-		const startTime = Date.now();
-		let firstTokenTime: number | undefined;
+			if (apiKey) {
+				// Explicit `location` is a deliberate residency choice: honor it and let
+				// a 404 surface. An ambient env-derived region falls back to the global
+				// endpoint so a stray GOOGLE_*_LOCATION never breaks a previously-working
+				// global-only request.
+				const explicitLocation = options?.location;
+				const location = explicitLocation ?? resolveAmbientLocation() ?? "global";
+				const host = resolveVertexEndpointHost(location);
+				const path = `${API_VERSION}/publishers/google/models/${model.id}:streamGenerateContent?alt=sse`;
+				const useGlobalFallback = !explicitLocation && host !== "aiplatform.googleapis.com";
+				return {
+					params,
+					url: `https://${host}/${path}`,
+					fallbackUrl: useGlobalFallback ? `https://aiplatform.googleapis.com/${path}` : undefined,
+					headers: {
+						...baseHeaders,
+						"x-goog-api-key": apiKey,
+					},
+					fetch: options?.fetch,
+				};
+			}
 
-		const output: AssistantMessage = {
-			role: "assistant",
-			content: [],
-			api: "google-vertex" as Api,
-			provider: model.provider,
-			model: model.id,
-			usage: {
-				input: 0,
-				output: 0,
-				cacheRead: 0,
-				cacheWrite: 0,
-				totalTokens: 0,
-				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-			},
-			stopReason: "stop",
-			timestamp: Date.now(),
-		};
-		let rawRequestDump: RawHttpRequestDump | undefined;
-
-		try {
 			const project = resolveProject(options);
 			const location = resolveLocation(options);
-			const client = createClient(model, project, location);
-			const params = buildParams(model, context, options);
-			options?.onPayload?.(params);
-			rawRequestDump = {
-				provider: model.provider,
-				api: output.api,
-				model: model.id,
-				method: "POST",
-				url: `https://${location}-aiplatform.googleapis.com/v1/projects/${project}/locations/${location}/publishers/google/models/${model.id}:streamGenerateContent`,
-				body: params,
+			const accessToken = await getVertexAccessToken({ signal: options?.signal, fetch: options?.fetch });
+			const host = resolveVertexEndpointHost(location);
+			const url = `https://${host}/${API_VERSION}/projects/${project}/locations/${location}/publishers/google/models/${model.id}:streamGenerateContent?alt=sse`;
+			return {
+				params,
+				url,
+				headers: { ...baseHeaders, Authorization: `Bearer ${accessToken}` },
+				fetch: options?.fetch,
 			};
-			const googleStream = await client.models.generateContentStream(params);
-
-			stream.push({ type: "start", partial: output });
-			let currentBlock: TextContent | ThinkingContent | null = null;
-			const blocks = output.content;
-			const blockIndex = () => blocks.length - 1;
-			for await (const chunk of googleStream) {
-				const candidate = chunk.candidates?.[0];
-				if (candidate?.content?.parts) {
-					for (const part of candidate.content.parts) {
-						if (part.text !== undefined) {
-							if (!firstTokenTime) firstTokenTime = Date.now();
-							const isThinking = isThinkingPart(part);
-							if (
-								!currentBlock ||
-								(isThinking && currentBlock.type !== "thinking") ||
-								(!isThinking && currentBlock.type !== "text")
-							) {
-								if (currentBlock) {
-									if (currentBlock.type === "text") {
-										stream.push({
-											type: "text_end",
-											contentIndex: blocks.length - 1,
-											content: currentBlock.text,
-											partial: output,
-										});
-									} else {
-										stream.push({
-											type: "thinking_end",
-											contentIndex: blockIndex(),
-											content: currentBlock.thinking,
-											partial: output,
-										});
-									}
-								}
-								if (isThinking) {
-									currentBlock = { type: "thinking", thinking: "", thinkingSignature: undefined };
-									output.content.push(currentBlock);
-									stream.push({ type: "thinking_start", contentIndex: blockIndex(), partial: output });
-								} else {
-									currentBlock = { type: "text", text: "" };
-									output.content.push(currentBlock);
-									stream.push({ type: "text_start", contentIndex: blockIndex(), partial: output });
-								}
-							}
-							if (currentBlock.type === "thinking") {
-								currentBlock.thinking += part.text;
-								currentBlock.thinkingSignature = retainThoughtSignature(
-									currentBlock.thinkingSignature,
-									part.thoughtSignature,
-								);
-								stream.push({
-									type: "thinking_delta",
-									contentIndex: blockIndex(),
-									delta: part.text,
-									partial: output,
-								});
-							} else {
-								currentBlock.text += part.text;
-								currentBlock.textSignature = retainThoughtSignature(
-									currentBlock.textSignature,
-									part.thoughtSignature,
-								);
-								stream.push({
-									type: "text_delta",
-									contentIndex: blockIndex(),
-									delta: part.text,
-									partial: output,
-								});
-							}
-						}
-
-						if (part.functionCall) {
-							if (currentBlock) {
-								if (currentBlock.type === "text") {
-									stream.push({
-										type: "text_end",
-										contentIndex: blockIndex(),
-										content: currentBlock.text,
-										partial: output,
-									});
-								} else {
-									stream.push({
-										type: "thinking_end",
-										contentIndex: blockIndex(),
-										content: currentBlock.thinking,
-										partial: output,
-									});
-								}
-								currentBlock = null;
-							}
-
-							const providedId = part.functionCall.id;
-							const needsNewId =
-								!providedId || output.content.some(b => b.type === "toolCall" && b.id === providedId);
-							const toolCallId = needsNewId
-								? `${part.functionCall.name}_${Date.now()}_${++toolCallCounter}`
-								: providedId;
-
-							const toolCall: ToolCall = {
-								type: "toolCall",
-								id: toolCallId,
-								name: part.functionCall.name || "",
-								arguments: part.functionCall.args as Record<string, any>,
-								...(part.thoughtSignature && { thoughtSignature: part.thoughtSignature }),
-							};
-
-							output.content.push(toolCall);
-							stream.push({ type: "toolcall_start", contentIndex: blockIndex(), partial: output });
-							stream.push({
-								type: "toolcall_delta",
-								contentIndex: blockIndex(),
-								delta: JSON.stringify(toolCall.arguments),
-								partial: output,
-							});
-							stream.push({ type: "toolcall_end", contentIndex: blockIndex(), toolCall, partial: output });
-						}
-					}
-				}
-
-				if (candidate?.finishReason) {
-					output.stopReason = mapStopReason(candidate.finishReason);
-					if (output.content.some(b => b.type === "toolCall")) {
-						output.stopReason = "toolUse";
-					}
-				}
-
-				if (chunk.usageMetadata) {
-					output.usage = {
-						input: chunk.usageMetadata.promptTokenCount || 0,
-						output:
-							(chunk.usageMetadata.candidatesTokenCount || 0) + (chunk.usageMetadata.thoughtsTokenCount || 0),
-						cacheRead: chunk.usageMetadata.cachedContentTokenCount || 0,
-						cacheWrite: 0,
-						totalTokens: chunk.usageMetadata.totalTokenCount || 0,
-						cost: {
-							input: 0,
-							output: 0,
-							cacheRead: 0,
-							cacheWrite: 0,
-							total: 0,
-						},
-					};
-					calculateCost(model, output.usage);
-				}
-			}
-
-			if (currentBlock) {
-				if (currentBlock.type === "text") {
-					stream.push({
-						type: "text_end",
-						contentIndex: blockIndex(),
-						content: currentBlock.text,
-						partial: output,
-					});
-				} else {
-					stream.push({
-						type: "thinking_end",
-						contentIndex: blockIndex(),
-						content: currentBlock.thinking,
-						partial: output,
-					});
-				}
-			}
-
-			if (options?.signal?.aborted) {
-				throw new Error("Request was aborted");
-			}
-
-			if (output.stopReason === "aborted" || output.stopReason === "error") {
-				throw new Error("An unknown error occurred");
-			}
-
-			output.duration = Date.now() - startTime;
-			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-			stream.push({ type: "done", reason: output.stopReason, message: output });
-			stream.end();
-		} catch (error) {
-			// Remove internal index property used during streaming
-			for (const block of output.content) {
-				if ("index" in block) {
-					delete (block as { index?: number }).index;
-				}
-			}
-			output.stopReason = options?.signal?.aborted ? "aborted" : "error";
-			output.errorMessage = await finalizeErrorMessage(error, rawRequestDump);
-			output.duration = Date.now() - startTime;
-			if (firstTokenTime) output.ttft = firstTokenTime - startTime;
-			stream.push({ type: "error", reason: output.stopReason, error: output });
-			stream.end();
-		}
-	})();
-
-	return stream;
+		},
+	});
 };
 
-function createClient(model: Model<"google-vertex">, project: string, location: string): GoogleGenAI {
-	const httpOptions: { headers?: Record<string, string> } = {};
-
-	if (model.headers) {
-		httpOptions.headers = { ...model.headers };
-	}
-
-	const hasHttpOptions = Object.values(httpOptions).some(Boolean);
-
-	return new GoogleGenAI({
-		vertexai: true,
-		project,
-		location,
-		apiVersion: API_VERSION,
-		httpOptions: hasHttpOptions ? httpOptions : undefined,
-	});
+function resolveApiKey(options?: GoogleVertexOptions): string | undefined {
+	// options.apiKey may contain sentinel values like "<authenticated>" or "N/A"
+	// leaked from the agent loop — only use it if it looks like a real API key.
+	const optKey = options?.apiKey;
+	const realKey = optKey && !optKey.startsWith("<") && optKey !== "N/A" ? optKey : undefined;
+	return realKey || $env.GOOGLE_CLOUD_API_KEY;
 }
 
 function resolveProject(options?: GoogleVertexOptions): string {
-	const project = options?.project || $env.GOOGLE_CLOUD_PROJECT || $env.GCLOUD_PROJECT;
+	const project = options?.project || $env.GOOGLE_CLOUD_PROJECT || $env.GCP_PROJECT || $env.GCLOUD_PROJECT;
 	if (!project) {
-		throw new Error(
-			"Vertex AI requires a project ID. Set GOOGLE_CLOUD_PROJECT/GCLOUD_PROJECT or pass project in options.",
+		throw new AIError.ConfigurationError(
+			"Vertex AI requires a project ID. Set GOOGLE_CLOUD_PROJECT/GCP_PROJECT/GCLOUD_PROJECT or pass project in options.",
 		);
 	}
 	return project;
 }
 
+function resolveAmbientLocation(): string | undefined {
+	return $env.GOOGLE_VERTEX_LOCATION || $env.GOOGLE_CLOUD_LOCATION || $env.VERTEX_LOCATION || undefined;
+}
+function resolveOptionalLocation(options?: GoogleVertexOptions): string | undefined {
+	return options?.location || resolveAmbientLocation();
+}
 function resolveLocation(options?: GoogleVertexOptions): string {
-	const location = options?.location || $env.GOOGLE_CLOUD_LOCATION;
+	const location = resolveOptionalLocation(options);
 	if (!location) {
-		throw new Error("Vertex AI requires a location. Set GOOGLE_CLOUD_LOCATION or pass location in options.");
+		throw new AIError.ConfigurationError(
+			"Vertex AI requires a location. Set GOOGLE_VERTEX_LOCATION/GOOGLE_CLOUD_LOCATION/VERTEX_LOCATION or pass location in options.",
+		);
 	}
 	return location;
-}
-
-function buildParams(
-	model: Model<"google-vertex">,
-	context: Context,
-	options: GoogleVertexOptions = {},
-): GenerateContentParameters {
-	const contents = convertMessages(model, context);
-
-	const generationConfig: GoogleVertexSamplingConfig = {};
-	if (options.temperature !== undefined) {
-		generationConfig.temperature = options.temperature;
-	}
-	if (options.maxTokens !== undefined) {
-		generationConfig.maxOutputTokens = options.maxTokens;
-	}
-	if (options.topP !== undefined) {
-		generationConfig.topP = options.topP;
-	}
-	if (options.topK !== undefined) {
-		generationConfig.topK = options.topK;
-	}
-	if (options.minP !== undefined) {
-		generationConfig.minP = options.minP;
-	}
-	if (options.presencePenalty !== undefined) {
-		generationConfig.presencePenalty = options.presencePenalty;
-	}
-	if (options.repetitionPenalty !== undefined) {
-		generationConfig.repetitionPenalty = options.repetitionPenalty;
-	}
-
-	const config: GenerateContentConfig = {
-		...(Object.keys(generationConfig).length > 0 && generationConfig),
-		...(context.systemPrompt && { systemInstruction: context.systemPrompt.toWellFormed() }),
-		...(context.tools && context.tools.length > 0 && { tools: convertTools(context.tools, model) }),
-	};
-
-	if (context.tools && context.tools.length > 0 && options.toolChoice) {
-		config.toolConfig = {
-			functionCallingConfig: {
-				mode: mapToolChoice(options.toolChoice),
-			},
-		};
-	} else {
-		config.toolConfig = undefined;
-	}
-
-	if (options.thinking?.enabled && model.reasoning) {
-		const thinkingConfig: ThinkingConfig = { includeThoughts: true };
-		if (options.thinking.level !== undefined) {
-			thinkingConfig.thinkingLevel = THINKING_LEVEL_MAP[options.thinking.level];
-		} else if (options.thinking.budgetTokens !== undefined) {
-			thinkingConfig.thinkingBudget = options.thinking.budgetTokens;
-		}
-		config.thinkingConfig = thinkingConfig;
-	}
-
-	if (options.signal) {
-		if (options.signal.aborted) {
-			throw new Error("Request aborted");
-		}
-		config.abortSignal = options.signal;
-	}
-
-	const params: GenerateContentParameters = {
-		model: model.id,
-		contents,
-		config,
-	};
-
-	return params;
 }

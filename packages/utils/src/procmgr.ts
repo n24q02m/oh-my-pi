@@ -1,9 +1,13 @@
 import * as fs from "node:fs";
-import path from "node:path";
-import * as timers from "node:timers";
+import * as path from "node:path";
+import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
 import type { Subprocess } from "bun";
-import { $env } from "./env";
+import { getAgentDir, MAIN_CONFIG_FILENAMES } from "./dirs";
+import { $env, filterChildShellEnv } from "./env";
+import { isExecutable } from "./executable";
+import { $which } from "./which";
 
+export { isExecutable };
 export interface ShellConfig {
 	shell: string;
 	args: string[];
@@ -11,22 +15,12 @@ export interface ShellConfig {
 	prefix: string | undefined;
 }
 
-let cachedShellConfig: ShellConfig | null = null;
-
-const IS_WINDOWS = process.platform === "win32";
-const TERM_SIGNAL = IS_WINDOWS ? undefined : "SIGTERM";
-
-/**
- * Check if a shell binary is executable.
- */
-function isExecutable(path: string): boolean {
-	try {
-		fs.accessSync(path, fs.constants.X_OK);
-		return true;
-	} catch {
-		return false;
-	}
+/** Identifies the settings source users should edit when shell resolution fails. */
+export interface ShellConfigOptions {
+	/** File path or runtime layer that supplied the active shell setting. */
+	configSource?: string;
 }
+let cachedShellConfig: ShellConfig | null = null;
 
 /**
  * Build the spawn environment (cached).
@@ -34,23 +28,55 @@ function isExecutable(path: string): boolean {
 function buildSpawnEnv(shell: string): Record<string, string> {
 	const noCI = $env.PI_BASH_NO_CI || $env.CLAUDE_BASH_NO_CI;
 	return {
-		...Bun.env,
+		...filterChildShellEnv(Bun.env),
 		SHELL: shell,
 		GIT_EDITOR: "true",
 		GPG_TTY: "not a tty",
 		OMPCODE: "1",
 		CLAUDECODE: "1",
 		...(noCI ? {} : { CI: "true" }),
-	};
+	} as Record<string, string>;
 }
 
 /**
- * Get shell args, optionally including login shell flag.
- * Supports PI_BASH_NO_LOGIN and CLAUDE_BASH_NO_LOGIN to skip -l.
+ * Get shell args for the resolved shell.
+ * cmd.exe takes `/c`; PowerShell (powershell.exe / pwsh) takes
+ * `-NoLogo -Command`, with `-NoProfile` when PI_BASH_NO_LOGIN /
+ * CLAUDE_BASH_NO_LOGIN is set (profile scripts are PowerShell's login-shell
+ * analog); POSIX shells take `-c`, with `-l` unless the same env is set.
+ *
+ * Exported for tests; `env` overrides the process env gate.
  */
-function getShellArgs(): string[] {
-	const noLogin = $env.PI_BASH_NO_LOGIN || $env.CLAUDE_BASH_NO_LOGIN;
+export function getShellArgs(shell: string, env: Record<string, string | undefined> = $env): string[] {
+	if (isCmdShell(shell)) return ["/c"];
+	const noLogin = env.PI_BASH_NO_LOGIN || env.CLAUDE_BASH_NO_LOGIN;
+	if (isPowerShell(shell)) {
+		return noLogin ? ["-NoLogo", "-NoProfile", "-Command"] : ["-NoLogo", "-Command"];
+	}
 	return noLogin ? ["-c"] : ["-l", "-c"];
+}
+
+/** Whether the shell is Windows cmd.exe (spawn paths must use `/c`, not `-c`). */
+export function isCmdShell(shell: string): boolean {
+	const basename = shell.replace(/\\/g, "/").split("/").pop()?.toLowerCase();
+	return basename === "cmd.exe" || basename === "cmd";
+}
+
+/**
+ * Whether the shell is Windows PowerShell or PowerShell Core (pwsh). Spawn
+ * paths must use `-Command`: passing the POSIX `-l -c` pair makes PowerShell
+ * parse `-l` as the command and fail with `The term '-l' is not recognized`.
+ */
+export function isPowerShell(shell: string): boolean {
+	const basename = shell.replace(/\\/g, "/").split("/").pop()?.toLowerCase();
+	return basename === "powershell.exe" || basename === "powershell" || basename === "pwsh.exe" || basename === "pwsh";
+}
+
+const POSIX_SHELL_PATTERN = /(?:^|[\\/])(?:sh|bash|dash|ash|ksh|zsh)(?:\.exe)?$/i;
+
+/** Whether the executable is a known shell whose command language uses POSIX quoting. */
+export function isPosixShell(shell: string): boolean {
+	return POSIX_SHELL_PATTERN.test(shell);
 }
 
 /**
@@ -61,24 +87,12 @@ function getShellPrefix(): string | undefined {
 }
 
 /**
- * Find bash executable on PATH (Windows)
- */
-function findBashOnPath(): string | null {
-	try {
-		return Bun.which("bash.exe");
-	} catch {
-		// Ignore errors
-	}
-	return null;
-}
-
-/**
  * Build full shell config from a shell path.
  */
 function buildConfig(shell: string): ShellConfig {
 	return {
 		shell,
-		args: getShellArgs(),
+		args: getShellArgs(shell),
 		env: buildSpawnEnv(shell),
 		prefix: getShellPrefix(),
 	};
@@ -89,7 +103,7 @@ function buildConfig(shell: string): ShellConfig {
  */
 export function resolveBasicShell(): string | undefined {
 	for (const name of ["bash", "bash.exe", "sh", "sh.exe"]) {
-		const resolved = Bun.which(name);
+		const resolved = $which(name);
 		if (resolved) return resolved;
 	}
 
@@ -109,62 +123,82 @@ export function resolveBasicShell(): string | undefined {
 }
 
 /**
+ * Resolve the external shell to advertise on Windows.
+ *
+ * A host bash is OPTIONAL: bash tool commands always execute in the embedded
+ * brush-core shell. The resolved binary only serves the spawn-a-shell paths
+ * (interactive PTY sessions, ACP client terminals, SHELL env), so this
+ * prefers a real Git Bash when one exists and otherwise falls back to
+ * cmd.exe — it never fails.
+ *
+ * Search order:
+ * 1. Git for Windows install roots (machine + per-user installers)
+ * 2. scoop installs — scoop's git manifest sets GIT_INSTALL_ROOT and shims
+ *    sh.exe/git.exe but never bash.exe, so PATH lookup alone misses it
+ * 3. bash.exe on PATH (Cygwin, MSYS2, ...)
+ * 4. sh.exe on PATH (Git for Windows' sh.exe is bash; prefer a sibling
+ *    bash.exe when present)
+ * 5. cmd.exe from ComSpec
+ *
+ * Exported for tests; `env` overrides Bun.env-based discovery.
+ */
+export function resolveWindowsShell(env: Record<string, string | undefined> = Bun.env): string {
+	const gitRoots = [
+		env.ProgramFiles && path.join(env.ProgramFiles, "Git"),
+		env["ProgramFiles(x86)"] && path.join(env["ProgramFiles(x86)"], "Git"),
+		env.LOCALAPPDATA && path.join(env.LOCALAPPDATA, "Programs", "Git"),
+		env.GIT_INSTALL_ROOT,
+		env.SCOOP && path.join(env.SCOOP, "apps", "git", "current"),
+		env.USERPROFILE && path.join(env.USERPROFILE, "scoop", "apps", "git", "current"),
+	];
+	for (const root of gitRoots) {
+		if (!root) continue;
+		const candidate = path.join(root, "bin", "bash.exe");
+		if (fs.existsSync(candidate)) return candidate;
+	}
+
+	const bashOnPath = $which("bash.exe");
+	if (bashOnPath) return bashOnPath;
+
+	const shOnPath = $which("sh.exe");
+	if (shOnPath) {
+		const siblingBash = path.join(path.dirname(shOnPath), "bash.exe");
+		return fs.existsSync(siblingBash) ? siblingBash : shOnPath;
+	}
+
+	return env.ComSpec || env.COMSPEC || "C:\\Windows\\System32\\cmd.exe";
+}
+
+/**
  * Get shell configuration based on platform.
  * Resolution order:
- * 1. User-specified shellPath in settings.json
- * 2. On Windows: Git Bash in known locations, then bash on PATH
+ * 1. User-specified shellPath from the active settings source
+ * 2. On Windows: Git Bash / bash / sh discovery, then cmd.exe (see
+ *    {@link resolveWindowsShell}) — never fails
  * 3. On Unix: $SHELL if bash/zsh, then fallback paths
  * 4. Fallback: sh
  */
-export function getShellConfig(customShellPath?: string): ShellConfig {
+export function getShellConfig(customShellPath?: string, options: ShellConfigOptions = {}): ShellConfig {
+	const configSource = options.configSource ?? path.join(getAgentDir(), MAIN_CONFIG_FILENAMES[0]);
+	// 1. Check user-specified shell path. Validated even on the cached path so a
+	// broken shellPath surfaces its guidance error instead of being masked by an
+	// earlier successful resolution in the same process.
+	if (customShellPath) {
+		if (!fs.existsSync(customShellPath)) {
+			throw new Error(`Custom shell path not found: ${customShellPath}\nPlease update shellPath in ${configSource}`);
+		}
+		if (cachedShellConfig?.shell !== customShellPath) {
+			cachedShellConfig = buildConfig(customShellPath);
+		}
+		return cachedShellConfig;
+	}
 	if (cachedShellConfig) {
 		return cachedShellConfig;
 	}
 
-	// 1. Check user-specified shell path
-	if (customShellPath) {
-		if (fs.existsSync(customShellPath)) {
-			cachedShellConfig = buildConfig(customShellPath);
-			return cachedShellConfig;
-		}
-		throw new Error(
-			`Custom shell path not found: ${customShellPath}\nPlease update shellPath in ~/.omp/agent/settings.json`,
-		);
-	}
-
 	if (process.platform === "win32") {
-		// 2. Try Git Bash in known locations
-		const paths: string[] = [];
-		const programFiles = Bun.env.ProgramFiles;
-		if (programFiles) {
-			paths.push(`${programFiles}\\Git\\bin\\bash.exe`);
-		}
-		const programFilesX86 = Bun.env["ProgramFiles(x86)"];
-		if (programFilesX86) {
-			paths.push(`${programFilesX86}\\Git\\bin\\bash.exe`);
-		}
-
-		for (const path of paths) {
-			if (fs.existsSync(path)) {
-				cachedShellConfig = buildConfig(path);
-				return cachedShellConfig;
-			}
-		}
-
-		// 3. Fallback: search bash.exe on PATH (Cygwin, MSYS2, WSL, etc.)
-		const bashOnPath = findBashOnPath();
-		if (bashOnPath) {
-			cachedShellConfig = buildConfig(bashOnPath);
-			return cachedShellConfig;
-		}
-
-		throw new Error(
-			`No bash shell found. Options:\n` +
-				`  1. Install Git for Windows: https://git-scm.com/download/win\n` +
-				`  2. Add your bash to PATH (Cygwin, MSYS2, etc.)\n` +
-				`  3. Set shellPath in ~/.omp/agent/settings.json\n\n` +
-				`Searched Git Bash in:\n${paths.map(p => `  ${p}`).join("\n")}`,
-		);
+		cachedShellConfig = buildConfig(resolveWindowsShell());
+		return cachedShellConfig;
 	}
 
 	// Unix: prefer user's shell from $SHELL if it's bash/zsh and executable
@@ -186,63 +220,19 @@ export function getShellConfig(customShellPath?: string): ShellConfig {
 }
 
 /**
- * Function signature for native process tree killing.
- * Returns the number of processes killed.
- */
-export type KillTreeFn = (pid: number, signal: number) => number;
-
-/**
- * Global native kill tree function, injected by pi-natives when loaded.
- * Falls back to platform-specific behavior if not set.
- */
-export let nativeKillTree: KillTreeFn | undefined;
-
-/**
- * Set the native kill tree function. Called by pi-natives on load.
- */
-export function setNativeKillTree(fn: KillTreeFn): void {
-	nativeKillTree = fn;
-}
-
-/**
- * Options for terminating a process and all its descendants.
- */
-export interface TerminateOptions {
-	/** The process to terminate */
-	target: Subprocess | number;
-	/** Whether to terminate the process tree (all descendants) */
-	group?: boolean;
-	/** Timeout in milliseconds */
-	timeout?: number;
-	/** Abort signal */
-	signal?: AbortSignal;
-}
-
-/**
  * Check if a process is running.
  */
 export function isPidRunning(pid: number | Subprocess): boolean {
-	try {
-		if (typeof pid === "number") {
-			process.kill(pid, 0);
-		} else {
-			if (pid.killed) return false;
-			if (pid.exitCode !== null) return false;
-		}
+	if (typeof pid !== "number") {
+		if (pid.killed) return false;
+		if (pid.exitCode !== null) return false;
 		return true;
-	} catch {
-		return false;
 	}
+
+	return Process.fromPid(pid)?.status() === ProcessStatus.Running;
 }
 
-function joinSignals(...sigs: (AbortSignal | null | undefined)[]): AbortSignal | undefined {
-	const nn = sigs.filter(Boolean) as AbortSignal[];
-	if (nn.length === 0) return undefined;
-	if (nn.length === 1) return nn[0];
-	return AbortSignal.any(nn);
-}
-
-export function onProcessExit(proc: Subprocess | number, abortSignal?: AbortSignal): Promise<boolean> {
+export async function onProcessExit(proc: Subprocess | number, abortSignal?: AbortSignal): Promise<boolean> {
 	if (typeof proc !== "number") {
 		return proc.exited.then(
 			() => true,
@@ -250,88 +240,5 @@ export function onProcessExit(proc: Subprocess | number, abortSignal?: AbortSign
 		);
 	}
 
-	if (!isPidRunning(proc)) {
-		return Promise.resolve(true);
-	}
-
-	const { promise, resolve, reject } = Promise.withResolvers<boolean>();
-	const localAbortController = new AbortController();
-
-	const timer = timers.promises.setInterval(300, null, {
-		signal: joinSignals(abortSignal, localAbortController.signal),
-	});
-	void (async () => {
-		try {
-			for await (const _ of timer) {
-				if (!isPidRunning(proc)) {
-					resolve(true);
-					break;
-				}
-			}
-		} catch (error) {
-			return reject(error);
-		} finally {
-			localAbortController.abort();
-		}
-		resolve(false);
-	})();
-
-	return promise;
-}
-
-/**
- * Terminate a process and all its descendants.
- */
-export async function terminate(options: TerminateOptions): Promise<boolean> {
-	const { target, group = false, timeout = 5000, signal } = options;
-
-	const abortController = new AbortController();
-	try {
-		const abortSignal = joinSignals(signal, abortController.signal);
-
-		// Determine PID
-		let pid: number | undefined;
-		const exitPromise = onProcessExit(target, abortSignal);
-		if (typeof target === "number") {
-			pid = target;
-		} else {
-			pid = target.pid;
-			if (target.killed) return true;
-		}
-
-		// Give it a moment to exit gracefully first.
-		try {
-			if (typeof target === "number") {
-				process.kill(target, TERM_SIGNAL);
-			} else {
-				target.kill(TERM_SIGNAL);
-			}
-
-			if (exitPromise) {
-				const exited = await Promise.race([Bun.sleep(1000).then(() => false), exitPromise]);
-				if (exited) return true;
-			}
-		} catch {}
-
-		if (nativeKillTree) {
-			nativeKillTree(pid, 9);
-		} else {
-			if (group && !IS_WINDOWS) {
-				try {
-					process.kill(-pid, "SIGKILL");
-				} catch {}
-			}
-			try {
-				if (typeof target === "number") {
-					process.kill(target, "SIGKILL");
-				} else {
-					target.kill("SIGKILL");
-				}
-			} catch {}
-		}
-
-		return await Promise.race([Bun.sleep(timeout).then(() => false), exitPromise]);
-	} finally {
-		abortController.abort();
-	}
+	return (await Process.fromPid(proc)?.waitForExit({ signal: abortSignal })) ?? true;
 }

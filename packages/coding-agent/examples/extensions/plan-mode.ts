@@ -22,7 +22,7 @@ import type { ExtensionAPI, ExtensionContext } from "@oh-my-pi/pi-coding-agent";
 import { Key } from "@oh-my-pi/pi-tui";
 
 // Read-only tools for plan mode
-const PLAN_MODE_TOOLS = ["read", "bash", "grep", "find", "ls"];
+const PLAN_MODE_TOOLS = ["read", "bash", "search", "find"];
 
 // Full set of tools for normal mode
 const NORMAL_MODE_TOOLS = ["read", "bash", "edit", "write"];
@@ -334,7 +334,6 @@ export default function planModeExtension(pi: ExtensionAPI) {
 		}
 
 		// Remove any previous plan-mode-context messages
-		const _beforeCount = event.messages.length;
 		const filtered = event.messages.filter(m => {
 			if (m.role === "user" && Array.isArray(m.content)) {
 				const hasOldContext = m.content.some(
@@ -427,7 +426,7 @@ Execute each step in order.`,
 
 		// Extract todos from last message
 		const messages = event.messages;
-		const lastAssistant = [...messages].reverse().find(m => m.role === "assistant");
+		const lastAssistant = messages.findLast(m => m.role === "assistant");
 		if (lastAssistant && Array.isArray(lastAssistant.content)) {
 			const textContent = lastAssistant.content
 				.filter(

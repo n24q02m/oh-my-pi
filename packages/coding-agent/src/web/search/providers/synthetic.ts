@@ -5,12 +5,15 @@
  * Endpoint: POST https://api.synthetic.new/v2/search
  */
 
-import { getEnvApiKey } from "@oh-my-pi/pi-ai";
-import type { SearchResponse, SearchSource } from "../../../web/search/types";
+import { type ApiKey, type AuthStorage, type FetchImpl, getEnvApiKey, withAuth } from "@oh-my-pi/pi-ai";
+import type { SearchResponse, SearchSource } from "@oh-my-pi/pi-tui/tools/web-search";
 import { SearchProviderError } from "../../../web/search/types";
+import { formatQuery, parseSearchQuery } from "../query";
 import type { SearchParams } from "./base";
 import { SearchProvider } from "./base";
-import { findCredential } from "./utils";
+import { classifyProviderHttpError, withHardTimeout } from "./utils";
+
+type SearchParamsWithFetch = SearchParams & { fetch?: FetchImpl };
 
 const SYNTHETIC_SEARCH_URL = "https://api.synthetic.new/v2/search";
 
@@ -25,9 +28,13 @@ interface SyntheticSearchResponse {
 	results: SyntheticSearchResult[];
 }
 
-/** Find Synthetic API key from environment or agent.db credentials. */
-export async function findApiKey(): Promise<string | null> {
-	return findCredential(getEnvApiKey("synthetic"), "synthetic");
+/** Resolve Synthetic API key through the shared auth storage pipeline. */
+export function findApiKey(
+	authStorage: AuthStorage,
+	sessionId?: string,
+	signal?: AbortSignal,
+): Promise<string | undefined> {
+	return authStorage.getApiKey("synthetic", sessionId, { signal });
 }
 
 /** Call Synthetic search API. */
@@ -35,19 +42,23 @@ async function callSyntheticSearch(
 	apiKey: string,
 	query: string,
 	signal?: AbortSignal,
+	fetchImpl: FetchImpl = fetch,
+	timeoutMs?: number,
 ): Promise<SyntheticSearchResponse> {
-	const response = await fetch(SYNTHETIC_SEARCH_URL, {
+	const response = await fetchImpl(SYNTHETIC_SEARCH_URL, {
 		method: "POST",
 		headers: {
 			"Content-Type": "application/json",
 			Authorization: `Bearer ${apiKey}`,
 		},
 		body: JSON.stringify({ query }),
-		signal,
+		signal: withHardTimeout(signal, timeoutMs),
 	});
 
 	if (!response.ok) {
 		const errorText = await response.text();
+		const classified = classifyProviderHttpError("synthetic", response.status, errorText);
+		if (classified) throw classified;
 		throw new SearchProviderError(
 			"synthetic",
 			`Synthetic API error (${response.status}): ${errorText}`,
@@ -59,17 +70,26 @@ async function callSyntheticSearch(
 }
 
 /** Execute Synthetic web search. */
-export async function searchSynthetic(params: {
-	query: string;
-	num_results?: number;
-	signal?: AbortSignal;
-}): Promise<SearchResponse> {
-	const apiKey = await findApiKey();
-	if (!apiKey) {
-		throw new Error("Synthetic credentials not found. Set SYNTHETIC_API_KEY or login with 'omp /login synthetic'.");
-	}
+export async function searchSynthetic(params: SearchParamsWithFetch): Promise<SearchResponse> {
+	const keyOrResolver: ApiKey = params.authStorage.resolver("synthetic", {
+		sessionId: params.sessionId,
+	});
 
-	const data = await callSyntheticSearch(apiKey, params.query, params.signal);
+	const parsed = params.parsedQuery ?? parseSearchQuery(params.query);
+	const query = parsed.hasDirectives
+		? formatQuery(parsed, { phrases: true, negation: true, site: true })
+		: params.query;
+
+	const fetchImpl = params.fetch;
+	const data = await withAuth(
+		keyOrResolver,
+		key => callSyntheticSearch(key, query, params.signal, fetchImpl, params.timeoutMs),
+		{
+			signal: params.signal,
+			missingKeyMessage:
+				"Synthetic credentials not found. Set SYNTHETIC_API_KEY or login with 'omp /login synthetic'.",
+		},
+	);
 	const sources: SearchSource[] = [];
 
 	for (const result of data.results ?? []) {
@@ -82,7 +102,8 @@ export async function searchSynthetic(params: {
 		});
 	}
 
-	const limitedSources = params.num_results ? sources.slice(0, params.num_results) : sources;
+	const numResults = params.numSearchResults ?? params.limit;
+	const limitedSources = numResults ? sources.slice(0, numResults) : sources;
 
 	return {
 		provider: "synthetic",
@@ -95,19 +116,11 @@ export class SyntheticProvider extends SearchProvider {
 	readonly id = "synthetic";
 	readonly label = "Synthetic";
 
-	async isAvailable(): Promise<boolean> {
-		try {
-			return !!(await findApiKey());
-		} catch {
-			return false;
-		}
+	isAvailable(authStorage: AuthStorage): boolean {
+		return authStorage.hasAuth("synthetic") || !!getEnvApiKey("synthetic");
 	}
 
-	search(params: SearchParams): Promise<SearchResponse> {
-		return searchSynthetic({
-			query: params.query,
-			num_results: params.numSearchResults ?? params.limit,
-			signal: params.signal,
-		});
+	search(params: SearchParamsWithFetch): Promise<SearchResponse> {
+		return searchSynthetic(params);
 	}
 }

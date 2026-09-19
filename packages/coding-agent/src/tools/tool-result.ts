@@ -1,7 +1,8 @@
 import type { AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
-import type { OutputSummary, TruncationResult } from "../session/streaming-output";
-import type { OutputMeta, TruncationOptions, TruncationSummaryOptions, TruncationTextOptions } from "./output-meta";
+import type { OutputSummary, TruncationResult } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import type { OutputMeta } from "@oh-my-pi/pi-tui/tools/output-meta";
+import type { LimitsInput, TruncationMetaInput, TruncationSummaryOptions, TruncationTextOptions } from "./output-meta";
 import { outputMeta } from "./output-meta";
 
 type ToolContent = Array<TextContent | ImageContent>;
@@ -12,6 +13,8 @@ export class ToolResultBuilder<TDetails extends DetailsWithMeta> {
 	#details: TDetails;
 	#meta = outputMeta();
 	#content: ToolContent = [];
+	#isError = false;
+	#useless = false;
 
 	constructor(details?: TDetails) {
 		this.#details = details ?? ({} as TDetails);
@@ -27,7 +30,7 @@ export class ToolResultBuilder<TDetails extends DetailsWithMeta> {
 		return this;
 	}
 
-	truncation(result: TruncationResult, options: TruncationOptions): this {
+	truncation(result: TruncationResult, options: TruncationMetaInput): this {
 		this.#meta.truncation(result, options);
 		return this;
 	}
@@ -42,7 +45,7 @@ export class ToolResultBuilder<TDetails extends DetailsWithMeta> {
 		return this;
 	}
 
-	limits(limits: { matchLimit?: number; resultLimit?: number; headLimit?: number; columnMax?: number }): this {
+	limits(limits: LimitsInput): this {
 		this.#meta.limits(limits);
 		return this;
 	}
@@ -67,6 +70,18 @@ export class ToolResultBuilder<TDetails extends DetailsWithMeta> {
 		return this;
 	}
 
+	/** Flag the result as a non-throwing failure (agent-loop surfaces it as a tool error). */
+	error(value = true): this {
+		this.#isError = value;
+		return this;
+	}
+
+	/** Marks the result contextually useless — compaction may elide it once consumed. */
+	useless(value = true): this {
+		this.#useless = value;
+		return this;
+	}
+
 	done(): AgentToolResult<TDetails> {
 		const meta = this.#meta.get();
 		if (meta) {
@@ -77,6 +92,8 @@ export class ToolResultBuilder<TDetails extends DetailsWithMeta> {
 		return {
 			content: this.#content,
 			details: hasDetails ? this.#details : undefined,
+			...(this.#isError ? { isError: true } : {}),
+			...(this.#useless && !this.#isError ? { useless: true } : {}),
 		};
 	}
 }

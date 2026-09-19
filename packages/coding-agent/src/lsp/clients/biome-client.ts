@@ -2,7 +2,8 @@
  * Biome CLI-based linter client.
  * Uses Biome's CLI with JSON output instead of LSP (which has stale diagnostics issues).
  */
-import path from "node:path";
+import * as path from "node:path";
+import { logger } from "@oh-my-pi/pi-utils";
 import type { Diagnostic, DiagnosticSeverity, LinterClient, ServerConfig } from "../../lsp/types";
 
 // =============================================================================
@@ -13,45 +14,27 @@ interface BiomeJsonOutput {
 	diagnostics: BiomeDiagnostic[];
 }
 
+/**
+ * A single diagnostic from Biome's `--reporter=json` output (Biome 2.x).
+ *
+ * Positions are 1-indexed `{ line, column }` pairs; the path is a plain string
+ * relative to the CLI's cwd. Older releases used byte-offset `span`s, which
+ * this client no longer parses.
+ */
 interface BiomeDiagnostic {
 	category: string; // e.g., "lint/correctness/noUnusedVariables"
-	severity: "error" | "warning" | "info" | "hint";
-	description: string;
+	severity: string; // "error" | "warning" | "info" | "hint"
+	message: string;
 	location?: {
-		path?: { file: string };
-		span?: [number, number]; // [startOffset, endOffset] in bytes
-		sourceCode?: string;
+		path?: string;
+		start?: { line: number; column: number };
+		end?: { line: number; column: number };
 	};
 }
 
 // =============================================================================
 // Helpers
 // =============================================================================
-
-/**
- * Convert byte offset to line:column using source code.
- */
-function offsetToPosition(source: string, offset: number): { line: number; column: number } {
-	let line = 1;
-	let column = 1;
-	let byteIndex = 0;
-
-	for (const ch of source) {
-		const byteLen = Buffer.byteLength(ch);
-		if (byteIndex + byteLen > offset) {
-			break;
-		}
-		if (ch === "\n") {
-			line++;
-			column = 1;
-		} else {
-			column++;
-		}
-		byteIndex += byteLen;
-	}
-
-	return { line, column };
-}
 
 /**
  * Parse Biome severity to LSP DiagnosticSeverity.
@@ -78,6 +61,7 @@ async function runBiome(
 	args: string[],
 	cwd: string,
 	resolvedCommand?: string,
+	signal?: AbortSignal,
 ): Promise<{ stdout: string; stderr: string; success: boolean }> {
 	const command = resolvedCommand ?? "biome";
 
@@ -87,15 +71,28 @@ async function runBiome(
 			stdout: "pipe",
 			stderr: "pipe",
 			windowsHide: true,
+			signal,
 		});
 
 		const [stdout, stderr] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text()]);
 		const exitCode = await proc.exited;
+		signal?.throwIfAborted();
 
 		return { stdout, stderr, success: exitCode === 0 };
 	} catch (err) {
+		if (signal?.aborted) throw err;
 		return { stdout: "", stderr: String(err), success: false };
 	}
+}
+
+// Surface broken-binary / CLI failures once instead of silently reporting
+// "no diagnostics" forever (and instead of spamming every writethrough).
+const reportedBiomeFailures = new Set<string>();
+
+function warnBiomeOnce(key: string, message: string, meta: Record<string, unknown>): void {
+	if (reportedBiomeFailures.has(key)) return;
+	reportedBiomeFailures.add(key);
+	logger.warn(message, meta);
 }
 
 // =============================================================================
@@ -118,14 +115,13 @@ export class BiomeClient implements LinterClient {
 	) {}
 
 	async format(filePath: string, content: string): Promise<string> {
-		// Write content to file first
+		// Keep the standalone LinterClient contract: callers supply the content to
+		// format, regardless of what is currently on disk.
 		await Bun.write(filePath, content);
 
-		// Run biome format --write
 		const result = await runBiome(["format", "--write", filePath], this.cwd, this.config.resolvedCommand);
 
 		if (result.success) {
-			// Read back formatted content
 			return await Bun.file(filePath).text();
 		}
 
@@ -133,9 +129,24 @@ export class BiomeClient implements LinterClient {
 		return content;
 	}
 
-	async lint(filePath: string): Promise<Diagnostic[]> {
+	async lint(filePath: string, signal?: AbortSignal): Promise<Diagnostic[]> {
 		// Run biome lint with JSON reporter
-		const result = await runBiome(["lint", "--reporter=json", filePath], this.cwd, this.config.resolvedCommand);
+		const result = await runBiome(
+			["lint", "--reporter=json", filePath],
+			this.cwd,
+			this.config.resolvedCommand,
+			signal,
+		);
+
+		// Biome exits non-zero when diagnostics are found, so only an empty
+		// stdout signals an actual run failure (missing binary, CLI error).
+		if (!result.success && result.stdout.trim().length === 0) {
+			warnBiomeOnce(`run:${this.cwd}`, "Biome lint failed; reporting no diagnostics", {
+				cwd: this.cwd,
+				stderr: result.stderr.slice(0, 500),
+			});
+			return [];
+		}
 
 		return this.#parseJsonOutput(result.stdout, filePath);
 	}
@@ -144,53 +155,66 @@ export class BiomeClient implements LinterClient {
 	 * Parse Biome's JSON output into LSP Diagnostics.
 	 */
 	#parseJsonOutput(jsonOutput: string, targetFile: string): Diagnostic[] {
-		const diagnostics: Diagnostic[] = [];
-
+		let parsed: BiomeJsonOutput;
 		try {
-			const parsed: BiomeJsonOutput = JSON.parse(jsonOutput);
-
-			for (const diag of parsed.diagnostics) {
-				const location = diag.location;
-				if (!location?.path?.file) continue;
-
-				// Resolve file path
-				const diagFile = path.isAbsolute(location.path.file)
-					? location.path.file
-					: path.join(this.cwd, location.path.file);
-
-				// Only include diagnostics for the target file
-				if (path.resolve(diagFile) !== path.resolve(targetFile)) {
-					continue;
-				}
-
-				// Convert byte offset to line:column
-				let startLine = 1;
-				let startColumn = 1;
-				let endLine = 1;
-				let endColumn = 1;
-
-				if (location.span && location.sourceCode) {
-					const startPos = offsetToPosition(location.sourceCode, location.span[0]);
-					const endPos = offsetToPosition(location.sourceCode, location.span[1]);
-					startLine = startPos.line;
-					startColumn = startPos.column;
-					endLine = endPos.line;
-					endColumn = endPos.column;
-				}
-
-				diagnostics.push({
-					range: {
-						start: { line: startLine - 1, character: startColumn - 1 },
-						end: { line: endLine - 1, character: endColumn - 1 },
-					},
-					severity: parseSeverity(diag.severity),
-					message: diag.description,
-					source: "biome",
-					code: diag.category,
-				});
-			}
+			parsed = JSON.parse(jsonOutput);
 		} catch {
-			// JSON parse failed, return empty
+			warnBiomeOnce(`parse:${this.cwd}`, "Failed to parse Biome JSON output; reporting no diagnostics", {
+				cwd: this.cwd,
+				file: targetFile,
+			});
+			return [];
+		}
+
+		const emitted = parsed.diagnostics ?? [];
+		const target = path.resolve(targetFile);
+		const diagnostics: Diagnostic[] = [];
+		// Biome's JSON reporter is experimental and may reshape its output in
+		// patch releases. Track whether any diagnostic carried a usable location
+		// so a schema drift surfaces as a warning instead of a silent empty list.
+		let sawUsableLocation = false;
+
+		for (const diag of emitted) {
+			const location = diag.location;
+			const filePath = location?.path;
+			if (!filePath) continue;
+			sawUsableLocation = true;
+
+			// Biome reports paths relative to its cwd.
+			const diagFile = path.isAbsolute(filePath) ? filePath : path.join(this.cwd, filePath);
+
+			// Only include diagnostics for the target file.
+			if (path.resolve(diagFile) !== target) continue;
+
+			// Biome positions are 1-indexed; LSP ranges are 0-indexed.
+			const start = location.start;
+			const end = location.end ?? start;
+			const startLine = start?.line ?? 1;
+			const startColumn = start?.column ?? 1;
+			const endLine = end?.line ?? startLine;
+			const endColumn = end?.column ?? startColumn;
+
+			diagnostics.push({
+				range: {
+					start: { line: startLine - 1, character: startColumn - 1 },
+					end: { line: endLine - 1, character: endColumn - 1 },
+				},
+				severity: parseSeverity(diag.severity),
+				message: diag.message,
+				source: "biome",
+				code: diag.category,
+			});
+		}
+
+		// Non-empty output whose diagnostics all lacked a recognizable location
+		// means the reporter schema changed out from under us — warn loudly
+		// instead of masking the regression as "no lint issues".
+		if (emitted.length > 0 && !sawUsableLocation) {
+			warnBiomeOnce(
+				`schema:${this.cwd}`,
+				"Biome diagnostics had no recognizable location; reporter schema may have changed",
+				{ cwd: this.cwd, file: targetFile, count: emitted.length },
+			);
 		}
 
 		return diagnostics;

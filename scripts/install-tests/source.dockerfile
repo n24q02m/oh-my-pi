@@ -7,7 +7,8 @@ RUN apt-get update && apt-get install -y curl ca-certificates unzip build-essent
 RUN curl -fsSL https://bun.sh/install | bash
 ENV PATH="/root/.bun/bin:$PATH"
 
-# Install Rust (needed to build native addon)
+# Install Rust — the host native addon builds through the default
+# cargo/napi-rs backend, so no bazelisk is needed.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly
 ENV PATH="/root/.cargo/bin:$PATH"
 
@@ -17,7 +18,7 @@ COPY . .
 
 # Install dependencies, build native addon, and link globally
 RUN bun install --frozen-lockfile
-RUN bun --cwd=packages/natives run build:native
+RUN bun --cwd=packages/natives run build
 RUN cd packages/coding-agent && bun link
 
 # Verify

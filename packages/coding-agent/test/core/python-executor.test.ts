@@ -1,36 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
-import {
-	disposeAllKernelSessions,
-	executePythonWithKernel,
-	getPreludeDocs,
-	type PythonKernelExecutor,
-	resetPreludeDocsCache,
-	warmPythonEnvironment,
-} from "@oh-my-pi/pi-coding-agent/ipy/executor";
-import {
-	type KernelExecuteOptions,
-	type KernelExecuteResult,
-	type PreludeHelper,
-	PythonKernel,
-} from "@oh-my-pi/pi-coding-agent/ipy/kernel";
-import { DEFAULT_MAX_BYTES } from "@oh-my-pi/pi-coding-agent/session/streaming-output";
+import { disposeAllKernelSessions, executePythonWithKernel } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
+import { DEFAULT_MAX_BYTES } from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { TempDir } from "@oh-my-pi/pi-utils";
-
-class FakeKernel implements PythonKernelExecutor {
-	private result: KernelExecuteResult;
-	private onExecute: (options?: KernelExecuteOptions) => Promise<void> | void;
-
-	constructor(result: KernelExecuteResult, onExecute: (options?: KernelExecuteOptions) => Promise<void> | void) {
-		this.result = result;
-		this.onExecute = onExecute;
-	}
-
-	async execute(_code: string, options?: KernelExecuteOptions): Promise<KernelExecuteResult> {
-		await this.onExecute(options);
-		return this.result;
-	}
-}
+import { FakeKernel } from "./helpers";
 
 describe("executePythonWithKernel", () => {
 	it("captures text and display outputs", async () => {
@@ -102,7 +75,7 @@ describe("executePythonWithKernel", () => {
 
 		expect(result.exitCode).toBeUndefined();
 		expect(result.cancelled).toBe(true);
-		expect(result.output).toContain("Command timed out after 4 seconds");
+		expect(result.output).toContain("eval cell timed out after 4s");
 	});
 
 	it("returns cancelled result without timeout annotation", async () => {
@@ -154,43 +127,5 @@ describe("executePythonWithKernel", () => {
 
 afterEach(async () => {
 	await disposeAllKernelSessions();
-	resetPreludeDocsCache();
 	vi.restoreAllMocks();
-});
-
-describe("warmPythonEnvironment", () => {
-	it("caches prelude docs on warmup", async () => {
-		const previousSkip = Bun.env.PI_PYTHON_SKIP_CHECK;
-		Bun.env.PI_PYTHON_SKIP_CHECK = "1";
-		using tempDir = TempDir.createSync("@python-executor-");
-		const docs: PreludeHelper[] = [
-			{
-				name: "read",
-				signature: "(path)",
-				docstring: "Read file contents.",
-				category: "File I/O",
-			},
-		];
-		const kernel = {
-			introspectPrelude: vi.fn().mockResolvedValue(docs),
-			ping: vi.fn().mockResolvedValue(true),
-			isAlive: () => true,
-			shutdown: vi.fn().mockResolvedValue(undefined),
-		};
-		const startSpy = vi.spyOn(PythonKernel, "start").mockResolvedValue(kernel as unknown as PythonKernel);
-
-		const result = await warmPythonEnvironment(tempDir.path(), "session-1");
-
-		expect(result.ok).toBe(true);
-		expect(result.docs).toEqual(docs);
-		expect(getPreludeDocs()).toEqual(docs);
-		expect(kernel.introspectPrelude).toHaveBeenCalledTimes(1);
-
-		startSpy.mockRestore();
-		if (previousSkip === undefined) {
-			delete Bun.env.PI_PYTHON_SKIP_CHECK;
-		} else {
-			Bun.env.PI_PYTHON_SKIP_CHECK = previousSkip;
-		}
-	});
 });

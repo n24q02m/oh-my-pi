@@ -1,116 +1,122 @@
-import { useCallback, useEffect, useState } from "react";
-import { getRecentErrors, getRecentRequests, getStats, sync } from "./api";
-import { ChartsContainer } from "./components/ChartsContainer";
-import { Header } from "./components/Header";
-import { ModelsTable } from "./components/ModelsTable";
-import { RequestDetail } from "./components/RequestDetail";
-import { RequestList } from "./components/RequestList";
-import { StatsGrid } from "./components/StatsGrid";
-import type { DashboardStats, MessageStats } from "./types";
-
-type Tab = "overview" | "requests" | "errors" | "models";
+import { useCallback, useRef, useState } from "react";
+import { AppLayout } from "./app/AppLayout";
+import type { DashboardSection } from "./app/routes";
+import { useHashRoute } from "./data/useHashRoute";
+import {
+	BehaviorRoute,
+	CostsRoute,
+	ErrorsRoute,
+	GainRoute,
+	ModelsRoute,
+	OverviewRoute,
+	ProjectsRoute,
+	ProvidersRoute,
+	RequestsRoute,
+	ToolsRoute,
+	TracesRoute,
+} from "./routes";
+import { RequestDrawer } from "./ui/RequestDrawer";
 
 export default function App() {
-	const [stats, setStats] = useState<DashboardStats | null>(null);
-	const [recentRequests, setRecentRequests] = useState<MessageStats[]>([]);
-	const [recentErrors, setRecentErrors] = useState<MessageStats[]>([]);
-	const [selectedRequest, setSelectedRequest] = useState<number | null>(null);
-	const [syncing, setSyncing] = useState(false);
-	const [activeTab, setActiveTab] = useState<Tab>("overview");
+	const { section, setSection, range, setRange, session, setSession } = useHashRoute();
+	const [refreshTrigger, setRefreshTrigger] = useState(0);
+	const [selectedRequestId, setSelectedRequestId] = useState<number | null>(null);
+	const [updatedAt, setUpdatedAt] = useState<number | null>(() => Date.now());
 
-	const loadData = useCallback(async () => {
-		try {
-			const [s, r, e] = await Promise.all([getStats(), getRecentRequests(50), getRecentErrors(50)]);
-			setStats(s);
-			setRecentRequests(r);
-			setRecentErrors(e);
-		} catch (err) {
-			console.error(err);
+	const handleSyncComplete = useCallback((result: { success: boolean }) => {
+		if (result.success) {
+			setRefreshTrigger(prev => prev + 1);
+			setUpdatedAt(Date.now());
 		}
 	}, []);
 
-	const handleSync = async () => {
-		setSyncing(true);
-		try {
-			await sync();
-			await loadData();
-		} finally {
-			setSyncing(false);
+	// Stable identity so the drawer's effects don't tear down on every App render.
+	const closeDrawer = useCallback(() => setSelectedRequestId(null), []);
+
+	const active = section;
+
+	// Keep every visited section mounted and just toggle visibility. Remounting a
+	// route on each navigation replays the chart entry animations (a visible
+	// flicker); keeping it alive makes revisits instant while the live chart
+	// instances still animate in place on data/range updates. Only the active
+	// route fetches/polls (enabled), so hidden routes don't keep hitting the API.
+	const mountedRef = useRef<Set<DashboardSection>>(new Set());
+	mountedRef.current.add(active);
+
+	const renderRoute = (target: DashboardSection) => {
+		const isActive = target === active;
+		switch (target) {
+			case "overview":
+				return (
+					<OverviewRoute
+						active={isActive}
+						range={range}
+						refreshTrigger={refreshTrigger}
+						onRequestClick={setSelectedRequestId}
+					/>
+				);
+			case "requests":
+				return (
+					<RequestsRoute
+						active={isActive}
+						range={range}
+						refreshTrigger={refreshTrigger}
+						onRequestClick={setSelectedRequestId}
+					/>
+				);
+			case "traces":
+				return (
+					<TracesRoute
+						active={isActive}
+						session={session}
+						onOpenSession={setSession}
+						refreshTrigger={refreshTrigger}
+					/>
+				);
+			case "errors":
+				return (
+					<ErrorsRoute
+						active={isActive}
+						range={range}
+						refreshTrigger={refreshTrigger}
+						onRequestClick={setSelectedRequestId}
+					/>
+				);
+			case "models":
+				return <ModelsRoute active={isActive} range={range} refreshTrigger={refreshTrigger} />;
+			case "providers":
+				return <ProvidersRoute active={isActive} range={range} refreshTrigger={refreshTrigger} />;
+			case "tools":
+				return <ToolsRoute active={isActive} range={range} refreshTrigger={refreshTrigger} />;
+			case "costs":
+				return <CostsRoute active={isActive} range={range} refreshTrigger={refreshTrigger} />;
+			case "behavior":
+				return <BehaviorRoute active={isActive} range={range} refreshTrigger={refreshTrigger} />;
+			case "projects":
+				return <ProjectsRoute active={isActive} range={range} refreshTrigger={refreshTrigger} />;
+			case "gain":
+				return <GainRoute active={isActive} range={range} refreshTrigger={refreshTrigger} />;
 		}
 	};
 
-	useEffect(() => {
-		loadData();
-		const interval = setInterval(loadData, 30000);
-		return () => clearInterval(interval);
-	}, [loadData]);
-
-	if (!stats) {
-		return (
-			<div className="min-h-screen flex items-center justify-center">
-				<div className="flex items-center gap-3 text-[var(--text-muted)]">
-					<div className="w-5 h-5 border-2 border-[var(--border-default)] border-t-[var(--accent-cyan)] rounded-full spin" />
-					<span className="text-sm">Loading analytics...</span>
-				</div>
-			</div>
-		);
-	}
-
 	return (
-		<div className="min-h-screen">
-			<div className="max-w-[1600px] mx-auto px-6 py-6">
-				<Header activeTab={activeTab} onTabChange={setActiveTab} onSync={handleSync} syncing={syncing} />
-
-				{activeTab === "overview" && (
-					<div className="space-y-6 animate-fade-in">
-						<StatsGrid stats={stats.overall} />
-
-						<div className="grid lg:grid-cols-2 gap-6">
-							<RequestList
-								title="Recent Requests"
-								requests={recentRequests.slice(0, 10)}
-								onSelect={r => r.id && setSelectedRequest(r.id)}
-							/>
-							<RequestList
-								title="Recent Errors"
-								requests={recentErrors.slice(0, 10)}
-								onSelect={r => r.id && setSelectedRequest(r.id)}
-							/>
-						</div>
+		<>
+			<AppLayout
+				activeSection={active}
+				onSectionChange={setSection}
+				range={range}
+				onRangeChange={setRange}
+				updatedAt={updatedAt}
+				onSyncComplete={handleSyncComplete}
+			>
+				{[...mountedRef.current].map(target => (
+					<div key={target} hidden={target !== active}>
+						{renderRoute(target)}
 					</div>
-				)}
+				))}
+			</AppLayout>
 
-				{activeTab === "requests" && (
-					<div className="h-[calc(100vh-140px)] animate-fade-in">
-						<RequestList
-							title="All Recent Requests"
-							requests={recentRequests}
-							onSelect={r => r.id && setSelectedRequest(r.id)}
-						/>
-					</div>
-				)}
-
-				{activeTab === "errors" && (
-					<div className="h-[calc(100vh-140px)] animate-fade-in">
-						<RequestList
-							title="Failed Requests"
-							requests={recentErrors}
-							onSelect={r => r.id && setSelectedRequest(r.id)}
-						/>
-					</div>
-				)}
-
-				{activeTab === "models" && (
-					<div className="space-y-6 animate-fade-in">
-						<ChartsContainer modelSeries={stats.modelSeries} />
-						<ModelsTable models={stats.byModel} performanceSeries={stats.modelPerformanceSeries} />
-					</div>
-				)}
-
-				{selectedRequest !== null && (
-					<RequestDetail id={selectedRequest} onClose={() => setSelectedRequest(null)} />
-				)}
-			</div>
-		</div>
+			<RequestDrawer id={selectedRequestId} onClose={closeDrawer} />
+		</>
 	);
 }

@@ -6,9 +6,9 @@ A custom tool is a TypeScript/JavaScript module that exports a factory. The fact
 
 ## What this is (and is not)
 
-- **Custom tool**: callable by the model during a turn (`execute` + TypeBox schema).
+- **Custom tool**: callable by the model during a turn (`execute` + parameter schema).
 - **Extension**: lifecycle/event framework that can register tools and intercept/modify events.
-- **Hook**: external pre/post command scripts.
+- **Hook**: legacy event-driven interceptor API loaded through the extension runner.
 - **Skill**: static guidance/context package, not executable tool code.
 
 If you need the model to call code directly, use a custom tool.
@@ -18,11 +18,11 @@ If you need the model to call code directly, use a custom tool.
 There are two active integration styles:
 
 1. **SDK-provided custom tools** (`options.customTools`)
-   - Wrapped into agent tools via `CustomToolAdapter` or extension wrappers.
-   - Always included in the initial active tool set in SDK bootstrap.
+   - In unrestricted SDK bootstrap, converted to extension tool definitions, registered through a generated extension, and always included in the initial active tool set.
+   - In a restricted session (`restrictToolNames: true`), SDK-provided custom tools are excluded unless `allowRestrictedCustomTools: true`; opted-in tools are active only when their names also appear in `toolNames`.
 
 2. **Filesystem-discovered modules via loader API** (`discoverAndLoadCustomTools` / `loadCustomTools`)
-   - Exposed as library APIs in `src/extensibility/custom-tools/loader.ts`.
+   - Exposed as library APIs in `packages/coding-agent/src/extensibility/custom-tools/loader.ts`.
    - Host code can call these to discover and load tool modules from config/provider/plugin paths.
 
 ```text
@@ -31,7 +31,7 @@ Model tool call flow
 LLM tool call
    │
    ▼
-Tool registry (built-ins + custom tool adapters)
+Tool registry (built-ins + registered custom definitions)
    │
    ▼
 CustomTool.execute(toolCallId, params, onUpdate, ctx, signal)
@@ -56,7 +56,8 @@ CustomTool.execute(toolCallId, params, onUpdate, ctx, signal)
 
 - Duplicate resolved paths are deduplicated.
 - Tool name conflicts are rejected against built-ins and already-loaded custom tools.
-- `.md` and `.json` files are discovered as tool metadata by some providers, but the executable module loader rejects them as runnable tools.
+- Automatic tool-directory scans discover `.ts` and `.js` modules; native OMP discovery also checks immediate subdirectories for `index.ts`. Executable discovery excludes `.d.ts` and filters out metadata and scripts before tool-name deduplication. Declarative metadata such as `.md` and `.json` remains available to capability consumers but is not loaded as executable tools.
+- `.mjs` and `.cjs` modules can be loaded through explicitly configured paths or declared plugin tool entries, but the tool-directory scans above do not discover them automatically. Explicitly configured `.md` or `.json` paths still produce a load error.
 - Relative configured paths are resolved from `cwd`; `~` is expanded.
 
 ## Module contract
@@ -67,43 +68,49 @@ A custom tool module must export a function (default export preferred):
 import type { CustomToolFactory } from "@oh-my-pi/pi-coding-agent";
 
 const factory: CustomToolFactory = (pi) => ({
-	name: "repo_stats",
-	label: "Repo Stats",
-	description: "Counts tracked TypeScript files",
-	parameters: pi.typebox.Type.Object({
-		glob: pi.typebox.Type.Optional(pi.typebox.Type.String({ default: "**/*.ts" })),
-	}),
+  name: "repo_stats",
+  label: "Repo Stats",
+  description: "Counts tracked TypeScript files",
+  parameters: pi.zod.object({
+    glob: pi.zod.string().optional(),
+  }),
 
-	async execute(toolCallId, params, onUpdate, ctx, signal) {
-		onUpdate?.({
-			content: [{ type: "text", text: "Scanning files..." }],
-			details: { phase: "scan" },
-		});
+  async execute(toolCallId, params, onUpdate, ctx, signal) {
+    onUpdate?.({
+      content: [{ type: "text", text: "Scanning files..." }],
+      details: { phase: "scan" },
+    });
 
-		const result = await pi.exec("git", ["ls-files", params.glob ?? "**/*.ts"], { signal, cwd: pi.cwd });
-		if (result.killed) {
-			throw new Error("Scan was cancelled");
-		}
-		if (result.code !== 0) {
-			throw new Error(result.stderr || "git ls-files failed");
-		}
+    const result = await pi.exec(
+      "git",
+      ["ls-files", params.glob ?? "**/*.ts"],
+      { signal, cwd: pi.cwd },
+    );
+    if (result.killed) {
+      throw new Error("Scan was cancelled");
+    }
+    if (result.code !== 0) {
+      throw new Error(result.stderr || "git ls-files failed");
+    }
 
-		const files = result.stdout.split("\n").filter(Boolean);
-		return {
-			content: [{ type: "text", text: `Found ${files.length} files` }],
-			details: { count: files.length, sample: files.slice(0, 10) },
-		};
-	},
+    const files = result.stdout.split("\n").filter(Boolean);
+    return {
+      content: [{ type: "text", text: `Found ${files.length} files` }],
+      details: { count: files.length, sample: files.slice(0, 10) },
+    };
+  },
 
-	onSession(event) {
-		if (event.reason === "shutdown") {
-			// cleanup resources if needed
-		}
-	},
+  onSession(event) {
+    if (event.reason === "shutdown") {
+      // cleanup resources if needed
+    }
+  },
 });
 
 export default factory;
 ```
+
+Parameter schemas may use the Zod-compatible omptype builder (`pi.zod`), native omptype builder (`pi.arktype`), or legacy-compatible TypeBox shim (`pi.typebox`) and flow through the shared validation/wire pipeline.
 
 Factory return type:
 
@@ -120,46 +127,51 @@ From `types.ts` and `loader.ts`:
 - `ui`: UI context (can be no-op in headless modes)
 - `hasUI`: `false` in non-interactive flows
 - `logger`: shared file logger
-- `typebox`: injected `@sinclair/typebox`
+- `arktype`: injected omptype `type(...)` builder
+- `typebox`: compatibility shim for legacy TypeBox-style schemas
 - `pi`: injected `@oh-my-pi/pi-coding-agent` exports
-- `pushPendingAction(action)`: register a preview action for hidden `resolve` tool (`docs/resolve-tool-runtime.md`)
+- `pushPendingAction(action)`: stage a preview action that is finalized by writing a plain-text reason to `xd://resolve` or `xd://reject`
 
-Loader starts with a no-op UI context and requires host code to call `setUIContext(...)` when real UI is ready.
+The loader starts with a no-op UI context and requires host code to call `setUIContext(...)` when real UI is ready. If the runtime did not provide a pending-action store, calling `pushPendingAction` throws `Pending action store unavailable for custom tools in this runtime.`
 
 ## Execution contract and typing
 
 `CustomTool.execute` signature:
 
 ```ts
-execute(toolCallId, params, onUpdate, ctx, signal)
+execute(toolCallId, params, onUpdate, ctx, signal);
 ```
 
-- `params` is statically typed from your TypeBox schema via `Static<TParams>`.
+- `params` is statically typed from its omptype or TypeBox schema via `Static<TParams>`.
 - Runtime argument validation happens before execution in the agent loop.
 - `onUpdate` emits partial results for UI streaming.
-- `ctx` includes session/model state and an `abort()` helper.
-- `signal` carries cancellation.
+- `ctx` includes `sessionManager`, `modelRegistry`, current `model`, `isIdle()`, `hasQueuedMessages()`, `abort()`, and optional `settings`, `fetch`, `localProtocolOptions`, and `autoApprove`.
+- `signal` carries cancellation and may be `undefined`.
 
-`CustomToolAdapter` bridges this to the agent tool interface and forwards calls in the correct argument order.
+The session bootstrap bridge converts custom tools to extension `ToolDefinition`s and forwards calls in the correct argument order. `CustomToolAdapter` remains available to library consumers that directly adapt a custom tool to the agent tool interface.
+
+Tool definitions may also declare `strict`, `hidden`, `loadMode`, `deferrable`, `mcpServerName`, `mcpToolName`, and `approval`. When `loadMode` is omitted, custom tool names default to `"discoverable"` except for the canonical essential built-in names (`read`, `write`, `bash`, `edit`, `glob`, `computer`, `eval`, `task`, `hub`, `learn`, and `manage_skill`), which default to `"essential"` so wrappers or re-registrations do not demote them. An explicit `loadMode` always wins; use `"essential"` to keep any other tool top-level. Although the public `CustomTool` type also declares `formatApprovalDetails`, the SDK/discovery bridge does not propagate that callback into the registered tool definition, so it cannot customize approval details on the normal integration paths.
 
 ## How tools are exposed to the model
 
-- Tools are wrapped into `AgentTool` instances (`CustomToolAdapter` or extension wrappers).
+- Session bootstrap wraps included SDK-provided and discovered custom tools as extension tool definitions; library consumers may instead use `CustomToolAdapter` directly.
 - They are inserted into the session tool registry by name.
-- In SDK bootstrap, custom and extension-registered tools are force-included in the initial active set.
+- In unrestricted SDK bootstrap, custom and extension-registered tools are force-included in the initial active set. Restricted sessions exclude SDK-provided custom tools unless `allowRestrictedCustomTools: true`, and expose an opted-in custom tool only when its name appears in `toolNames`.
 - CLI `--tools` currently validates only built-in tool names; custom tool inclusion is handled through discovery/registration paths and SDK options.
 
 ## Rendering hooks
 
 Optional rendering hooks:
 
-- `renderCall(args, theme)`
-- `renderResult(result, options, theme, args?)`
+- `renderCall(args, options, theme)`
+- `renderResult(result, options, theme)`
+
+The normal SDK and filesystem-discovery paths wrap custom tools as extensions. On those paths, `renderResult` receives only the three arguments above; the bridge does not forward the original tool arguments. The public `CustomTool` type retains an optional fourth `args` parameter for direct `CustomToolAdapter` consumers.
 
 Runtime behavior in TUI:
 
 - If hooks exist, tool output is rendered inside a `Box` container.
-- `renderResult` receives `{ expanded, isPartial, spinnerFrame? }`.
+- `renderResult` receives `{ expanded, isPartial, spinnerFrame? }` as its `options` argument.
 - Renderer errors are caught and logged; UI falls back to default text rendering.
 
 ## Session/state handling

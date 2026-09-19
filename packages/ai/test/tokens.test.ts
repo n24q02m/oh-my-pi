@@ -1,7 +1,7 @@
 import { describe, expect, it } from "bun:test";
-import { getBundledModel } from "@oh-my-pi/pi-ai/models";
 import { stream } from "@oh-my-pi/pi-ai/stream";
 import type { Api, Context, Model, OptionsForApi } from "@oh-my-pi/pi-ai/types";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
@@ -83,7 +83,7 @@ describe("Token Statistics on Abort", () => {
 
 	describe.skipIf(!e2eApiKey("OPENAI_API_KEY"))("OpenAI Completions Provider", () => {
 		const llm: Model<"openai-completions"> = {
-			...getBundledModel("openai", "gpt-4o-mini")!,
+			...(getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">)!,
 			api: "openai-completions",
 		};
 
@@ -97,7 +97,7 @@ describe("Token Statistics on Abort", () => {
 	});
 
 	describe.skipIf(!e2eApiKey("OPENAI_API_KEY"))("OpenAI Responses Provider", () => {
-		const llm = getBundledModel("openai", "gpt-5-mini");
+		const llm = getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">;
 
 		it(
 			"should include token stats when aborted mid-stream",

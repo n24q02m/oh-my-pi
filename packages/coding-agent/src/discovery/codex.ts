@@ -7,8 +7,8 @@
  * User directory: ~/.codex
  */
 import * as path from "node:path";
-import { logger } from "@oh-my-pi/pi-utils";
-import { registerProvider } from "../capability";
+import { logger, parseFrontmatter } from "@oh-my-pi/pi-utils";
+import { isUserSourceEnabled, registerProvider } from "../capability";
 import type { ContextFile } from "../capability/context-file";
 import { contextFileCapability } from "../capability/context-file";
 import { type ExtensionModule, extensionModuleCapability } from "../capability/extension-module";
@@ -21,22 +21,24 @@ import type { Prompt } from "../capability/prompt";
 import { promptCapability } from "../capability/prompt";
 import type { Settings } from "../capability/settings";
 import { settingsCapability } from "../capability/settings";
+import { settings as activeSettings } from "../config/settings";
 import type { Skill } from "../capability/skill";
 import { skillCapability } from "../capability/skill";
-import type { SlashCommand } from "../capability/slash-command";
-import { slashCommandCapability } from "../capability/slash-command";
+import { type SlashCommand, slashCommandCapability } from "../capability/slash-command";
+import { slashCommandFrontmatterDisplay } from "@oh-my-pi/pi-tui/overlays/extensions/inspector-model";
 import type { CustomTool } from "../capability/tool";
 import { toolCapability } from "../capability/tool";
 import type { LoadContext, LoadResult, SourceMeta } from "../capability/types";
-import { parseFrontmatter } from "../utils/frontmatter";
+
 import {
+	buildExtensionModuleItems,
 	createSourceMeta,
 	discoverExtensionModulePaths,
-	getExtensionNameFromPath,
 	loadFilesFromDir,
 	SOURCE_PATHS,
 	scanSkillsFromDir,
 } from "./helpers";
+import { resolvePluginStdioPaths } from "./substitute-plugin-root";
 
 const PROVIDER_ID = "codex";
 const DISPLAY_NAME = "OpenAI Codex";
@@ -44,6 +46,25 @@ const PRIORITY = 70;
 
 function getProjectCodexDir(ctx: LoadContext): string {
 	return path.join(ctx.cwd, ".codex");
+}
+
+/**
+ * `~/.codex`, or null when not opted in. `capabilityToggle` is a legacy
+ * per-capability opt-in (`skills.enableCodexUser`) admitting only that
+ * capability's directory.
+ */
+function getUserCodexDir(ctx: LoadContext, capabilityToggle = false): string | null {
+	if (!capabilityToggle && !isUserSourceEnabled("codex", ctx)) return null;
+	return path.join(ctx.home, SOURCE_PATHS.codex.userBase);
+}
+
+/** Legacy `skills.enableCodexUser` toggle; off by default and without initialized settings. */
+function readCodexUserSkillsToggle(): boolean {
+	try {
+		return activeSettings.get("skills.enableCodexUser") === true;
+	} catch {
+		return false;
+	}
 }
 
 // =============================================================================
@@ -54,8 +75,11 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 	const items: ContextFile[] = [];
 	const warnings: string[] = [];
 
+	const userDir = getUserCodexDir(ctx);
+	if (!userDir) return { items, warnings };
+
 	// User level only: ~/.codex/AGENTS.md
-	const agentsMd = path.join(ctx.home, SOURCE_PATHS.codex.userBase, "AGENTS.md");
+	const agentsMd = path.join(userDir, "AGENTS.md");
 	const agentsContent = await readFile(agentsMd);
 	if (agentsContent) {
 		items.push({
@@ -76,33 +100,39 @@ async function loadContextFiles(ctx: LoadContext): Promise<LoadResult<ContextFil
 async function loadMCPServers(ctx: LoadContext): Promise<LoadResult<MCPServer>> {
 	const warnings: string[] = [];
 
-	const userConfigPath = path.join(ctx.home, SOURCE_PATHS.codex.userBase, "config.toml");
+	const userDir = getUserCodexDir(ctx);
+	const userConfigPath = userDir ? path.join(userDir, "config.toml") : null;
 	const codexDir = getProjectCodexDir(ctx);
 	const projectConfigPath = path.join(codexDir, "config.toml");
 
 	const [userConfig, projectConfig] = await Promise.all([
-		loadTomlConfig(ctx, userConfigPath),
+		userConfigPath ? loadTomlConfig(ctx, userConfigPath) : Promise.resolve(null),
 		loadTomlConfig(ctx, projectConfigPath),
 	]);
 
 	const items: MCPServer[] = [];
-	if (userConfig) {
-		const servers = extractMCPServersFromToml(userConfig);
-		for (const [name, config] of Object.entries(servers)) {
-			items.push({
-				name,
-				...config,
-				_source: createSourceMeta(PROVIDER_ID, userConfigPath, "user"),
-			});
-		}
-	}
+	// Capability dedupe is first-wins, including suppressed items claiming their
+	// key. Load project entries first so a project `enabled = false` keeps a
+	// same-named user server disabled.
 	if (projectConfig) {
-		const servers = extractMCPServersFromToml(projectConfig);
-		for (const [name, config] of Object.entries(servers)) {
+		const servers = extractMCPServersFromToml(projectConfig, path.dirname(projectConfigPath));
+		for (const name in servers) {
+			const config = servers[name];
 			items.push({
 				name,
 				...config,
 				_source: createSourceMeta(PROVIDER_ID, projectConfigPath, "project"),
+			});
+		}
+	}
+	if (userConfig && userConfigPath) {
+		const servers = extractMCPServersFromToml(userConfig, path.dirname(userConfigPath));
+		for (const name in servers) {
+			const config = servers[name];
+			items.push({
+				name,
+				...config,
+				_source: createSourceMeta(PROVIDER_ID, userConfigPath, "user"),
 			});
 		}
 	}
@@ -124,6 +154,7 @@ async function loadTomlConfig(_ctx: LoadContext, path: string): Promise<Record<s
 
 /** Codex MCP server config format (from config.toml) */
 interface CodexMCPConfig {
+	enabled?: boolean;
 	command?: string;
 	args?: string[];
 	env?: Record<string, string>;
@@ -139,7 +170,10 @@ interface CodexMCPConfig {
 	disabled_tools?: string[];
 }
 
-function extractMCPServersFromToml(toml: Record<string, unknown>): Record<string, Partial<MCPServer>> {
+function extractMCPServersFromToml(
+	toml: Record<string, unknown>,
+	configDir: string,
+): Record<string, Partial<MCPServer>> {
 	// Check for [mcp_servers.*] sections (Codex format)
 	if (!toml.mcp_servers || typeof toml.mcp_servers !== "object") {
 		return {};
@@ -148,11 +182,24 @@ function extractMCPServersFromToml(toml: Record<string, unknown>): Record<string
 	const codexServers = toml.mcp_servers as Record<string, CodexMCPConfig>;
 	const result: Record<string, Partial<MCPServer>> = {};
 
-	for (const [name, config] of Object.entries(codexServers)) {
+	for (const name in codexServers) {
+		const config = codexServers[name];
+		// Root relative cwd/command against the Codex config directory. Codex
+		// spawns the process with the resolved cwd, so a relative command is
+		// resolved by the OS from there — pass "cwd" so e.g. cwd="server",
+		// command="./bin/mcp" resolves to <configDir>/server/bin/mcp.
+		const rooted = resolvePluginStdioPaths({ command: config.command, cwd: config.cwd }, configDir, "cwd");
 		const server: Partial<MCPServer> = {
-			command: config.command,
+			// Carry `enabled: false` through rather than dropping the entry: the
+			// central MCP loader (`loadAllMCPConfigs`) suppresses disabled servers
+			// so they still claim their dedupe key (keeping a same-named,
+			// lower-priority source disabled) and remain overridable via the user
+			// force-enable allowlist. Dropping here would defeat both.
+			...(config.enabled === false && { enabled: false }),
+			...(rooted.command !== undefined && { command: rooted.command }),
 			args: config.args,
 			url: config.url,
+			...(rooted.cwd !== undefined && { cwd: rooted.cwd }),
 		};
 
 		// Build env by merging explicit env and forwarded env_vars
@@ -197,6 +244,10 @@ function extractMCPServersFromToml(toml: Record<string, unknown>): Record<string
 		}
 		// Note: validation of transport vs endpoint is handled by mcpCapability.validate()
 
+		// Map Codex tool_timeout_sec (seconds) to MCPServer timeout (milliseconds)
+		if (typeof config.tool_timeout_sec === "number" && config.tool_timeout_sec > 0) {
+			server.timeout = config.tool_timeout_sec * 1000;
+		}
 		result[name] = server;
 	}
 
@@ -208,16 +259,19 @@ function extractMCPServersFromToml(toml: Record<string, unknown>): Record<string
 // =============================================================================
 
 async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
-	const userSkillsDir = path.join(ctx.home, SOURCE_PATHS.codex.userBase, "skills");
+	const userDir = getUserCodexDir(ctx, readCodexUserSkillsToggle());
+	const userSkillsDir = userDir ? path.join(userDir, "skills") : null;
 	const codexDir = getProjectCodexDir(ctx);
 	const projectSkillsDir = path.join(codexDir, "skills");
 
 	const results = await Promise.all([
-		scanSkillsFromDir(ctx, {
-			dir: userSkillsDir,
-			providerId: PROVIDER_ID,
-			level: "user",
-		}),
+		userSkillsDir
+			? scanSkillsFromDir(ctx, {
+					dir: userSkillsDir,
+					providerId: PROVIDER_ID,
+					level: "user",
+				})
+			: Promise.resolve({ items: [] as Skill[], warnings: [] as string[] }),
 		scanSkillsFromDir(ctx, {
 			dir: projectSkillsDir,
 			providerId: PROVIDER_ID,
@@ -238,29 +292,17 @@ async function loadSkills(ctx: LoadContext): Promise<LoadResult<Skill>> {
 async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<ExtensionModule>> {
 	const warnings: string[] = [];
 
-	const userExtensionsDir = path.join(ctx.home, SOURCE_PATHS.codex.userBase, "extensions");
+	const userDir = getUserCodexDir(ctx);
+	const userExtensionsDir = userDir ? path.join(userDir, "extensions") : null;
 	const codexDir = getProjectCodexDir(ctx);
 	const projectExtensionsDir = path.join(codexDir, "extensions");
 
 	const [userPaths, projectPaths] = await Promise.all([
-		discoverExtensionModulePaths(ctx, userExtensionsDir),
+		userExtensionsDir ? discoverExtensionModulePaths(ctx, userExtensionsDir) : Promise.resolve([]),
 		discoverExtensionModulePaths(ctx, projectExtensionsDir),
 	]);
 
-	const items: ExtensionModule[] = [
-		...userPaths.map(extPath => ({
-			name: getExtensionNameFromPath(extPath),
-			path: extPath,
-			level: "user" as const,
-			_source: createSourceMeta(PROVIDER_ID, extPath, "user"),
-		})),
-		...projectPaths.map(extPath => ({
-			name: getExtensionNameFromPath(extPath),
-			path: extPath,
-			level: "project" as const,
-			_source: createSourceMeta(PROVIDER_ID, extPath, "project"),
-		})),
-	];
+	const items = buildExtensionModuleItems(PROVIDER_ID, userPaths, projectPaths);
 
 	return { items, warnings };
 }
@@ -270,7 +312,8 @@ async function loadExtensionModules(ctx: LoadContext): Promise<LoadResult<Extens
 // =============================================================================
 
 async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashCommand>> {
-	const userCommandsDir = path.join(ctx.home, SOURCE_PATHS.codex.userBase, "commands");
+	const userDir = getUserCodexDir(ctx);
+	const userCommandsDir = userDir ? path.join(userDir, "commands") : null;
 	const codexDir = getProjectCodexDir(ctx);
 	const projectCommandsDir = path.join(codexDir, "commands");
 
@@ -282,16 +325,19 @@ async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashComm
 				name: String(commandName),
 				path,
 				content: body,
+				...slashCommandFrontmatterDisplay(frontmatter),
 				level,
 				_source: source,
 			};
 		};
 
 	const results = await Promise.all([
-		loadFilesFromDir(ctx, userCommandsDir, PROVIDER_ID, "user", {
-			extensions: ["md"],
-			transform: transformCommand("user"),
-		}),
+		userCommandsDir
+			? loadFilesFromDir(ctx, userCommandsDir, PROVIDER_ID, "user", {
+					extensions: ["md"],
+					transform: transformCommand("user"),
+				})
+			: Promise.resolve({ items: [] as SlashCommand[], warnings: [] as string[] }),
 		loadFilesFromDir(ctx, projectCommandsDir, PROVIDER_ID, "project", {
 			extensions: ["md"],
 			transform: transformCommand("project"),
@@ -309,7 +355,8 @@ async function loadSlashCommands(ctx: LoadContext): Promise<LoadResult<SlashComm
 // =============================================================================
 
 async function loadPrompts(ctx: LoadContext): Promise<LoadResult<Prompt>> {
-	const userPromptsDir = path.join(ctx.home, SOURCE_PATHS.codex.userBase, "prompts");
+	const userDir = getUserCodexDir(ctx);
+	const userPromptsDir = userDir ? path.join(userDir, "prompts") : null;
 	const codexDir = getProjectCodexDir(ctx);
 	const projectPromptsDir = path.join(codexDir, "prompts");
 
@@ -326,10 +373,12 @@ async function loadPrompts(ctx: LoadContext): Promise<LoadResult<Prompt>> {
 	};
 
 	const results = await Promise.all([
-		loadFilesFromDir(ctx, userPromptsDir, PROVIDER_ID, "user", {
-			extensions: ["md"],
-			transform: transformPrompt,
-		}),
+		userPromptsDir
+			? loadFilesFromDir(ctx, userPromptsDir, PROVIDER_ID, "user", {
+					extensions: ["md"],
+					transform: transformPrompt,
+				})
+			: Promise.resolve({ items: [] as Prompt[], warnings: [] as string[] }),
 		loadFilesFromDir(ctx, projectPromptsDir, PROVIDER_ID, "project", {
 			extensions: ["md"],
 			transform: transformPrompt,
@@ -347,16 +396,25 @@ async function loadPrompts(ctx: LoadContext): Promise<LoadResult<Prompt>> {
 // =============================================================================
 
 async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
-	const userHooksDir = path.join(ctx.home, SOURCE_PATHS.codex.userBase, "hooks");
+	const userDir = getUserCodexDir(ctx);
+	const userHooksDir = userDir ? path.join(userDir, "hooks") : null;
 	const codexDir = getProjectCodexDir(ctx);
 	const projectHooksDir = path.join(codexDir, "hooks");
 
+	// OMP hooks must be named `pre-<tool>.<ts|js>` or `post-<tool>.<ts|js>`.
+	// Files without that prefix are not OMP hooks (e.g. the standalone Codex
+	// hook scripts users keep alongside) — silently dropping the prefix and
+	// defaulting to `pre:<basename>` caused those scripts to be imported as
+	// extension factories and any top-level `process.exit()` killed startup
+	// (#3680).
 	const transformHook =
-		(level: "user" | "project") => (name: string, _content: string, path: string, source: SourceMeta) => {
+		(level: "user" | "project") =>
+		(name: string, _content: string, path: string, source: SourceMeta): Hook | null => {
 			const baseName = name.replace(/\.(ts|js)$/, "");
 			const match = baseName.match(/^(pre|post)-(.+)$/);
-			const hookType = (match?.[1] as "pre" | "post") || "pre";
-			const toolName = match?.[2] || baseName;
+			if (!match) return null;
+			const hookType = match[1] as "pre" | "post";
+			const toolName = match[2];
 			return {
 				name,
 				path,
@@ -368,11 +426,13 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 		};
 
 	const results = await Promise.all([
-		loadFilesFromDir(ctx, userHooksDir, PROVIDER_ID, "user", {
-			extensions: ["ts", "js"],
-			transform: transformHook("user"),
-		}),
-		loadFilesFromDir(ctx, projectHooksDir, PROVIDER_ID, "project", {
+		userHooksDir
+			? loadFilesFromDir<Hook>(ctx, userHooksDir, PROVIDER_ID, "user", {
+					extensions: ["ts", "js"],
+					transform: transformHook("user"),
+				})
+			: Promise.resolve({ items: [] as Hook[], warnings: [] as string[] }),
+		loadFilesFromDir<Hook>(ctx, projectHooksDir, PROVIDER_ID, "project", {
 			extensions: ["ts", "js"],
 			transform: transformHook("project"),
 		}),
@@ -389,7 +449,8 @@ async function loadHooks(ctx: LoadContext): Promise<LoadResult<Hook>> {
 // =============================================================================
 
 async function loadTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
-	const userToolsDir = path.join(ctx.home, SOURCE_PATHS.codex.userBase, "tools");
+	const userDir = getUserCodexDir(ctx);
+	const userToolsDir = userDir ? path.join(userDir, "tools") : null;
 	const codexDir = getProjectCodexDir(ctx);
 	const projectToolsDir = path.join(codexDir, "tools");
 
@@ -405,10 +466,12 @@ async function loadTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
 		};
 
 	const results = await Promise.all([
-		loadFilesFromDir(ctx, userToolsDir, PROVIDER_ID, "user", {
-			extensions: ["ts", "js"],
-			transform: transformTool("user"),
-		}),
+		userToolsDir
+			? loadFilesFromDir(ctx, userToolsDir, PROVIDER_ID, "user", {
+					extensions: ["ts", "js"],
+					transform: transformTool("user"),
+				})
+			: Promise.resolve({ items: [] as CustomTool[], warnings: [] as string[] }),
 		loadFilesFromDir(ctx, projectToolsDir, PROVIDER_ID, "project", {
 			extensions: ["ts", "js"],
 			transform: transformTool("project"),
@@ -428,17 +491,18 @@ async function loadTools(ctx: LoadContext): Promise<LoadResult<CustomTool>> {
 async function loadSettings(ctx: LoadContext): Promise<LoadResult<Settings>> {
 	const warnings: string[] = [];
 
-	const userConfigPath = path.join(ctx.home, SOURCE_PATHS.codex.userBase, "config.toml");
+	const userDir = getUserCodexDir(ctx);
+	const userConfigPath = userDir ? path.join(userDir, "config.toml") : null;
 	const codexDir = getProjectCodexDir(ctx);
 	const projectConfigPath = path.join(codexDir, "config.toml");
 
 	const [userConfig, projectConfig] = await Promise.all([
-		loadTomlConfig(ctx, userConfigPath),
+		userConfigPath ? loadTomlConfig(ctx, userConfigPath) : Promise.resolve(null),
 		loadTomlConfig(ctx, projectConfigPath),
 	]);
 
 	const items: Settings[] = [];
-	if (userConfig) {
+	if (userConfig && userConfigPath) {
 		items.push({
 			...userConfig,
 			_source: createSourceMeta(PROVIDER_ID, userConfigPath, "user"),

@@ -5,58 +5,20 @@
  * This handles AGENTS.md files that live in project root (not in config directories
  * like .codex/ or .gemini/, which are handled by their respective providers).
  */
-import * as path from "node:path";
 import { registerProvider } from "../capability";
 import { type ContextFile, contextFileCapability } from "../capability/context-file";
-import { readFile } from "../capability/fs";
 import type { LoadContext, LoadResult } from "../capability/types";
-import { calculateDepth, createSourceMeta } from "./helpers";
+import { loadStandaloneContextFiles } from "./helpers";
 
 const PROVIDER_ID = "agents-md";
 const DISPLAY_NAME = "AGENTS.md";
-const MAX_DEPTH = 20; // Prevent walking up excessively far from cwd
 
 /**
- * Load standalone AGENTS.md files.
+ * Load standalone AGENTS.md files by walking up from cwd
+ * (see {@link loadStandaloneContextFiles}).
  */
-async function loadAgentsMd(ctx: LoadContext): Promise<LoadResult<ContextFile>> {
-	const items: ContextFile[] = [];
-	const warnings: string[] = [];
-
-	// Walk up from cwd looking for AGENTS.md files
-	let current = ctx.cwd;
-	let depth = 0;
-
-	while (depth < MAX_DEPTH) {
-		const candidate = path.join(current, "AGENTS.md");
-		const content = await readFile(candidate);
-
-		if (content !== null) {
-			const parent = path.dirname(candidate);
-			const baseName = parent.split(path.sep).pop() ?? "";
-
-			if (!baseName.startsWith(".")) {
-				const fileDir = path.dirname(candidate);
-				const calculatedDepth = calculateDepth(ctx.cwd, fileDir, path.sep);
-
-				items.push({
-					path: candidate,
-					content,
-					level: "project",
-					depth: calculatedDepth,
-					_source: createSourceMeta(PROVIDER_ID, candidate, "project"),
-				});
-			}
-		}
-
-		// Move to parent directory
-		const parent = path.dirname(current);
-		if (parent === current) break; // Reached filesystem root
-		current = parent;
-		depth++;
-	}
-
-	return { items, warnings };
+export async function loadAgentsMd(ctx: LoadContext): Promise<LoadResult<ContextFile>> {
+	return loadStandaloneContextFiles(ctx, PROVIDER_ID, "AGENTS.md");
 }
 
 registerProvider(contextFileCapability.id, {

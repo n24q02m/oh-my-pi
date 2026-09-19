@@ -1,19 +1,87 @@
-import { $env, logger } from "@oh-my-pi/pi-utils";
-import type { TSchema } from "@sinclair/typebox";
+import type { TSchema } from "@oh-my-pi/pi-ai";
+import { $env, isRecord, logger } from "@oh-my-pi/pi-utils";
 import type { CustomTool, CustomToolResult } from "../extensibility/custom-tools/types";
-import { callMCP } from "../mcp/json-rpc";
-import type {
-	ExaRenderDetails,
-	ExaSearchResponse,
-	MCPCallResponse,
-	MCPTool,
-	MCPToolsResponse,
-	MCPToolWrapperConfig,
-} from "./types";
+import { type CallMcpOptions, callMCP } from "../mcp/json-rpc";
+import type { ExaSearchResponse, MCPTool, MCPToolWrapperConfig } from "./types";
+
+type MCPWrappedToolDetails = {
+	response?: ExaSearchResponse;
+	error?: string;
+	toolName?: string;
+	raw?: unknown;
+};
 
 /** Find EXA_API_KEY from Bun.env or .env files */
 export function findApiKey(): string | null {
 	return $env.EXA_API_KEY;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+	return isRecord(value) ? value : null;
+}
+
+function isMcpTool(value: unknown): value is MCPTool {
+	if (!isRecord(value)) return false;
+	return (
+		typeof value.name === "string" &&
+		(value.description === undefined || typeof value.description === "string") &&
+		isRecord(value.inputSchema)
+	);
+}
+
+function toolsFromMcpResult(result: unknown): MCPTool[] {
+	if (!isRecord(result) || !Array.isArray(result.tools)) return [];
+	return result.tools.filter(isMcpTool);
+}
+
+function parseJsonContent(text: string): unknown | null {
+	try {
+		return JSON.parse(text);
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Normalize tools/call payloads across MCP servers.
+ *
+ * Exa currently returns different shapes depending on deployment/environment:
+ * - direct payload in result
+ * - structured payload under result.structuredContent / result.data / result.result
+ * - JSON payload embedded as text in result.content[]
+ */
+function normalizeMcpToolPayload(payload: unknown): unknown {
+	const candidates: unknown[] = [];
+	const root = asRecord(payload);
+
+	if (root) {
+		if (root.structuredContent !== undefined) candidates.push(root.structuredContent);
+		if (root.data !== undefined) candidates.push(root.data);
+		if (root.result !== undefined) candidates.push(root.result);
+		candidates.push(root);
+
+		const content = root.content;
+		if (Array.isArray(content)) {
+			for (const item of content) {
+				const part = asRecord(item);
+				if (!part) continue;
+				const text = part.text;
+				if (typeof text !== "string" || text.trim().length === 0) continue;
+				const parsed = parseJsonContent(text);
+				if (parsed !== null) candidates.push(parsed);
+			}
+		}
+	} else {
+		candidates.push(payload);
+	}
+
+	for (const candidate of candidates) {
+		if (isSearchResponse(candidate)) {
+			return candidate;
+		}
+	}
+
+	return payload;
 }
 
 /** Fetch available tools from Exa MCP */
@@ -22,27 +90,27 @@ export async function fetchExaTools(apiKey: string | null, toolNames: string[]):
 	if (apiKey) params.set("exaApiKey", apiKey);
 	params.set("toolNames", toolNames.join(","));
 	const url = `https://mcp.exa.ai/mcp?${params.toString()}`;
-	const response = (await callMCP(url, "tools/list")) as MCPToolsResponse;
+	const response = await callMCP(url, "tools/list");
 
 	if (response.error) {
 		logger.error("MCP tools/list error", { toolNames, error: response.error });
 		throw new Error(`MCP error: ${response.error.message}`);
 	}
 
-	return response.result?.tools ?? [];
+	return toolsFromMcpResult(response.result);
 }
 
 /** Fetch available tools from Websets MCP */
 export async function fetchWebsetsTools(apiKey: string): Promise<MCPTool[]> {
 	const url = `https://websetsmcp.exa.ai/mcp?exaApiKey=${encodeURIComponent(apiKey)}`;
-	const response = (await callMCP(url, "tools/list")) as MCPToolsResponse;
+	const response = await callMCP(url, "tools/list");
 
 	if (response.error) {
 		logger.error("Websets MCP tools/list error", { error: response.error });
 		throw new Error(`MCP error: ${response.error.message}`);
 	}
 
-	return response.result?.tools ?? [];
+	return toolsFromMcpResult(response.result);
 }
 
 /** Call a tool on Exa MCP (simplified: toolName as first arg for easier use) */
@@ -50,22 +118,28 @@ export async function callExaTool(
 	toolName: string,
 	args: Record<string, unknown>,
 	apiKey: string | null,
+	options?: CallMcpOptions,
 ): Promise<unknown> {
 	const params = new URLSearchParams();
 	if (apiKey) params.set("exaApiKey", apiKey);
 	params.set("tools", toolName);
 	const url = `https://mcp.exa.ai/mcp?${params.toString()}`;
-	const response = (await callMCP(url, "tools/call", {
-		name: toolName,
-		arguments: args,
-	})) as MCPCallResponse;
+	const response = await callMCP(
+		url,
+		"tools/call",
+		{
+			name: toolName,
+			arguments: args,
+		},
+		options,
+	);
 
 	if (response.error) {
 		logger.error("MCP tools/call error", { toolName, args, error: response.error });
 		throw new Error(`MCP error: ${response.error.message}`);
 	}
 
-	return response.result;
+	return normalizeMcpToolPayload(response.result);
 }
 
 /** Call a tool on Websets MCP */
@@ -75,17 +149,17 @@ export async function callWebsetsTool(
 	args: Record<string, unknown>,
 ): Promise<unknown> {
 	const url = `https://websetsmcp.exa.ai/mcp?exaApiKey=${encodeURIComponent(apiKey)}`;
-	const response = (await callMCP(url, "tools/call", {
+	const response = await callMCP(url, "tools/call", {
 		name: toolName,
 		arguments: args,
-	})) as MCPCallResponse;
+	});
 
 	if (response.error) {
 		logger.error("Websets MCP tools/call error", { toolName, args, error: response.error });
 		throw new Error(`MCP error: ${response.error.message}`);
 	}
 
-	return response.result;
+	return normalizeMcpToolPayload(response.result);
 }
 
 /** Format search results for LLM */
@@ -118,6 +192,79 @@ export function formatSearchResults(data: ExaSearchResponse): string {
 	}
 
 	return output.trim();
+}
+/**
+ * Format a non-search MCP response as human-readable text.
+ * Handles objects, arrays, primitives, and common MCP response shapes.
+ */
+export function formatGenericResponse(data: unknown): string {
+	if (data === null || data === undefined) return "No result.";
+	if (typeof data === "string") return data;
+	if (typeof data === "number" || typeof data === "boolean") return String(data);
+
+	if (Array.isArray(data)) {
+		if (data.length === 0) return "(empty)";
+		const parts: string[] = [];
+		for (let i = 0; i < data.length; i++) {
+			const item = data[i];
+			if (typeof item === "object" && item !== null) {
+				const record = item as Record<string, unknown>;
+				const title = (record.title ?? record.name ?? record.id ?? `Item ${i + 1}`) as string;
+				parts.push(`\n### ${title}`);
+				for (const [k, v] of Object.entries(record)) {
+					if (["title", "name", "id"].includes(k)) continue;
+					parts.push(`- **${k}:** ${formatValue(v)}`);
+				}
+			} else {
+				parts.push(`- ${formatValue(item)}`);
+			}
+		}
+		return parts.join("\n");
+	}
+
+	if (typeof data === "object") {
+		const record = data as Record<string, unknown>;
+		if (record.content && Array.isArray(record.content)) {
+			// MCP-style content array — extract text blocks
+			const texts = record.content
+				.filter(
+					(c: unknown): c is { type: string; text?: string } =>
+						typeof c === "object" && c !== null && (c as Record<string, unknown>)?.type === "text",
+				)
+				.map(c => c.text ?? "")
+				.filter(Boolean);
+			if (texts.length > 0) return texts.join("\n");
+		}
+
+		const lines: string[] = [];
+		for (const [k, v] of Object.entries(record)) {
+			if (k === "content") continue; // handled above
+			if (v === null || v === undefined) continue;
+			if (typeof v === "object") {
+				const formatted = formatGenericResponse(v);
+				if (formatted) lines.push(`- **${k}:**\n${indent(formatted, 2)}`);
+			} else {
+				lines.push(`- **${k}:** ${formatValue(v)}`);
+			}
+		}
+		return lines.join("\n") || "(empty)";
+	}
+
+	return String(data);
+}
+
+function formatValue(v: unknown): string {
+	if (v === null || v === undefined) return "—";
+	if (typeof v === "object") return JSON.stringify(v);
+	return String(v);
+}
+
+function indent(text: string, spaces: number): string {
+	const pad = " ".repeat(spaces);
+	return text
+		.split("\n")
+		.map(line => pad + line)
+		.join("\n");
 }
 
 /** Check if result is a search response */
@@ -162,7 +309,7 @@ export async function fetchMCPToolSchema(
  * This allows tools to be generated from MCP server schemas without hardcoding,
  * reducing drift when MCP servers add new parameters.
  */
-export class MCPWrappedTool implements CustomTool<TSchema, ExaRenderDetails> {
+export class MCPWrappedTool implements CustomTool<TSchema, MCPWrappedToolDetails> {
 	readonly name: string;
 	readonly label: string;
 
@@ -181,9 +328,9 @@ export class MCPWrappedTool implements CustomTool<TSchema, ExaRenderDetails> {
 		_onUpdate?: unknown,
 		_ctx?: unknown,
 		_signal?: AbortSignal,
-	): Promise<CustomToolResult<ExaRenderDetails>> {
+	): Promise<CustomToolResult<MCPWrappedToolDetails>> {
 		try {
-			const apiKey = await findApiKey();
+			const apiKey = findApiKey();
 			// Websets tools require an API key; basic Exa MCP tools work without one
 			if (!apiKey && this.config.isWebsetsTool) {
 				return {
@@ -205,7 +352,7 @@ export class MCPWrappedTool implements CustomTool<TSchema, ExaRenderDetails> {
 			}
 
 			return {
-				content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }],
+				content: [{ type: "text" as const, text: formatGenericResponse(response) }],
 				details: { raw: response, toolName: this.config.name },
 			};
 		} catch (error) {

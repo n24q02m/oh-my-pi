@@ -1,15 +1,23 @@
 /**
- * Process @file CLI arguments into text content and image attachments
+ * Process @file CLI arguments into text, document content, and image attachments
  */
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { getProjectDir, isEnoent } from "@oh-my-pi/pi-utils";
-import chalk from "chalk";
+import { getProjectDir, isEnoent, readImageMetadata } from "@oh-my-pi/pi-utils";
+import chalk from "@oh-my-pi/pi-utils/chalk";
 import { resolveReadPath } from "../tools/path-utils";
-import { formatBytes } from "../tools/render-utils";
+import { formatBytes } from "@oh-my-pi/pi-tui/render/render-utils";
 import { formatDimensionNote, resizeImage } from "../utils/image-resize";
-import { detectSupportedImageMimeTypeFromFile } from "../utils/mime";
+import { CONVERTIBLE_EXTENSIONS, convertFileWithMarkit } from "../utils/markit";
+import {
+	VideoError,
+	buildVideoContactSheetPng,
+	formatVideoDetails,
+	probeVideo,
+	videoMimeForPath,
+} from "../utils/video";
+import { createVideoPreviewImage, isVideoPath } from "@oh-my-pi/pi-tui/prompt/video";
 
 // Keep CLI startup responsive and avoid OOM when users pass huge files.
 // If a file exceeds these limits, we include it as a path-only <file/> block.
@@ -26,7 +34,7 @@ export interface ProcessFileOptions {
 	autoResizeImages?: boolean;
 }
 
-/** Process @file arguments into text content and image attachments */
+/** Process @file arguments into text, document content, and image attachments */
 export async function processFileArguments(fileArgs: string[], options?: ProcessFileOptions): Promise<ProcessedFiles> {
 	const autoResizeImages = options?.autoResizeImages ?? true;
 	let text = "";
@@ -42,7 +50,31 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 			process.exit(1);
 		}
 
-		const mimeType = await detectSupportedImageMimeTypeFromFile(absolutePath);
+		const imageMetadata = await readImageMetadata(absolutePath);
+		const mimeType = imageMetadata?.mimeType;
+		const ext = path.extname(absolutePath).toLowerCase();
+		if (isVideoPath(absolutePath)) {
+			try {
+				const meta = await probeVideo(absolutePath);
+				const sheet = await buildVideoContactSheetPng(absolutePath, meta);
+				let attachment: ImageContent = { type: "image", data: sheet.png.data, mimeType: sheet.png.mimeType };
+				if (autoResizeImages) {
+					try {
+						const resized = await resizeImage(attachment);
+						attachment = { type: "image", mimeType: resized.mimeType, data: resized.data };
+					} catch {
+						// Keep the extracted sheet when resize fails.
+					}
+				}
+				images.push(createVideoPreviewImage(attachment, absolutePath));
+				const details = formatVideoDetails(absolutePath, meta, stat.size, videoMimeForPath(absolutePath));
+				text += `<file name="${absolutePath}">\n${details}\nPreview grid: ${sheet.thumbs} frames (${sheet.cols}x${sheet.rows})\n</file>\n`;
+			} catch (error) {
+				const reason = error instanceof VideoError ? error.message : "video preview failed";
+				text += `<file name="${absolutePath}">(skipped: ${reason})</file>\n`;
+			}
+			continue;
+		}
 		const maxBytes = mimeType ? MAX_CLI_IMAGE_BYTES : MAX_CLI_TEXT_BYTES;
 		if (stat.size > maxBytes) {
 			console.error(
@@ -105,6 +137,13 @@ export async function processFileArguments(fileArgs: string[], options?: Process
 				text += `<file name="${absolutePath}">${dimensionNote}</file>\n`;
 			} else {
 				text += `<file name="${absolutePath}"></file>\n`;
+			}
+		} else if (CONVERTIBLE_EXTENSIONS.has(ext)) {
+			const result = await convertFileWithMarkit(absolutePath);
+			if (result.ok) {
+				text += `<file name="${absolutePath}">\n${result.content}\n</file>\n`;
+			} else {
+				text += `<file name="${absolutePath}">[Cannot read ${ext} file: ${result.error || "conversion failed"}]</file>\n`;
 			}
 		} else {
 			// Handle text file

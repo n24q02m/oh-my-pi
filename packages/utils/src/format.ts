@@ -8,7 +8,8 @@ const DAY = 24 * HOUR;
  * Examples: "123ms", "1.5s", "30m15s", "2h30m", "3d2h"
  */
 export function formatDuration(ms: number): string {
-	if (ms < SEC) return `${ms}ms`;
+	if (!Number.isFinite(ms) || ms <= 0) return "0ms";
+	if (ms < SEC) return `${Math.floor(ms)}ms`;
 	if (ms < MIN) return `${(ms / SEC).toFixed(1)}s`;
 	if (ms < HOUR) {
 		const mins = Math.floor(ms / MIN);
@@ -27,17 +28,23 @@ export function formatDuration(ms: number): string {
 
 /**
  * Format a number with K/M/B suffix for compact display.
- * Uses 1 decimal for small leading digits, rounded otherwise.
- * Examples: "999", "1.5K", "25K", "1.5M", "25M", "1.5B"
+ * Uses 1 decimal for small leading digits when non-zero, rounded otherwise.
+ * Examples: "999", "1K", "1.5K", "25K", "1M", "1.5M", "25M", "1.5B"
  */
 export function formatNumber(n: number): string {
 	if (n < 1_000) return n.toString();
-	if (n < 10_000) return `${(n / 1_000).toFixed(1)}K`;
+	if (n < 10_000) return `${trim1(n / 1_000)}K`;
 	if (n < 1_000_000) return `${Math.round(n / 1_000)}K`;
-	if (n < 10_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+	if (n < 10_000_000) return `${trim1(n / 1_000_000)}M`;
 	if (n < 1_000_000_000) return `${Math.round(n / 1_000_000)}M`;
-	if (n < 10_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+	if (n < 10_000_000_000) return `${trim1(n / 1_000_000_000)}B`;
 	return `${Math.round(n / 1_000_000_000)}B`;
+}
+
+/** Format with up to 1 decimal place, dropping trailing `.0`. */
+function trim1(n: number): string {
+	const s = n.toFixed(1);
+	return s.endsWith(".0") ? s.slice(0, -2) : s;
 }
 
 /**
@@ -49,6 +56,22 @@ export function formatBytes(bytes: number): string {
 	if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
 	if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 	return `${(bytes / (1024 * 1024 * 1024)).toFixed(1)}GB`;
+}
+
+/**
+ * Count `\n` code units via native `indexOf` — no split array, roughly an
+ * order of magnitude cheaper than a per-code-unit loop on multi-MiB text.
+ * Line-count semantics are the caller's (empty text is 0 or 1 lines
+ * depending on the contract).
+ */
+export function countNewlines(text: string): number {
+	let count = 0;
+	let pos = text.indexOf("\n");
+	while (pos !== -1) {
+		count++;
+		pos = text.indexOf("\n", pos + 1);
+	}
+	return count;
 }
 
 /**

@@ -1,2 +1,3 @@
-Generate a very short title (3-6 words) for a coding session based on the user's first message. The title **MUST** capture the main task or topic.
-You **MUST** output ONLY the title, nothing else. You **MUST NOT** include quotes or punctuation at the end.
+Write a ~5 word title using only the task described in the next user message.
+- You MUST ONLY answer with the title, inside the <title> tag.
+- If the message is only a greeting, answer `<title/>`.

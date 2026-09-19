@@ -13,11 +13,11 @@ The theme system drives:
 - syntax highlighting colors used by native highlighter (`@oh-my-pi/pi-natives`)
 - status line segment colors
 
-Primary implementation: `src/modes/theme/theme.ts`.
+Primary implementation: `packages/tui/src/theme/theme.ts`.
 
 ## Theme JSON shape
 
-Theme files are JSON objects validated against the runtime schema in `theme.ts` (`ThemeJsonSchema`) and mirrored by `src/modes/theme/theme-schema.json`.
+Theme files are JSON objects validated against the runtime schema in `theme.ts` (`themeJsonSchema`) and mirrored by `packages/tui/src/theme/theme-schema.json`.
 
 Top-level fields:
 
@@ -36,9 +36,9 @@ Color values accept:
 - variable reference string (resolved through `vars`)
 - empty string (`""`) meaning terminal default (`\x1b[39m` fg, `\x1b[49m` bg)
 
-## Required color tokens (current)
+## Required and optional color tokens
 
-All tokens below are required in `colors`.
+All tokens below are required in `colors` except `thinkingMax`, which is optional for compatibility and falls back to `thinkingXhigh`.
 
 ### Core text and borders (11)
 
@@ -61,11 +61,11 @@ All tokens below are required in `colors`.
 `toolDiffAdded`, `toolDiffRemoved`, `toolDiffContext`,
 `syntaxComment`, `syntaxKeyword`, `syntaxFunction`, `syntaxVariable`, `syntaxString`, `syntaxNumber`, `syntaxType`, `syntaxOperator`, `syntaxPunctuation`
 
-### Mode/thinking borders (8)
+### Mode/thinking borders (8 required, 1 optional)
 
-`thinkingOff`, `thinkingMinimal`, `thinkingLow`, `thinkingMedium`, `thinkingHigh`, `thinkingXhigh`, `bashMode`, `pythonMode`
+`thinkingOff`, `thinkingMinimal`, `thinkingLow`, `thinkingMedium`, `thinkingHigh`, `thinkingXhigh`, optional `thinkingMax`, `bashMode`, `pythonMode`
 
-### Status line segment colors (14)
+### Status line segment colors (13)
 
 `statusLineSep`, `statusLineModel`, `statusLinePath`, `statusLineGitClean`, `statusLineGitDirty`, `statusLineContext`, `statusLineSpend`, `statusLineStaged`, `statusLineDirty`, `statusLineUntracked`, `statusLineOutput`, `statusLineCost`, `statusLineSubagents`
 
@@ -85,6 +85,7 @@ If omitted, export code derives defaults from resolved theme colors.
 
 - `symbols.preset` sets a theme-level default symbol set.
 - `symbols.overrides` can override individual `SymbolKey` values.
+- `symbols.spinnerFrames` overrides the loading spinner frames. Accepts either a flat `string[]` (applied to both spinner types) or an object `{ "status"?: string[], "activity"?: string[] }` to override each type independently. Any type not specified falls back to the symbol preset's default frames. `status` drives the ~12.5fps spinner used by loaders and tool-execution indicators; `activity` drives the ~30fps spinner used by markdown progress bars and similar high-frequency UI.
 
 Runtime precedence:
 
@@ -93,6 +94,16 @@ Runtime precedence:
 3. fallback `"unicode"`
 
 Invalid override keys are ignored and logged (`logger.debug`).
+
+#### Box-drawing borders
+
+All outlined chrome — tool-result frames, overlays, code fences, the editor, the welcome banner — draws with the `boxRound.*` tokens: rounded corners (`╭╮╰╯`) plus tee/cross junctions (`├┤┬┴┼`, which have no rounded Unicode form, so they are sourced from the `boxSharp.*` tokens). Markdown tables are the sole exception and keep the fully sharp `boxSharp.*` set (`┌┐└┘`).
+
+Override behavior follows from that split:
+
+- `boxRound.{topLeft,topRight,bottomLeft,bottomRight,horizontal,vertical}` restyle every border's corners and edges.
+- `boxSharp.{cross,teeDown,teeUp,teeRight,teeLeft}` restyle dividers/junctions everywhere (rounded frames and tables alike).
+- `boxSharp.{topLeft,topRight,bottomLeft,bottomRight}` now affect markdown table corners only.
 
 ## Built-in vs custom theme sources
 
@@ -114,7 +125,7 @@ For custom theme files:
 
 1. read JSON
 2. parse JSON
-3. validate against `ThemeJsonSchema`
+3. validate against `themeJsonSchema`
 4. resolve `vars` references recursively
 5. convert resolved values to ANSI by terminal capability mode
 
@@ -147,6 +158,14 @@ Conversion behavior:
 
 ## Runtime switching behavior
 
+The `theme` export is a live binding, including in bundled extensions. Read it inside rendering callbacks rather than retaining a theme instance across switches. Extension renderer callbacks may also use their supplied theme argument.
+
+```ts
+import { theme } from "@oh-my-pi/pi-coding-agent";
+
+const renderStatus = () => theme.fg("accent", "Ready");
+```
+
 ### Initial theme (`initTheme`)
 
 `main.ts` initializes theme with settings:
@@ -156,12 +175,12 @@ Conversion behavior:
 - `theme.dark`
 - `theme.light`
 
-Auto theme slot selection uses `COLORFGBG` background detection:
+Auto theme slot selection uses terminal appearance in this order:
 
-- parse background index from `COLORFGBG`
-- `< 8` => dark slot (`theme.dark`)
-- `>= 8` => light slot (`theme.light`)
-- parse failure => dark slot
+1. terminal-reported OSC 11 background luminance, unless the macOS/Zellij fallback path is active
+2. `COLORFGBG` background index (`< 8` => dark, `>= 8` => light)
+3. macOS appearance fallback only for the known-broken macOS/Zellij OSC 11 path
+4. dark slot fallback
 
 Current defaults from settings schema:
 
@@ -173,7 +192,7 @@ Current defaults from settings schema:
 ### Explicit switching (`setTheme`)
 
 - loads selected theme
-- updates global `theme` singleton
+- updates the live `theme` export
 - optionally starts watcher
 - triggers `onThemeChange` callback
 
@@ -184,7 +203,7 @@ On failure:
 
 ### Preview switching (`previewTheme`)
 
-- applies temporary preview theme to global `theme`
+- applies the preview to the live `theme` export
 - does **not** change persisted settings by itself
 - returns success/error without fallback replacement
 
@@ -194,12 +213,12 @@ Settings UI uses this for live preview and restores prior theme on cancel.
 
 When watcher is enabled (`setTheme(..., true)` / interactive init):
 
-- only watches custom file path `<customThemesDir>/<currentTheme>.json`
-- built-ins are effectively not watched
-- file `change`: attempts reload (debounced)
-- file `rename`/delete: falls back to `dark`, closes watcher
+- watches `<customThemesDir>/<currentTheme>.json` only when that file exists
+- built-ins are effectively not watched; built-in theme lookup also takes precedence over same-name custom files
+- matching file changes schedule a debounced reload; reload errors or temporary file absence keep the last successfully loaded theme
+- the watcher does not perform a delete/rename fallback; it waits for a future successful reload or explicit theme switch
 
-Auto mode also installs a `SIGWINCH` listener and can re-evaluate dark/light slot mapping when terminal state changes.
+Auto mode also reevaluates dark/light slot mapping from terminal appearance changes, `SIGWINCH`, and the macOS fallback observer when active.
 
 ## Color-blind mode behavior
 
@@ -232,7 +251,7 @@ Legacy migration exists: old flat `theme: "name"` is migrated to nested `theme.d
 1. Create file in custom themes dir, e.g. `~/.omp/agent/themes/my-theme.json`.
 2. Include `name`, optional `vars`, and **all required** `colors` tokens.
 3. Optionally include `symbols` and `export`.
-4. Select the theme in Settings (`Display -> Dark theme` or `Display -> Light theme`) depending on which auto slot you want.
+4. Select the theme in Settings (`Appearance -> Dark Theme` or `Appearance -> Light Theme`) depending on which auto slot you want.
 
 Minimal skeleton:
 
@@ -299,6 +318,7 @@ Minimal skeleton:
     "thinkingMedium": "#2ac3de",
     "thinkingHigh": "#bb9af7",
     "thinkingXhigh": "#f7768e",
+    "thinkingMax": "#ff007c",
 
     "bashMode": "#2ac3de",
     "pythonMode": "#bb9af7",
@@ -339,8 +359,8 @@ Use this workflow:
 
 ## Real constraints and caveats
 
-- All `colors` tokens are required for custom themes.
+- All `colors` tokens are required for custom themes except optional `thinkingMax`, which falls back to `thinkingXhigh`.
 - `export` and `symbols` are optional.
-- `$schema` in theme JSON is informational; runtime validation is enforced by compiled TypeBox schema in code.
+- `$schema` in theme JSON is informational; runtime validation is enforced by the ArkType-compatible schema in code (`themeJsonSchema` in `packages/tui/src/theme/schema.ts`).
 - `setTheme` failure falls back to `dark`; `previewTheme` failure does not replace current theme.
-- File watcher reload errors keep the current loaded theme until a successful reload or fallback path is triggered.
+- File watcher reload errors or temporary missing files keep the current loaded theme until a successful reload or explicit theme switch.

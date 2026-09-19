@@ -1,20 +1,24 @@
 import { describe, expect, it } from "bun:test";
 import {
 	adaptSchemaForStrict,
-	prepareSchemaForCCA,
+	normalizeSchemaForCCA,
+	normalizeSchemaForGoogle,
 	type SchemaCompatibilityProvider,
 	type SchemaCompatibilityResult,
-	sanitizeSchemaForGoogle,
+	toolWireSchema,
 	validateSchemaCompatibility,
 	validateStrictSchemaEnforcement,
 } from "@oh-my-pi/pi-ai/utils/schema";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { createTools, HIDDEN_TOOLS, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { createVibeTools } from "@oh-my-pi/pi-coding-agent/tools/vibe";
 
 interface ToolSchemaEntry {
 	name: string;
 	schema: Record<string, unknown>;
 }
+
+const testSettings = Settings.isolated({ "tools.xdev": false });
 
 function createTestSession(): ToolSession {
 	return {
@@ -22,7 +26,7 @@ function createTestSession(): ToolSession {
 		hasUI: true,
 		getSessionFile: () => null,
 		getSessionSpawns: () => "*",
-		settings: Settings.isolated(),
+		settings: testSettings,
 	};
 }
 
@@ -32,35 +36,40 @@ function asSchemaObject(value: unknown): Record<string, unknown> | null {
 	}
 	return value as Record<string, unknown>;
 }
-
-async function collectToolSchemas(): Promise<ToolSchemaEntry[]> {
+const builtinToolsPromise = createTools(createTestSession());
+const toolSchemasPromise: Promise<ToolSchemaEntry[]> = (async () => {
 	const session = createTestSession();
 	const byToolName = new Map<string, Record<string, unknown>>();
 
-	for (const tool of await createTools(session)) {
-		const schema = asSchemaObject(tool.parameters);
-		if (!schema) {
-			continue;
+	for (const tool of await builtinToolsPromise) {
+		const schema = toolWireSchema(tool);
+		if (asSchemaObject(schema)) {
+			byToolName.set(tool.name, schema);
 		}
-		byToolName.set(tool.name, schema);
 	}
 
-	for (const [name, factory] of Object.entries(HIDDEN_TOOLS)) {
-		const tool = await factory(session);
+	for (const name in HIDDEN_TOOLS) {
+		const tool = await HIDDEN_TOOLS[name as keyof typeof HIDDEN_TOOLS](session);
 		if (!tool) {
 			continue;
 		}
-		const schema = asSchemaObject(tool.parameters);
-		if (!schema) {
-			continue;
+		const schema = toolWireSchema(tool);
+		if (asSchemaObject(schema)) {
+			byToolName.set(name, schema);
 		}
-		byToolName.set(name, schema);
+	}
+
+	for (const tool of createVibeTools(session)) {
+		const schema = toolWireSchema(tool);
+		if (asSchemaObject(schema)) {
+			byToolName.set(tool.name, schema);
+		}
 	}
 
 	return [...byToolName.entries()]
 		.sort(([left], [right]) => left.localeCompare(right))
 		.map(([name, schema]) => ({ name, schema }));
-}
+})();
 
 function formatCompatibilityIssues(
 	toolName: string,
@@ -77,8 +86,23 @@ function formatCompatibilityIssues(
 }
 
 describe("builtin tool schemas provider compatibility", () => {
+	it("keeps todo strict and marks task non-strict for free-form output schemas", async () => {
+		const tools = await builtinToolsPromise;
+		const task = tools.find(tool => tool.name === "task");
+		const todo = tools.find(tool => tool.name === "todo");
+		expect(task).toBeDefined();
+		expect(todo).toBeDefined();
+		if (!task || !todo) {
+			return;
+		}
+
+		expect(task.strict).toBe(false);
+		expect(adaptSchemaForStrict(toolWireSchema(task), task.strict !== false).strict).toBe(false);
+		expect(adaptSchemaForStrict(toolWireSchema(todo), todo.strict !== false).strict).toBe(true);
+	});
+
 	it("keeps all builtin and hidden tool schemas valid after provider enforcement", async () => {
-		const toolSchemas = await collectToolSchemas();
+		const toolSchemas = await toolSchemasPromise;
 		const failures: string[] = [];
 
 		for (const { name, schema } of toolSchemas) {
@@ -89,16 +113,16 @@ describe("builtin tool schemas provider compatibility", () => {
 			}
 
 			try {
-				const googleSchema = sanitizeSchemaForGoogle(schema);
+				const googleSchema = normalizeSchemaForGoogle(schema);
 				const googleCompatibility = validateSchemaCompatibility(googleSchema, "google");
 				if (!googleCompatibility.compatible) {
 					failures.push(formatCompatibilityIssues(name, "google", googleCompatibility));
 				}
 			} catch (error) {
-				failures.push(`${name} (google): sanitizeSchemaForGoogle threw: ${String(error)}`);
+				failures.push(`${name} (google): normalizeSchemaForGoogle threw: ${String(error)}`);
 			}
 
-			const cloudCodeAssistSchema = prepareSchemaForCCA(schema);
+			const cloudCodeAssistSchema = normalizeSchemaForCCA(schema);
 			const cloudCodeAssistCompatibility = validateSchemaCompatibility(
 				cloudCodeAssistSchema,
 				"cloud-code-assist-claude",
@@ -113,5 +137,22 @@ describe("builtin tool schemas provider compatibility", () => {
 		}
 
 		expect(failures).toEqual([]);
+	});
+
+	it("preserves the yield result schema for Cloud Code Assist", async () => {
+		const toolSchemas = await toolSchemasPromise;
+		const yieldEntry = toolSchemas.find(tool => tool.name === "yield");
+		expect(yieldEntry).toBeDefined();
+		if (!yieldEntry) return;
+
+		const normalized = asSchemaObject(normalizeSchemaForCCA(yieldEntry.schema));
+		const properties = asSchemaObject(normalized?.properties);
+		const typeSchema = asSchemaObject(properties?.type);
+
+		expect(normalized?.type).toBe("object");
+		expect(properties?.data).toBeDefined();
+		expect(asSchemaObject(properties?.error)?.type).toBe("string");
+		expect(typeSchema?.type).toBe("string");
+		expect(typeSchema?.anyOf).toBeUndefined();
 	});
 });

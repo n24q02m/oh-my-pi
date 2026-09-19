@@ -36,7 +36,7 @@ export default function toolsExtension(pi: ExtensionAPI) {
 
 	// Find the last tools-config entry in the current branch
 	async function restoreFromBranch(ctx: ExtensionContext) {
-		allTools = pi.getAllTools();
+		allTools = pi.getAllTools().map(t => t.name);
 
 		// Get entries in current branch only
 		const branchEntries = ctx.sessionManager.getBranch();
@@ -66,9 +66,9 @@ export default function toolsExtension(pi: ExtensionAPI) {
 		description: "Enable/disable tools",
 		handler: async (_args, ctx) => {
 			// Refresh tool list
-			allTools = pi.getAllTools();
+			allTools = pi.getAllTools().map(t => t.name);
 
-			await ctx.ui.custom((tui, theme, done) => {
+			await ctx.ui.custom((tui, theme, _keybindings, done) => {
 				// Build settings items for each tool
 				const items: SettingItem[] = allTools.map(tool => ({
 					id: tool,
@@ -78,10 +78,11 @@ export default function toolsExtension(pi: ExtensionAPI) {
 				}));
 
 				const container = new Container();
+				const header: readonly string[] = [theme.fg("accent", theme.bold("Tool Configuration")), ""];
 				container.addChild(
 					new (class {
-						render(_width: number) {
-							return [theme.fg("accent", theme.bold("Tool Configuration")), ""];
+						render(_width: number): readonly string[] {
+							return header;
 						}
 						invalidate() {}
 					})(),
@@ -110,7 +111,7 @@ export default function toolsExtension(pi: ExtensionAPI) {
 				container.addChild(settingsList);
 
 				const component = {
-					render(width: number) {
+					render(width: number): readonly string[] {
 						return container.render(width);
 					},
 					invalidate() {

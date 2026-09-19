@@ -1,5 +1,5 @@
+import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core/types";
-import { type Static, Type } from "@sinclair/typebox";
 
 export interface CalculateResult extends AgentToolResult<undefined> {
 	content: Array<{ type: "text"; text: string }>;
@@ -15,11 +15,11 @@ export function calculate(expression: string): CalculateResult {
 	}
 }
 
-const calculateSchema = Type.Object({
-	expression: Type.String({ description: "The mathematical expression to evaluate" }),
+const calculateSchema = type({
+	expression: "string = 'The mathematical expression to evaluate'",
 });
 
-type CalculateParams = Static<typeof calculateSchema>;
+type CalculateParams = typeof calculateSchema.infer;
 
 export const calculateTool: AgentTool<typeof calculateSchema, undefined> = {
 	label: "Calculator",

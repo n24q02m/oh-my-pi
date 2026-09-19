@@ -1,7 +1,7 @@
 /**
  * Read the Docs handler for web-fetch
  */
-import { parseHTML } from "linkedom";
+import type { Element } from "@oh-my-pi/pi-utils/dom";
 import { buildResult, htmlToBasicMarkdown, loadPage, type RenderResult, type SpecialHandler } from "./types";
 
 export const handleReadTheDocs: SpecialHandler = async (
@@ -39,6 +39,7 @@ export const handleReadTheDocs: SpecialHandler = async (
 	}
 
 	// Parse HTML
+	const { parseHTML } = await import("@oh-my-pi/pi-utils/dom");
 	const root = parseHTML(result.content).document;
 
 	// Extract main content from common Read the Docs selectors
@@ -101,7 +102,7 @@ export const handleReadTheDocs: SpecialHandler = async (
 	// If no raw source, convert HTML to markdown
 	if (!content && mainContent) {
 		const html = mainContent.innerHTML;
-		content = htmlToBasicMarkdown(html);
+		content = await htmlToBasicMarkdown(html);
 	}
 
 	if (!content) {

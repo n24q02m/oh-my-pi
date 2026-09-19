@@ -3,19 +3,19 @@
  *
  * Agents are embedded at build time via Bun's import with { type: "text" }.
  */
-import { renderPromptTemplate } from "../config/prompt-templates";
+import { Effort } from "@oh-my-pi/pi-ai";
+import { parseFrontmatter, prompt } from "@oh-my-pi/pi-utils";
 import { parseAgentFields } from "../discovery/helpers";
-import designerMd from "../prompts/agents/designer.md" with { type: "text" };
-import exploreMd from "../prompts/agents/explore.md" with { type: "text" };
 // Embed agent markdown files at build time
 import agentFrontmatterTemplate from "../prompts/agents/frontmatter.md" with { type: "text" };
-import librarianMd from "../prompts/agents/librarian.md" with { type: "text" };
-import oracleMd from "../prompts/agents/oracle.md" with { type: "text" };
-import planMd from "../prompts/agents/plan.md" with { type: "text" };
 import reviewerMd from "../prompts/agents/reviewer.md" with { type: "text" };
+import scoutMd from "../prompts/agents/scout.md" with { type: "text" };
+import securityReviewerMd from "../prompts/agents/security-reviewer.md" with { type: "text" };
 import taskMd from "../prompts/agents/task.md" with { type: "text" };
-import { parseFrontmatter } from "../utils/frontmatter";
-import type { AgentDefinition, AgentSource } from "./types";
+import { AUTO_THINKING } from "@oh-my-pi/pi-tui/thinking";
+
+import type { AgentSource } from "@oh-my-pi/pi-tui/tools/task";
+import type { AgentDefinition } from "./types";
 
 interface AgentFrontmatter {
 	name: string;
@@ -25,6 +25,8 @@ interface AgentFrontmatter {
 	model?: string | string[];
 	thinkingLevel?: string;
 	blocking?: boolean;
+	prewalk?: boolean | string;
+	advisor?: boolean | string;
 }
 
 interface EmbeddedAgentDef {
@@ -34,45 +36,43 @@ interface EmbeddedAgentDef {
 }
 
 function buildAgentContent(def: EmbeddedAgentDef): string {
-	const body = renderPromptTemplate(def.template);
+	const body = prompt.render(def.template);
 	if (!def.frontmatter) return body;
-	return renderPromptTemplate(agentFrontmatterTemplate, { ...def.frontmatter, body });
+	return prompt.render(agentFrontmatterTemplate, { ...def.frontmatter, body });
 }
 
 const EMBEDDED_AGENT_DEFS: EmbeddedAgentDef[] = [
-	{ fileName: "explore.md", template: exploreMd },
-	{ fileName: "plan.md", template: planMd },
-	{ fileName: "designer.md", template: designerMd },
+	{ fileName: "scout.md", template: scoutMd },
 	{ fileName: "reviewer.md", template: reviewerMd },
-	{ fileName: "oracle.md", template: oracleMd },
-	{ fileName: "librarian.md", template: librarianMd },
+	{ fileName: "security-reviewer.md", template: securityReviewerMd },
 	{
 		fileName: "task.md",
 		frontmatter: {
 			name: "task",
 			description: "General-purpose subagent with full capabilities for delegated multi-step tasks",
 			spawns: "*",
-			model: "default",
-			thinkingLevel: "medium",
+			model: "@task",
+			thinkingLevel: AUTO_THINKING,
+			// No `prewalk` frontmatter: the generic task hand-off (strong model
+			// plans, then hands off to the smol role) is armed by the
+			// `task.prewalk` setting (default off) or per agent via /agents
+			// (task.agentPrewalk).
 		},
 		template: taskMd,
 	},
 	{
-		fileName: "quick_task.md",
+		fileName: "sonic.md",
 		frontmatter: {
-			name: "quick_task",
+			name: "sonic",
 			description: "Low-reasoning agent for strictly mechanical updates or data collection only",
-			model: "pi/smol",
-			thinkingLevel: "minimal",
+			model: "@smol",
+			thinkingLevel: Effort.Medium,
 		},
 		template: taskMd,
 	},
 ];
 
-const EMBEDDED_AGENTS: { name: string; content: string }[] = EMBEDDED_AGENT_DEFS.map(def => ({
-	name: def.fileName,
-	content: buildAgentContent(def),
-}));
+// Computed lazily on first loadBundledAgents() call to avoid eager prompt.render at module load.
 
 export class AgentParsingError extends Error {
 	constructor(
@@ -83,7 +83,7 @@ export class AgentParsingError extends Error {
 		this.name = "AgentParsingError";
 	}
 
-	toString(): string {
+	override toString(): string {
 		const details: string[] = [this.message];
 		if (this.source !== undefined) {
 			details.push(`Source: ${JSON.stringify(this.source)}`);
@@ -133,7 +133,9 @@ export function loadBundledAgents(): AgentDefinition[] {
 	if (bundledAgentsCache !== null) {
 		return bundledAgentsCache;
 	}
-	bundledAgentsCache = EMBEDDED_AGENTS.map(({ name, content }) => parseAgent(`embedded:${name}`, content, "bundled"));
+	bundledAgentsCache = EMBEDDED_AGENT_DEFS.map(def =>
+		parseAgent(`embedded:${def.fileName}`, buildAgentContent(def), "bundled"),
+	);
 	return bundledAgentsCache;
 }
 

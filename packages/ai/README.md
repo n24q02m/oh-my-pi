@@ -10,38 +10,38 @@ Unified LLM API with automatic model discovery, provider configuration, token an
 - [Installation](#installation)
 - [Quick Start](#quick-start)
 - [Tools](#tools)
-  - [Defining Tools](#defining-tools)
-  - [Handling Tool Calls](#handling-tool-calls)
-  - [Streaming Tool Calls with Partial JSON](#streaming-tool-calls-with-partial-json)
-  - [Validating Tool Arguments](#validating-tool-arguments)
-  - [Complete Event Reference](#complete-event-reference)
+   - [Defining Tools](#defining-tools)
+   - [Handling Tool Calls](#handling-tool-calls)
+   - [Streaming Tool Calls with Partial JSON](#streaming-tool-calls-with-partial-json)
+   - [Validating Tool Arguments](#validating-tool-arguments)
+   - [Complete Event Reference](#complete-event-reference)
 - [Image Input](#image-input)
 - [Thinking/Reasoning](#thinkingreasoning)
-  - [Unified Interface](#unified-interface-streamsimplecompletesimple)
-  - [Provider-Specific Options](#provider-specific-options-streamcomplete)
-  - [Streaming Thinking Content](#streaming-thinking-content)
+   - [Unified Interface](#unified-interface-streamsimplecompletesimple)
+   - [Provider-Specific Options](#provider-specific-options-streamcomplete)
+   - [Streaming Thinking Content](#streaming-thinking-content)
 - [Stop Reasons](#stop-reasons)
 - [Error Handling](#error-handling)
-  - [Aborting Requests](#aborting-requests)
-  - [Continuing After Abort](#continuing-after-abort)
+   - [Aborting Requests](#aborting-requests)
+   - [Continuing After Abort](#continuing-after-abort)
 - [APIs, Models, and Providers](#apis-models-and-providers)
-  - [Providers and Models](#providers-and-models)
-  - [Querying Providers and Models](#querying-providers-and-models)
-  - [Custom Models](#custom-models)
-  - [OpenAI Compatibility Settings](#openai-compatibility-settings)
-  - [Type Safety](#type-safety)
+   - [Providers and Models](#providers-and-models)
+   - [Querying Providers and Models](#querying-providers-and-models)
+   - [Custom Models](#custom-models)
+   - [OpenAI Compatibility Settings](#openai-compatibility-settings)
+   - [Type Safety](#type-safety)
 - [Cross-Provider Handoffs](#cross-provider-handoffs)
 - [Context Serialization](#context-serialization)
 - [Browser Usage](#browser-usage)
-  - [Environment Variables](#environment-variables-nodejs-only)
-  - [Checking Environment Variables](#checking-environment-variables)
+   - [Environment Variables](#environment-variables-nodejs-only)
+   - [Checking Environment Variables](#checking-environment-variables)
 - [OAuth Providers](#oauth-providers)
-  - [Vertex AI (ADC)](#vertex-ai-adc)
-  - [CLI Login](#cli-login)
-  - [Programmatic OAuth](#programmatic-oauth)
-  - [Login Flow Example](#login-flow-example)
-  - [Using OAuth Tokens](#using-oauth-tokens)
-  - [Provider Notes](#provider-notes)
+   - [Vertex AI (ADC)](#vertex-ai-adc)
+   - [CLI Login](#cli-login)
+   - [Programmatic OAuth](#programmatic-oauth)
+   - [Login Flow Example](#login-flow-example)
+   - [Using OAuth Tokens](#using-oauth-tokens)
+   - [Provider Notes](#provider-notes)
 - [License](#license)
 
 ## Supported Providers
@@ -59,18 +59,27 @@ Unified LLM API with automatic model discovery, provider configuration, token an
 - **Qianfan** (requires `QIANFAN_API_KEY`)
 - **NVIDIA** (requires `NVIDIA_API_KEY`)
 - **NanoGPT** (requires `NANO_GPT_API_KEY`)
+- **Novita** (requires `NOVITA_API_KEY`)
+- **DeepInfra** (requires `DEEPINFRA_API_KEY`)
 - **Hugging Face Inference**
 - **xAI**
 - **Venice** (requires `VENICE_API_KEY`)
+- **Wafer Serverless** (requires `WAFER_SERVERLESS_API_KEY`; pay-as-you-go)
 - **OpenRouter**
 - **Kilo Gateway** (supports OAuth `/login kilo` or `KILO_API_KEY`)
 - **LiteLLM** (requires `LITELLM_API_KEY`)
 - **zAI** (requires `ZAI_API_KEY`)
-- **MiniMax Coding Plan** (requires `MINIMAX_CODE_API_KEY` or `MINIMAX_CODE_CN_API_KEY`)
+- **Umans AI Coding Plan** (supports `/login umans` or `UMANS_AI_CODING_PLAN_API_KEY`)
+- **MiniMax Token Plan** (requires `MINIMAX_CODE_API_KEY` or `MINIMAX_CODE_CN_API_KEY`)
 - **Xiaomi MiMo** (requires `XIAOMI_API_KEY`)
+- **ZenMux** (requires `ZENMUX_API_KEY`)
 - **Qwen Portal** (supports `QWEN_OAUTH_TOKEN` or `QWEN_PORTAL_API_KEY`)
-- **Cloudflare AI Gateway** (requires `CLOUDFLARE_AI_GATEWAY_API_KEY` and provider-specific gateway base URL)
+- **QwenCloud Token Plan** (supports `/login alibaba-token-plan`, `ALIBABA_TOKEN_PLAN_API_KEY`, or `BAILIAN_TOKEN_PLAN_API_KEY`; interactive login first selects a region — International (Singapore, default), China (Beijing) for 百炼 Token Plan keys, or a custom base URL — since region keys are non-interchangeable, then optionally stores a `home.qwencloud.com` Cookie request header for best-effort 5-hour and 7-day quota reporting)
+  To enable quota reporting, sign in to the Token Plan dashboard, copy the `Cookie` request-header value from a `home.qwencloud.com` request in browser developer tools, and paste it at the second login prompt. Press Enter to skip; the Cookie is sensitive and session-lived, so rerun login when it expires.
+- **Cloudflare AI Gateway** (supports `/login cloudflare-ai-gateway`, or `CLOUDFLARE_AI_GATEWAY_API_KEY` with `CLOUDFLARE_ACCOUNT_ID` and `CLOUDFLARE_GATEWAY_ID`)
 - **Ollama** (local OpenAI-compatible runtime; optional `OLLAMA_API_KEY`)
+- **Ollama Cloud** (hosted native Ollama API; requires `OLLAMA_CLOUD_API_KEY`)
+- **llama.cpp** (local OpenAI and Anthropic compatible inference server)
 - **vLLM** (OpenAI-compatible server; `VLLM_API_KEY` for secured deployments)
 - **GitHub Copilot** (requires OAuth, see below)
 - **Google Gemini CLI** (requires OAuth, see below)
@@ -86,25 +95,25 @@ npm install @oh-my-pi/pi-ai
 ## Quick Start
 
 ```typescript
-import { Type, getModel, stream, complete, Context, Tool, StringEnum } from "@oh-my-pi/pi-ai";
+import { getModel, stream, complete, Context, Tool, type } from "@oh-my-pi/pi-ai";
 
 // Fully typed with auto-complete support for both providers and models
 const model = getModel("openai", "gpt-4o-mini");
 
-// Define tools with TypeBox schemas for type safety and validation
+// Define tools with omptype schemas for type safety and validation
 const tools: Tool[] = [
 	{
 		name: "get_time",
 		description: "Get the current time",
-		parameters: Type.Object({
-			timezone: Type.Optional(Type.String({ description: "Optional timezone (e.g., America/New_York)" })),
+		parameters: type({
+			"timezone?": type("string").describe("Optional timezone (e.g., America/New_York)"),
 		}),
 	},
 ];
 
 // Build a conversation context (easily serializable and transferable between models)
 const context: Context = {
-	systemPrompt: "You are a helpful assistant.",
+	systemPrompt: ["You are a helpful assistant."],
 	messages: [{ role: "user", content: "What time is it?" }],
 	tools,
 };
@@ -163,7 +172,7 @@ const finalMessage = await s.result();
 context.messages.push(finalMessage);
 
 // Handle tool calls if any
-const toolCalls = finalMessage.content.filter((b) => b.type === "toolCall");
+const toolCalls = finalMessage.content.filter(b => b.type === "toolCall");
 for (const call of toolCalls) {
 	// Execute the tool
 	const result =
@@ -210,34 +219,30 @@ for (const block of response.content) {
 
 ## Tools
 
-Tools enable LLMs to interact with external systems. This library uses TypeBox schemas for type-safe tool definitions with automatic validation using AJV. TypeBox schemas can be serialized and deserialized as plain JSON, making them ideal for distributed systems.
+Tools enable LLMs to interact with external systems. Omptype schemas provide type-safe definitions, runtime validation, and JSON Schema conversion for providers.
 
 ### Defining Tools
 
 ```typescript
-import { Type, Tool, StringEnum } from "@oh-my-pi/pi-ai";
+import { type Tool, type } from "@oh-my-pi/pi-ai";
 
-// Define tool parameters with TypeBox
 const weatherTool: Tool = {
 	name: "get_weather",
 	description: "Get current weather for a location",
-	parameters: Type.Object({
-		location: Type.String({ description: "City name or coordinates" }),
-		units: StringEnum(["celsius", "fahrenheit"], { default: "celsius" }),
+	parameters: type({
+		location: type("string").describe("City name or coordinates"),
+		units: type.enumerated("celsius", "fahrenheit").default("celsius"),
 	}),
 };
-
-// Note: For Google API compatibility, use StringEnum helper instead of Type.Enum
-// Type.Enum generates anyOf/const patterns that Google doesn't support
 
 const bookMeetingTool: Tool = {
 	name: "book_meeting",
 	description: "Schedule a meeting",
-	parameters: Type.Object({
-		title: Type.String({ minLength: 1 }),
-		startTime: Type.String({ format: "date-time" }),
-		endTime: Type.String({ format: "date-time" }),
-		attendees: Type.Array(Type.String({ format: "email" }), { minItems: 1 }),
+	parameters: type({
+		title: type("string").atLeastLength(1),
+		startTime: type("string").describe("ISO 8601 date-time"),
+		endTime: type("string").describe("ISO 8601 date-time"),
+		attendees: type("string.email").array().atLeastLength(1),
 	}),
 };
 ```
@@ -337,7 +342,7 @@ for await (const event of s) {
 
 ### Validating Tool Arguments
 
-When using `agentLoop`, tool arguments are automatically validated against your TypeBox schemas before execution. If validation fails, the error is returned to the model as a tool result, allowing it to retry.
+When using `agentLoop`, tool arguments are automatically validated against their omptype schemas before execution. Validation failures are returned to the model as tool results so it can retry.
 
 When implementing your own tool execution loop with `stream()` or `complete()`, use `validateToolCall` to validate arguments before passing them to your tools:
 
@@ -459,7 +464,7 @@ const response = await completeSimple(
 	},
 	{
 		reasoning: "medium", // 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' (xhigh maps to high on non-OpenAI providers)
-	}
+	},
 );
 
 // Access thinking and text blocks
@@ -578,7 +583,7 @@ const s = stream(
 	},
 	{
 		signal,
-	}
+	},
 );
 
 for await (const event of s) {
@@ -630,7 +635,7 @@ All providers accept the base `StreamOptions` (in addition to provider-specific 
 - `headers`: Extra request headers merged on top of model-defined headers
 - `sessionId`: Provider-specific session identifier (prompt caching/routing)
 - `signal`: Abort in-flight requests
-- `onPayload`: Callback invoked with the provider request payload just before sending
+- `onPayload`: Callback invoked with the provider request payload just before sending. Return a replacement payload object (sync or async) to send it instead of the original; return `undefined` to keep the original. The replacement is applied by every provider that fires the hook — all of them except `devin-agent`, whose payload is a protobuf object and does not fire the hook yet.
 
 Example:
 
@@ -638,7 +643,7 @@ Example:
 const response = await complete(model, context, {
 	apiKey: "sk-live",
 	headers: { "X-Debug-Trace": "true" },
-	onPayload: (payload) => {
+	onPayload: payload => {
 		console.log("request payload", payload);
 	},
 });
@@ -688,13 +693,14 @@ console.log(`Using ${model.name} via ${model.api} API`);
 
 ### Custom Models
 
-You can create custom models for local inference servers or custom endpoints:
-For Ollama, `OLLAMA_API_KEY` is optional and mainly needed for authenticated/self-hosted gateways.
+You can create custom models for local inference servers or custom endpoints.
+
+For local Ollama, `OLLAMA_API_KEY` is optional and mainly needed for authenticated/self-hosted gateways. `ollama` remains the local OpenAI-compatible runtime integration.
 
 ```typescript
 import { Model, stream } from "@oh-my-pi/pi-ai";
 
-// Example: Ollama using OpenAI-compatible API
+// Example: local Ollama using the OpenAI-compatible API
 const ollamaModel: Model<"openai-completions"> = {
 	id: "llama-3.1-8b",
 	name: "Llama 3.1 8B (Ollama)",
@@ -707,6 +713,28 @@ const ollamaModel: Model<"openai-completions"> = {
 	contextWindow: 128000,
 	maxTokens: 32000,
 };
+
+const localResponse = await stream(ollamaModel, context, {
+	apiKey: process.env.OLLAMA_API_KEY, // Optional; local Ollama usually runs without auth
+});
+
+// Example: Ollama Cloud using the native /api/chat transport
+const ollamaCloudModel: Model<"ollama-chat"> = {
+	id: "gpt-oss:120b",
+	name: "GPT OSS 120B (Ollama Cloud)",
+	api: "ollama-chat",
+	provider: "ollama-cloud",
+	baseUrl: "https://ollama.com",
+	reasoning: true,
+	input: ["text", "image"],
+	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+	contextWindow: 262144,
+	maxTokens: 8192,
+};
+
+const cloudResponse = await stream(ollamaCloudModel, context, {
+	apiKey: process.env.OLLAMA_CLOUD_API_KEY,
+});
 
 // Example: LiteLLM proxy with explicit compat settings
 const litellmModel: Model<"openai-completions"> = {
@@ -742,11 +770,6 @@ const proxyModel: Model<"anthropic-messages"> = {
 		"X-Custom-Auth": "bearer-token-here",
 	},
 };
-
-// Use the custom model
-const response = await stream(ollamaModel, context, {
-	apiKey: process.env.OLLAMA_API_KEY, // Optional; local Ollama usually runs without auth
-});
 ```
 
 ### OpenAI Compatibility Settings
@@ -759,6 +782,7 @@ interface OpenAICompat {
 	supportsDeveloperRole?: boolean; // Whether provider supports `developer` role vs `system` (default: true)
 	supportsReasoningEffort?: boolean; // Whether provider supports `reasoning_effort` (default: true)
 	maxTokensField?: "max_completion_tokens" | "max_tokens"; // Which field name to use (default: max_completion_tokens)
+	extraBody?: Record<string, unknown>; // Extra request-body fields for custom proxy routing or provider-specific options
 }
 ```
 
@@ -851,7 +875,7 @@ import { Context, getModel, complete } from "@oh-my-pi/pi-ai";
 
 // Create and use a context
 const context: Context = {
-	systemPrompt: "You are a helpful assistant.",
+	systemPrompt: ["You are a helpful assistant."],
 	messages: [{ role: "user", content: "What is TypeScript?" }],
 };
 
@@ -894,7 +918,7 @@ const response = await complete(
 	},
 	{
 		apiKey: "your-api-key",
-	}
+	},
 );
 ```
 
@@ -904,37 +928,53 @@ const response = await complete(
 
 In Node.js environments, you can set environment variables to avoid passing API keys:
 
-| Provider       | Environment Variable(s)                                                      |
-| -------------- | ---------------------------------------------------------------------------- |
-| OpenAI         | `OPENAI_API_KEY`                                                             |
-| Anthropic      | `ANTHROPIC_API_KEY` or `ANTHROPIC_OAUTH_TOKEN`                               |
-| Google         | `GEMINI_API_KEY`                                                             |
-| Vertex AI      | `GOOGLE_CLOUD_PROJECT` (or `GCLOUD_PROJECT`) + `GOOGLE_CLOUD_LOCATION` + ADC |
-| Mistral        | `MISTRAL_API_KEY`                                                            |
-| Groq           | `GROQ_API_KEY`                                                               |
-| Cerebras       | `CEREBRAS_API_KEY`                                                           |
-| Together       | `TOGETHER_API_KEY`                                                           |
-| Qianfan        | `QIANFAN_API_KEY`                                                            |
-| Hugging Face   | `HUGGINGFACE_HUB_TOKEN` or `HF_TOKEN`                                        |
-| Synthetic      | `SYNTHETIC_API_KEY`                                                          |
-| NVIDIA         | `NVIDIA_API_KEY`                                                             |
-| NanoGPT        | `NANO_GPT_API_KEY`                                                          |
-| Venice         | `VENICE_API_KEY`                                                             |
-| Moonshot       | `MOONSHOT_API_KEY`                                                           |
-| xAI            | `XAI_API_KEY`                                                                |
-| OpenRouter     | `OPENROUTER_API_KEY`                                                         |
-| LiteLLM        | `LITELLM_API_KEY`                                                            |
-| Ollama         | `OLLAMA_API_KEY` (optional for local deployments)                            |
-| Qwen Portal    | `QWEN_OAUTH_TOKEN` or `QWEN_PORTAL_API_KEY`                                  |
-| zAI            | `ZAI_API_KEY`                                                                |
-| MiniMax Code   | `MINIMAX_CODE_API_KEY` (international) or `MINIMAX_CODE_CN_API_KEY` (China) |
-| Xiaomi MiMo    | `XIAOMI_API_KEY`                                                             |
-| vLLM           | `VLLM_API_KEY`                                                               |
-| Cloudflare AI Gateway | `CLOUDFLARE_AI_GATEWAY_API_KEY`                                      |
-| GitHub Copilot | `COPILOT_GITHUB_TOKEN` or `GH_TOKEN` or `GITHUB_TOKEN`                      |
+| Provider              | Environment Variable(s)                                                                                             |
+| --------------------- | ------------------------------------------------------------------------------------------------------------------- |
+| OpenAI                | `OPENAI_API_KEY`                                                                                                    |
+| Anthropic             | `ANTHROPIC_API_KEY` or `ANTHROPIC_OAUTH_TOKEN` (or `ANTHROPIC_FOUNDRY_API_KEY` when `CLAUDE_CODE_USE_FOUNDRY=true`) |
+| Google                | `GEMINI_API_KEY`                                                                                                    |
+| Vertex AI             | `GOOGLE_CLOUD_PROJECT` (or `GCLOUD_PROJECT`) + `GOOGLE_CLOUD_LOCATION` + ADC                                        |
+| Mistral               | `MISTRAL_API_KEY`                                                                                                   |
+| Groq                  | `GROQ_API_KEY`                                                                                                      |
+| Cerebras              | `CEREBRAS_API_KEY`                                                                                                  |
+| Together              | `TOGETHER_API_KEY`                                                                                                  |
+| Qianfan               | `QIANFAN_API_KEY`                                                                                                   |
+| Hugging Face          | `HUGGINGFACE_HUB_TOKEN` or `HF_TOKEN`                                                                               |
+| Synthetic             | `SYNTHETIC_API_KEY`                                                                                                 |
+| NVIDIA                | `NVIDIA_API_KEY`                                                                                                    |
+| NanoGPT               | `NANO_GPT_API_KEY`                                                                                                  |
+| Novita                | `NOVITA_API_KEY`                                                                                                    |
+| DeepInfra             | `DEEPINFRA_API_KEY`                                                                                                 |
+| Venice                | `VENICE_API_KEY`                                                                                                    |
+| Moonshot              | `MOONSHOT_API_KEY`                                                                                                  |
+| xAI                   | `XAI_API_KEY`                                                                                                       |
+| OpenRouter            | `OPENROUTER_API_KEY`                                                                                                |
+| LiteLLM               | `LITELLM_API_KEY`                                                                                                   |
+| Ollama                | `OLLAMA_API_KEY` (optional for local deployments)                                                                   |
+| Ollama Cloud          | `OLLAMA_CLOUD_API_KEY`                                                                                              |
+| Qwen Portal           | `QWEN_OAUTH_TOKEN` or `QWEN_PORTAL_API_KEY`                                                                         |
+| QwenCloud Token Plan  | `ALIBABA_TOKEN_PLAN_API_KEY` or `BAILIAN_TOKEN_PLAN_API_KEY`                                                        |
+| zAI                   | `ZAI_API_KEY`                                                                                                       |
+| Umans AI Coding Plan  | `UMANS_AI_CODING_PLAN_API_KEY`                                                                                      |
+| MiniMax Code          | `MINIMAX_CODE_API_KEY` (international) or `MINIMAX_CODE_CN_API_KEY` (China)                                         |
+| Xiaomi MiMo           | `XIAOMI_API_KEY`                                                                                                    |
+| ZenMux                | `ZENMUX_API_KEY`                                                                                                    |
+| vLLM                  | `VLLM_API_KEY`                                                                                                      |
+| Cloudflare AI Gateway | `CLOUDFLARE_AI_GATEWAY_API_KEY` + `CLOUDFLARE_ACCOUNT_ID` + `CLOUDFLARE_GATEWAY_ID`                                 |
+| GitHub Copilot        | `COPILOT_GITHUB_TOKEN` or `GH_TOKEN` or `GITHUB_TOKEN`                                                              |
 
-For Cloudflare AI Gateway models, use provider base URL format
-`https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic`.
+`/login cloudflare-ai-gateway` collects and stores the gateway token, account ID, and gateway ID. For environment configuration, set all three Cloudflare values above. OMP derives provider endpoints from the account and gateway IDs.
+
+For Anthropic Foundry routing, set `CLAUDE_CODE_USE_FOUNDRY=true` plus:
+`FOUNDRY_BASE_URL`, `ANTHROPIC_FOUNDRY_API_KEY`, optional `ANTHROPIC_CUSTOM_HEADERS`,
+and optional mTLS material (`CLAUDE_CODE_CLIENT_CERT`, `CLAUDE_CODE_CLIENT_KEY`).
+
+`NODE_EXTRA_CA_CERTS` (PEM file path or inline PEM, mirroring Node's contract)
+is honoured on every provider fetch — OpenAI-compatible, Codex, Ollama, Azure
+Responses, Google, and Anthropic alike — for corporate relays or private CA
+bundles. Bun's `fetch` does not consume the env var natively, so omp injects
+the bundle into `RequestInit.tls.ca` and seeds the system root store
+alongside it.
 
 Provider endpoint defaults for the current OpenAI-compatible integrations:
 
@@ -943,15 +983,21 @@ Provider endpoint defaults for the current OpenAI-compatible integrations:
 - Qianfan: `https://qianfan.baidubce.com/v2`
 - NVIDIA: `https://integrate.api.nvidia.com/v1`
 - NanoGPT: `https://nano-gpt.com/api/v1`
+- Novita: `https://api.novita.ai/openai/v1`
+- DeepInfra: `https://api.deepinfra.com/v1/openai`
 - Hugging Face Inference: `https://router.huggingface.co/v1`
 - Venice: `https://api.venice.ai/api/v1`
 - Xiaomi MiMo: `https://api.xiaomimimo.com/anthropic`
+- ZenMux (OpenAI): `https://zenmux.ai/api/v1`
+- ZenMux (Anthropic models): `https://zenmux.ai/api/anthropic`
+- Umans AI Coding Plan: `https://api.code.umans.ai`
 - vLLM: `http://127.0.0.1:8000/v1`
-- Ollama: local OpenAI-compatible runtime
+- Ollama: local OpenAI-compatible runtime (`http://127.0.0.1:11434/v1`)
+- Ollama Cloud: native Ollama API host (`https://ollama.com/api`, configured here as base URL `https://ollama.com`)
 - LiteLLM: `http://localhost:4000/v1`
-- Cloudflare AI Gateway: `https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/anthropic`
+- Cloudflare AI Gateway: native Anthropic, OpenAI, and Workers AI routes under `https://gateway.ai.cloudflare.com/v1/<account>/<gateway>`
 - Qwen Portal: `https://portal.qwen.ai/v1`
-When set, the library automatically uses these keys:
+  When set, the library automatically uses these keys:
 
 ```typescript
 // Uses OPENAI_API_KEY from environment
@@ -1026,80 +1072,58 @@ Official docs: [Application Default Credentials](https://cloud.google.com/docs/a
 
 ### CLI Login
 
-The quickest way to authenticate:
+Authenticate via the [`omp`](https://omp.sh) coding-agent CLI, which drives this library's OAuth/API-key flows in-process and persists into `agent.db`:
 
 ```bash
-bunx @oh-my-pi/pi-ai login              # interactive provider selection
-bunx @oh-my-pi/pi-ai login anthropic    # login to specific provider
-bunx @oh-my-pi/pi-ai login vllm         # store vLLM API key (or placeholder for local no-auth)
-bunx @oh-my-pi/pi-ai list               # list available providers
+omp auth-broker login              # interactive provider selection
+omp auth-broker login anthropic    # login to a specific provider
+omp auth-broker login vllm         # store vLLM API key (or placeholder for local no-auth)
+omp auth-broker list               # list supported providers
+omp auth-broker logout             # interactive — pick a stored credential to remove
 ```
 
 Credentials are saved to `agent.db` in the agent directory. `/login qianfan` opens the Qianfan console and stores the pasted API key.
 
+If SQLite reports corruption during startup, the damaged database and remaining journal sidecars are preserved beside it as private `agent.db.corrupt-<timestamp>-<id>*` backups before a fresh database is created. The log records the backup path. This restores startup, not unreadable credentials: log in again; retain the backups for manual data recovery. Lock contention and other non-corruption errors never reset the database.
+
 `login` supports OAuth providers (Anthropic, OpenAI Codex, GitHub Copilot, Gemini CLI, Antigravity) and API-key onboarding flows.
 
-For the current OpenAI-compatible integrations, API-key onboarding covers Together, Moonshot, Qianfan, NVIDIA, NanoGPT, Hugging Face, Venice, Xiaomi, vLLM, LiteLLM, Cloudflare AI Gateway, and Qwen Portal. Ollama is typically local and unauthenticated; set `OLLAMA_API_KEY` only when your Ollama deployment enforces bearer auth.
+For the current API-key onboarding flows, the library covers Together, Moonshot, Qianfan, NVIDIA, NanoGPT, Novita, DeepInfra, Hugging Face, Venice, Xiaomi, vLLM, LiteLLM, Cloudflare AI Gateway, Qwen Portal, and Ollama Cloud. Ollama remains the local runtime integration; set `OLLAMA_API_KEY` only when your local or self-hosted deployment enforces bearer auth.
 
 ### Programmatic OAuth
 
-The library provides login and token refresh functions. Credential storage is the caller's responsibility.
+Provider login and refresh behavior is exposed through the registry. Credential storage is the caller's responsibility.
 
 ```typescript
 import {
-	// Login functions (return credentials, do not store)
-	loginAnthropic,
-	loginOpenAICodex,
-	loginGitHubCopilot,
-	loginGeminiCli,
-	loginAntigravity,
-	loginCloudflareAiGateway,
-	loginHuggingface,
-	loginLiteLLM,
-	loginMoonshot,
-	loginNvidia,
-	loginNanoGPT,
-	loginQianfan,
-	loginQwenPortal,
-	loginTogether,
-	loginVenice,
-	loginVllm,
-	loginXiaomi,
-
-	// Token management
+	getProviderDefinition,
 	refreshOAuthToken, // (provider, credentials) => new credentials
 	getOAuthApiKey, // (provider, credentialsMap) => { newCredentials, apiKey } | null
-
-	// Types
-	type OAuthProvider, // includes 'anthropic', 'openai-codex', 'github-copilot', 'google-gemini-cli', 'google-antigravity', 'together', 'moonshot', 'qianfan', 'nvidia', 'nanogpt', 'huggingface', 'venice', 'xiaomi', 'vllm', 'litellm', 'cloudflare-ai-gateway', 'qwen-portal', ...
+	type OAuthProvider,
 	type OAuthCredentials,
 } from "@oh-my-pi/pi-ai";
-```
 
-`loginOpenAICodex` accepts an optional `originator` value used in the OAuth flow:
-
-```typescript
-await loginOpenAICodex({
+const provider = getProviderDefinition("openai-codex");
+const credentials = await provider?.login?.({
 	onAuth: ({ url }) => console.log(url),
-	originator: "my-cli",
 });
 ```
 
 ### Login Flow Example
 
 ```typescript
-import { loginGitHubCopilot } from "@oh-my-pi/pi-ai";
+import { getProviderDefinition } from "@oh-my-pi/pi-ai";
 import * as fs from "node:fs";
 
-const credentials = await loginGitHubCopilot({
-	onAuth: (url, instructions) => {
+const credentials = await getProviderDefinition("github-copilot")?.login?.({
+	onAuth: ({ url, instructions }) => {
 		console.log(`Open: ${url}`);
 		if (instructions) console.log(instructions);
 	},
-	onPrompt: async (prompt) => {
+	onPrompt: async prompt => {
 		return await getUserInput(prompt.message);
 	},
-	onProgress: (message) => console.log(message),
+	onProgress: message => console.log(message),
 });
 
 // Store credentials yourself
@@ -1133,7 +1157,7 @@ const response = await complete(
 	{
 		messages: [{ role: "user", content: "Hello!" }],
 	},
-	{ apiKey: result.apiKey }
+	{ apiKey: result.apiKey },
 );
 ```
 

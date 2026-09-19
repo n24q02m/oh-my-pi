@@ -1,7 +1,28 @@
 /**
  * Client-side type definitions.
- * Duplicated from ../types.ts to avoid pulling in server dependencies.
+ *
+ * Shared shapes (aggregations, time-series, dashboard payloads) live in
+ * `../shared-types` and are re-exported here. The types declared inline below
+ * are deliberately client-only because:
+ *   - `Usage` is redeclared locally so the client bundle avoids importing
+ *     `@oh-my-pi/pi-ai` (the server-side AI types package).
+ *   - `MessageStats.stopReason` is widened from the server's `StopReason`
+ *     enum to `string`, again to keep the client free of pi-ai types.
+ *   - `TimeRange`, `OverviewStats`, `ModelDashboardStats`,
+ *     `CostDashboardStats` are UI-only view shapes the server never produces.
  */
+
+import type {
+	AgentTypeStats,
+	AggregatedStats,
+	CostTimeSeriesPoint,
+	ModelPerformancePoint,
+	ModelStats,
+	ModelTimeSeriesPoint,
+	TimeSeriesPoint,
+} from "../shared-types";
+
+export * from "../shared-types";
 
 export interface Usage {
 	input: number;
@@ -9,6 +30,7 @@ export interface Usage {
 	cacheRead: number;
 	cacheWrite: number;
 	totalTokens: number;
+	premiumRequests?: number;
 	cost: {
 		input: number;
 		output: number;
@@ -32,6 +54,8 @@ export interface MessageStats {
 	stopReason: string;
 	errorMessage: string | null;
 	usage: Usage;
+	/** Ingest found no tariff to price this request from; its zero is unknown spend. */
+	costUnpriced?: boolean;
 }
 
 export interface RequestDetails extends MessageStats {
@@ -39,62 +63,20 @@ export interface RequestDetails extends MessageStats {
 	output: unknown;
 }
 
-export interface AggregatedStats {
-	totalRequests: number;
-	successfulRequests: number;
-	failedRequests: number;
-	errorRate: number;
-	totalInputTokens: number;
-	totalOutputTokens: number;
-	totalCacheReadTokens: number;
-	totalCacheWriteTokens: number;
-	cacheRate: number;
-	totalCost: number;
-	avgDuration: number | null;
-	avgTtft: number | null;
-	avgTokensPerSecond: number | null;
-	firstTimestamp: number;
-	lastTimestamp: number;
-}
+export type TimeRange = "1h" | "24h" | "7d" | "30d" | "90d" | "all";
 
-export interface ModelStats extends AggregatedStats {
-	model: string;
-	provider: string;
-}
-
-export interface FolderStats extends AggregatedStats {
-	folder: string;
-}
-
-export interface TimeSeriesPoint {
-	timestamp: number;
-	requests: number;
-	errors: number;
-	tokens: number;
-	cost: number;
-}
-
-export interface ModelTimeSeriesPoint {
-	timestamp: number;
-	model: string;
-	provider: string;
-	requests: number;
-}
-
-export interface ModelPerformancePoint {
-	timestamp: number;
-	model: string;
-	provider: string;
-	requests: number;
-	avgTtft: number | null;
-	avgTokensPerSecond: number | null;
-}
-
-export interface DashboardStats {
+export interface OverviewStats {
 	overall: AggregatedStats;
-	byModel: ModelStats[];
-	byFolder: FolderStats[];
+	byAgentType: AgentTypeStats[];
 	timeSeries: TimeSeriesPoint[];
+}
+
+export interface ModelDashboardStats {
+	byModel: ModelStats[];
 	modelSeries: ModelTimeSeriesPoint[];
 	modelPerformanceSeries: ModelPerformancePoint[];
+}
+
+export interface CostDashboardStats {
+	costSeries: CostTimeSeriesPoint[];
 }

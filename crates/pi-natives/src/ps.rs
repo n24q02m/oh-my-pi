@@ -1,289 +1,236 @@
-//! Cross-platform process tree management.
+//! N-API bindings for cross-platform process tree management.
 //!
-//! Provides efficient process tree enumeration and termination without
-//! requiring processes to be spawned with `detached: true`.
-//!
-//! # Platform Implementation
-//! - **Linux**: Reads `/proc/{pid}/children` recursively
-//! - **macOS**: Uses `libproc` (`proc_listchildpids`)
-//! - **Windows**: Uses `CreateToolhelp32Snapshot` to build parent-child
-//!   relationships
-//!
-//! # Example
-//! ```ignore
-//! use pi_natives::ps::kill_tree;
-//!
-//! // Kill process 1234 and all its descendants
-//! let killed = kill_tree(1234, 9); // SIGKILL
-//! ```
+//! The platform-specific implementation lives in [`pi_shell::process`]; this
+//! module is a thin shim that exposes that crate's `Process` surface to
+//! JavaScript and re-exports the termination primitives used by other native
+//! modules (e.g. [`crate::pty`]).
 
+use std::time::Duration;
+
+use napi::{
+	Env, JsString, Result,
+	bindgen_prelude::{PromiseRaw, Unknown},
+};
 use napi_derive::napi;
+use pi_shell::process::{self as core_process, ProcessStatus as CoreProcessStatus};
+pub use pi_shell::process::{KILL_SIGNAL, TERM_SIGNAL, TerminationTargets, kill_process_group};
 
-#[cfg(target_os = "linux")]
-mod platform {
-	use std::fs;
+use crate::{js::into_string, task};
 
-	/// Collect all descendant PIDs of `pid` into `pids`.
-	/// Skips branches when `/proc/{pid}/children` cannot be read.
-	pub fn collect_descendants(pid: i32, pids: &mut Vec<i32>) {
-		let children_path = format!("/proc/{pid}/task/{pid}/children");
-		let Ok(content) = fs::read_to_string(&children_path) else {
-			return;
-		};
+#[derive(Default)]
+#[napi(object)]
+pub struct ProcessTerminateOptions<'env> {
+	/// Also signal the process group when supported by the platform.
+	pub group:       Option<bool>,
+	/// Milliseconds to wait after polite termination before hard-killing.
+	/// Omit to use the default grace period. Pass a negative value to skip the
+	/// graceful phase and hard-kill immediately.
+	pub graceful_ms: Option<i32>,
+	/// Milliseconds to wait after hard-kill for the process tree to exit.
+	pub timeout_ms:  Option<u32>,
+	/// Abort signal for cancelling termination while waiting.
+	pub signal:      Option<Unknown<'env>>,
+}
 
-		for part in content.split_whitespace() {
-			if let Ok(child_pid) = part.parse::<i32>() {
-				pids.push(child_pid);
-				collect_descendants(child_pid, pids);
-			}
+/// Options for waiting on a process exit.
+#[derive(Default)]
+#[napi(object)]
+pub struct ProcessWaitOptions<'env> {
+	/// Milliseconds to wait before returning false. Omit to wait indefinitely.
+	pub timeout_ms: Option<u32>,
+	/// Abort signal for cancelling the wait.
+	pub signal:     Option<Unknown<'env>>,
+}
+
+/// Current state of a process reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[napi(string_enum)]
+pub enum ProcessStatus {
+	/// The referenced process is still running.
+	#[napi(value = "running")]
+	Running,
+	/// The referenced process has exited or is no longer observable.
+	#[napi(value = "exited")]
+	Exited,
+}
+
+impl From<CoreProcessStatus> for ProcessStatus {
+	fn from(value: CoreProcessStatus) -> Self {
+		match value {
+			CoreProcessStatus::Running => Self::Running,
+			CoreProcessStatus::Exited => Self::Exited,
 		}
-	}
-
-	/// Send `signal` to `pid`.
-	/// Returns true when the signal is delivered successfully.
-	pub fn kill_pid(pid: i32, signal: i32) -> bool {
-		// SAFETY: libc::kill is safe to call with any pid/signal combination
-		unsafe { libc::kill(pid, signal) == 0 }
-	}
-
-	/// Get the process group id for `pid`.
-	/// Returns `None` when the process does not exist or is inaccessible.
-	pub fn process_group_id(pid: i32) -> Option<i32> {
-		// SAFETY: `libc::getpgid` is safe to call with any pid
-		let pgid = unsafe { libc::getpgid(pid) };
-		if pgid < 0 { None } else { Some(pgid) }
-	}
-
-	/// Send `signal` to the process group `pgid`.
-	/// Returns true when the signal is delivered successfully.
-	pub fn kill_process_group(pgid: i32, signal: i32) -> bool {
-		// SAFETY: libc::kill is safe to call with any pid/signal combination
-		unsafe { libc::kill(-pgid, signal) == 0 }
 	}
 }
 
-#[cfg(target_os = "macos")]
-mod platform {
-	use std::ptr;
-
-	#[link(name = "proc", kind = "dylib")]
-	unsafe extern "C" {
-		fn proc_listchildpids(ppid: i32, buffer: *mut i32, buffersize: i32) -> i32;
-	}
-
-	/// Collect all descendant PIDs of `pid` into `pids` using libproc.
-	/// Skips branches when libproc returns no children.
-	pub fn collect_descendants(pid: i32, pids: &mut Vec<i32>) {
-		// First call to get count
-		// SAFETY: passing null buffer with size 0 to query child count is valid
-		// per libproc API.
-		let count = unsafe { proc_listchildpids(pid, ptr::null_mut(), 0) };
-		if count <= 0 {
-			return;
-		}
-
-		let mut buffer = vec![0i32; count as usize];
-		// SAFETY: buffer is correctly sized and aligned for `count` i32 elements.
-		let actual = unsafe {
-			proc_listchildpids(pid, buffer.as_mut_ptr(), (buffer.len() * size_of::<i32>()) as i32)
-		};
-
-		if actual <= 0 {
-			return;
-		}
-
-		let child_count = actual as usize / size_of::<i32>();
-		for &child_pid in &buffer[..child_count] {
-			if child_pid > 0 {
-				pids.push(child_pid);
-				collect_descendants(child_pid, pids);
-			}
-		}
-	}
-
-	/// Send `signal` to `pid`.
-	/// Returns true when the signal is delivered successfully.
-	pub fn kill_pid(pid: i32, signal: i32) -> bool {
-		// SAFETY: libc::kill is safe to call with any pid/signal combination
-		unsafe { libc::kill(pid, signal) == 0 }
-	}
-
-	/// Get the process group id for `pid`.
-	/// Returns `None` when the process does not exist or is inaccessible.
-	pub fn process_group_id(pid: i32) -> Option<i32> {
-		// SAFETY: libc::getpgid is safe to call with any pid
-		let pgid = unsafe { libc::getpgid(pid) };
-		if pgid < 0 { None } else { Some(pgid) }
-	}
-
-	/// Send `signal` to the process group `pgid`.
-	/// Returns true when the signal is delivered successfully.
-	pub fn kill_process_group(pgid: i32, signal: i32) -> bool {
-		// SAFETY: libc::kill is safe to call with any pid/signal combination
-		unsafe { libc::kill(-pgid, signal) == 0 }
-	}
-}
-
-#[cfg(target_os = "windows")]
-mod platform {
-	use std::{collections::HashMap, mem};
-
-	use smallvec::SmallVec;
-
-	#[repr(C)]
-	#[allow(non_snake_case)]
-	struct PROCESSENTRY32W {
-		dwSize:              u32,
-		cntUsage:            u32,
-		th32ProcessID:       u32,
-		th32DefaultHeapID:   usize,
-		th32ModuleID:        u32,
-		cntThreads:          u32,
-		th32ParentProcessID: u32,
-		pcPriClassBase:      i32,
-		dwFlags:             u32,
-		szExeFile:           [u16; 260],
-	}
-
-	type HANDLE = *mut std::ffi::c_void;
-	const INVALID_HANDLE_VALUE: HANDLE = -1isize as HANDLE;
-	const TH32CS_SNAPPROCESS: u32 = 0x00000002;
-	const PROCESS_TERMINATE: u32 = 0x0001;
-
-	#[link(name = "kernel32")]
-	unsafe extern "system" {
-		fn CreateToolhelp32Snapshot(dwFlags: u32, th32ProcessID: u32) -> HANDLE;
-		fn Process32FirstW(hSnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> i32;
-		fn Process32NextW(hSnapshot: HANDLE, lppe: *mut PROCESSENTRY32W) -> i32;
-		fn CloseHandle(hObject: HANDLE) -> i32;
-		fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> HANDLE;
-		fn TerminateProcess(hProcess: HANDLE, uExitCode: u32) -> i32;
-	}
-
-	/// Build a map of parent_pid -> [child_pids] for all processes.
-	fn build_process_tree() -> HashMap<u32, SmallVec<[u32; 4]>> {
-		let mut tree: HashMap<u32, SmallVec<[u32; 4]>> = HashMap::new();
-
-		unsafe {
-			let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-			if snapshot == INVALID_HANDLE_VALUE {
-				return tree;
-			}
-
-			let mut entry: PROCESSENTRY32W = mem::zeroed();
-			entry.dwSize = mem::size_of::<PROCESSENTRY32W>() as u32;
-
-			if Process32FirstW(snapshot, &mut entry) != 0 {
-				loop {
-					tree
-						.entry(entry.th32ParentProcessID)
-						.or_default()
-						.push(entry.th32ProcessID);
-
-					if Process32NextW(snapshot, &mut entry) == 0 {
-						break;
-					}
-				}
-			}
-
-			CloseHandle(snapshot);
-		}
-
-		tree
-	}
-
-	/// Collect all descendant PIDs of `pid` into `pids`.
-	/// Uses a snapshot of the current process table.
-	pub fn collect_descendants(pid: i32, pids: &mut Vec<i32>) {
-		let tree = build_process_tree();
-		collect_descendants_from_tree(pid as u32, &tree, pids);
-	}
-
-	fn collect_descendants_from_tree(
-		pid: u32,
-		tree: &HashMap<u32, SmallVec<[u32; 4]>>,
-		pids: &mut Vec<i32>,
-	) {
-		if let Some(children) = tree.get(&pid) {
-			for &child_pid in children {
-				pids.push(child_pid as i32);
-				collect_descendants_from_tree(child_pid, tree, pids);
-			}
-		}
-	}
-
-	/// Terminate `pid` (Windows ignores `signal`).
-	/// Returns true when the process is terminated.
-	pub fn kill_pid(pid: i32, _signal: i32) -> bool {
-		unsafe {
-			let handle = OpenProcess(PROCESS_TERMINATE, 0, pid as u32);
-			if handle.is_null() || handle == INVALID_HANDLE_VALUE {
-				return false;
-			}
-			let result = TerminateProcess(handle, 1);
-			CloseHandle(handle);
-			result != 0
-		}
-	}
-
-	/// Process groups are not exposed on Windows.
-	/// Always returns `None`.
-	pub fn process_group_id(_pid: i32) -> Option<i32> {
-		None
-	}
-
-	/// Process groups are not exposed on Windows.
-	/// Always returns `false`.
-	pub fn kill_process_group(_pgid: i32, _signal: i32) -> bool {
-		false
-	}
-}
-
-/// Kill a process tree (the process and all its descendants).
-///
-/// Arguments: `pid` is the root process and `signal` is the kill signal.
-/// Kills children first (bottom-up) to prevent orphan re-parenting issues.
-/// Returns the number of processes successfully killed.
+/// Stable process reference.
 #[napi]
-pub fn kill_tree(pid: i32, signal: i32) -> u32 {
-	let mut descendants = Vec::new();
-	platform::collect_descendants(pid, &mut descendants);
-
-	let mut killed = 0u32;
-
-	// Kill children first (deepest first by reversing the DFS order)
-	for &child_pid in descendants.iter().rev() {
-		if platform::kill_pid(child_pid, signal) {
-			killed += 1;
-		}
-	}
-
-	// Kill the root process last
-	if platform::kill_pid(pid, signal) {
-		killed += 1;
-	}
-
-	killed
+#[derive(Clone)]
+pub struct Process {
+	inner: core_process::Process,
 }
 
-/// Get the process group id for `pid`.
-/// Returns `None` when the process is missing or unsupported on the platform.
-pub fn process_group_id(pid: i32) -> Option<i32> {
-	platform::process_group_id(pid)
-}
-
-/// Send `signal` to the process group `pgid`.
-/// Returns false when process groups are unsupported on the platform.
-pub fn kill_process_group(pgid: i32, signal: i32) -> bool {
-	platform::kill_process_group(pgid, signal)
-}
-
-/// List all descendant PIDs of `pid`.
-///
-/// Returns an empty array if the process has no children or doesn't exist.
 #[napi]
-pub fn list_descendants(pid: i32) -> Vec<i32> {
-	let mut descendants = Vec::new();
-	platform::collect_descendants(pid, &mut descendants);
-	descendants
+#[allow(clippy::use_self, reason = "napi return types must name the exported class")]
+impl Process {
+	/// Open a stable process reference from a PID.
+	#[napi]
+	pub fn from_pid(pid: i32) -> Option<Process> {
+		core_process::Process::from_pid(pid).map(Self::from_inner)
+	}
+
+	/// Open stable process references whose executable path matches exactly.
+	#[napi]
+	pub fn from_path(path: JsString) -> Result<Vec<Process>> {
+		Ok(core_process::Process::from_path(into_string(path)?)
+			.into_iter()
+			.map(Self::from_inner)
+			.collect())
+	}
+
+	/// Operating-system process identifier for this process reference.
+	#[napi(getter)]
+	pub const fn pid(&self) -> i32 {
+		self.inner.pid()
+	}
+
+	/// Parent process id for this process, when available.
+	#[napi(getter)]
+	pub fn ppid(&self) -> Option<i32> {
+		self.inner.ppid()
+	}
+
+	/// Launch arguments for this process.
+	#[napi]
+	pub fn args(&self) -> Vec<String> {
+		self.inner.args()
+	}
+
+	/// Send `signal` to this process and its descendants, children first.
+	///
+	/// On Linux and macOS the signal is forwarded as-is. On Windows there is no
+	/// signal abstraction, so the `signal` argument is ignored and the entire
+	/// tree is hard-killed via `TerminateProcess`. Defaults to the POSIX
+	/// hard-kill signal.
+	#[napi]
+	pub fn kill_tree(&self, signal: Option<i32>) -> u32 {
+		self.inner.kill_tree(signal)
+	}
+
+	/// Gracefully terminate this process and its descendants.
+	///
+	/// By default this waits 1000ms after polite termination before
+	/// hard-killing. Pass `graceful_ms < 0` to skip the graceful phase.
+	#[napi]
+	pub fn terminate<'env>(
+		&self,
+		env: &'env Env,
+		options: Option<ProcessTerminateOptions<'env>>,
+	) -> Result<PromiseRaw<'env, bool>> {
+		let options = options.unwrap_or_default();
+		let group = options.group.unwrap_or(false);
+		let graceful_ms = options.graceful_ms.unwrap_or(1000);
+		let timeout_ms = options.timeout_ms.unwrap_or(5000);
+		let ct = task::CancelToken::new(None, options.signal);
+		let process = self.inner.clone();
+		task::future(env, "process.terminate", async move {
+			process
+				.terminate_tree(group, graceful_ms, timeout_ms, ct.into_core())
+				.await
+				.map_err(|err| napi::Error::from_reason(err.to_string()))
+		})
+	}
+
+	/// Wait until this process exits.
+	///
+	/// When `options.timeout_ms` is omitted, waits until the process exits.
+	#[napi]
+	pub fn wait_for_exit<'env>(
+		&self,
+		env: &'env Env,
+		options: Option<ProcessWaitOptions<'env>>,
+	) -> Result<PromiseRaw<'env, bool>> {
+		let options = options.unwrap_or_default();
+		let ct = task::CancelToken::new(None, options.signal);
+		let timeout = options
+			.timeout_ms
+			.map(|ms| Duration::from_millis(u64::from(ms)));
+		let process = self.inner.clone();
+		task::future(env, "process.wait_for_exit", async move {
+			process
+				.wait_for_exit(timeout, ct.into_core())
+				.await
+				.map_err(|err| napi::Error::from_reason(err.to_string()))
+		})
+	}
+
+	/// Process group id for this process, when supported by the platform.
+	#[napi]
+	#[allow(clippy::missing_const_for_fn, reason = "#[napi] generates a non-const wrapper")]
+	pub fn group_id(&self) -> Option<i32> {
+		self.inner.group_id()
+	}
+
+	/// Direct children of this process as stable process references.
+	#[napi]
+	pub fn children(&self) -> Vec<Process> {
+		self
+			.inner
+			.children()
+			.into_iter()
+			.map(Self::from_inner)
+			.collect()
+	}
+
+	/// Current status of this process reference.
+	#[napi]
+	pub fn status(&self) -> ProcessStatus {
+		self.inner.status().into()
+	}
+}
+
+impl Process {
+	const fn from_inner(inner: core_process::Process) -> Self {
+		Self { inner }
+	}
+}
+
+/// Replace the current process image via `execvp(3)`.
+///
+/// On success this never returns: the kernel tears down every other thread and
+/// the new program takes over this PID, controlling terminal, and inherited
+/// (non-`CLOEXEC`) file descriptors. Callers must flush logs and restore the
+/// terminal first — no JS or native cleanup runs after a successful call.
+///
+/// # Errors
+/// Returns an error, leaving the process untouched, when `argv` is empty, an
+/// argument contains an interior NUL byte, or the exec itself fails (e.g.
+/// executable not found). Windows has no exec-replace semantics, so this
+/// always errors there; callers fall back to spawn-and-wait.
+#[napi]
+pub fn exec_replace(argv: Vec<String>) -> Result<()> {
+	#[cfg(unix)]
+	{
+		use std::ffi::CString;
+
+		if argv.is_empty() {
+			return Err(napi::Error::from_reason("exec_replace: argv must not be empty"));
+		}
+		let args = argv
+			.into_iter()
+			.map(CString::new)
+			.collect::<std::result::Result<Vec<_>, _>>()
+			.map_err(|err| napi::Error::from_reason(format!("exec_replace: {err}")))?;
+		let mut ptrs: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
+		ptrs.push(std::ptr::null());
+		// SAFETY: `ptrs` is a NUL-terminated array of pointers into `args`, which
+		// outlives the call; execvp only returns on failure.
+		unsafe { libc::execvp(ptrs[0], ptrs.as_ptr()) };
+		Err(napi::Error::from_reason(format!("execvp failed: {}", std::io::Error::last_os_error())))
+	}
+	#[cfg(not(unix))]
+	{
+		let _ = argv;
+		Err(napi::Error::from_reason("exec_replace is unsupported on this platform"))
+	}
 }

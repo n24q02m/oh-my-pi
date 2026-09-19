@@ -12,7 +12,14 @@ export type OpenAICompletionsToolChoice =
 	| undefined;
 
 /** OpenAI Responses API tool choice format (flat structure) */
-export type OpenAIResponsesToolChoice = "auto" | "none" | "required" | { type: "function"; name: string } | undefined;
+export type OpenAIResponsesToolChoice =
+	| "auto"
+	| "none"
+	| "required"
+	| { type: "function"; name: string }
+	| { type: "custom"; name: string }
+	| { type: "computer" }
+	| undefined;
 
 /** Anthropic-compatible tool choice format */
 export type AnthropicToolChoice = "auto" | "none" | "any" | { type: "tool"; name: string } | undefined;
@@ -49,6 +56,18 @@ export function mapToOpenAICompletionsToolChoice(choice?: ToolChoice): OpenAICom
 }
 
 /**
+ * Returns true when an OpenAI-completions `tool_choice` value forces a tool
+ * call (`"required"` or a function-name pin), as opposed to leaving it open
+ * (`"auto"`, `"none"`, or unset). Accepts `unknown` because the param shape
+ * pulled from the OpenAI SDK (`ChatCompletionToolChoiceOption`) widens with
+ * each release; this check only needs the open/forced bit.
+ */
+export function isForcedToolChoice(choice: unknown): boolean {
+	if (choice === undefined || choice === "auto" || choice === "none") return false;
+	return true;
+}
+
+/**
  * Map unified ToolChoice to OpenAI Responses API format.
  * - "any" → "required"
  * - { type: "tool", name } → { type: "function", name } (flat structure)
@@ -60,6 +79,7 @@ export function mapToOpenAIResponsesToolChoice(choice?: ToolChoice): OpenAIRespo
 		if (choice === "auto" || choice === "none" || choice === "required") return choice;
 		return undefined;
 	}
+	if (choice.type === "computer") return { type: "computer" };
 	const name = extractFunctionName(choice);
 	return name ? { type: "function", name } : undefined;
 }

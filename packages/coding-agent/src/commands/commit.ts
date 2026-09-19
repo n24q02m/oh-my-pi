@@ -1,14 +1,16 @@
 /**
  * Generate and optionally push a commit with changelog updates.
  */
+
+import { postmortem } from "@oh-my-pi/pi-utils";
 import { Command, Flags } from "@oh-my-pi/pi-utils/cli";
-import { runCommitCommand } from "../commit";
+import { commitHelp as commandHelp } from "../cli/command-help";
+import { CommitAbortedError, runCommitCommand } from "../commit";
 import type { CommitCommandArgs } from "../commit/types";
-import { initTheme } from "../modes/theme/theme";
+import { initTheme } from "@oh-my-pi/pi-tui/theme";
 
 export default class Commit extends Command {
-	static description = "Generate a commit message and update changelogs";
-
+	static description = commandHelp.description;
 	static flags = {
 		push: Flags.boolean({ description: "Push after committing" }),
 		"dry-run": Flags.boolean({ description: "Preview without committing" }),
@@ -31,6 +33,28 @@ export default class Commit extends Command {
 		};
 
 		await initTheme();
-		await runCommitCommand(cmd);
+		// The agentic commit flow opens keep-alive sockets to the model provider
+		// and spins up an AgentSession with background async-job + extension
+		// machinery. `session.dispose()` releases what it can, but Bun's fetch
+		// keeps idle connections warm and a few timers (Settings autosave, OAuth
+		// refresh) stay armed long enough to pin the event loop after the commit
+		// is already written. Mirror the `runPrintMode` exit pattern from
+		// `main.ts` so the CLI returns to the shell instead of stranding the user
+		// on Ctrl+C (issue #1041).
+		let exitCode = 0;
+		try {
+			const { usedFallback } = await runCommitCommand(cmd);
+			// A commit written by the mechanical fallback is a degraded outcome:
+			// the agent did not do the work it was asked to do, so the command
+			// reports non-zero so callers can distinguish it from a real
+			// single-commit decision (issue #7835).
+			if (usedFallback) exitCode = 1;
+		} catch (error) {
+			if (!(error instanceof CommitAbortedError)) throw error;
+			// Failure already reported with a readable message; exit non-zero
+			// without letting the runtime dump a stack/minified-source blob.
+			exitCode = 1;
+		}
+		await postmortem.quit(exitCode);
 	}
 }

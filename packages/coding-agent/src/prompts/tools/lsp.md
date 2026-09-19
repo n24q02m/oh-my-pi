@@ -1,33 +1,19 @@
-Interacts with Language Server Protocol servers for code intelligence.
+Symbol-aware code intelligence from language servers — navigation, refactors, and diagnostics where text tools miss callsites.
 
 <operations>
-- `diagnostics`: Get errors/warnings for file, glob, or entire workspace (no file)
-- `definition`: Go to symbol definition → file path + position + 3-line source context
-- `type_definition`: Go to symbol type definition → file path + position + 3-line source context
-- `implementation`: Find concrete implementations → file path + position + 3-line source context
-- `references`: Find references → locations with 3-line source context (first 50), remaining location-only
-- `hover`: Get type info and documentation → type signature + docs
-- `symbols`: List symbols in file, or search workspace (with query, no file)
-- `rename`: Rename symbol across codebase → preview or apply edits
-- `code_actions`: List available quick-fixes/refactors/import actions; apply one when `apply: true` and `query` matches title or index
-- `status`: Show active language servers
-- `reload`: Restart the language server
+- Position-based: `file` + `line` + `symbol` (substring; `#N` for Nth match). `line` is 1-indexed.
+- `rename` — applies by default; `apply: false` previews. Project-aware lookups ERROR without `symbol` — no silent fallback on missing/ambiguous matches.
+- `code_actions` — lists by default; apply ONE with `apply: true` + `query` (title substring or index).
+- `rename_file` — moves file AND rewrites all imports/references; applies by default.
+- `diagnostics` — path, glob (`src/**/*.ts`), or `file: "*"` for workspace.
+- `symbols` — `file` lists file symbols; `file: "*"` + `query` searches workspace.
+- `reload` — restart one server (`file`) or all (`*`); `reload *` re-reads LSP config.
+- `request` — raw: `query` = method, `payload` = JSON params (else auto-built).
 </operations>
 
-<parameters>
-- `file`: File path; for diagnostics it may be a glob pattern (e.g., `src/**/*.ts`)
-- `line`: 1-indexed line number for position-based actions
-- `symbol`: Substring on the target line used to resolve column automatically
-- `occurrence`: 1-indexed match index when `symbol` appears multiple times on the same line
-- `query`: Symbol search query, code-action kind filter (list mode), or code-action selector (apply mode)
-- `new_name`: Required for rename
-- `apply`: Apply edits for rename/code_actions (default true for rename, list mode for code_actions unless explicitly true)
-- `timeout`: Request timeout in seconds (clamped to 5-60, default 20)
-</parameters>
-
-<caution>
-- Requires running LSP server for target language
-- Some operations require file to be saved to disk
-- Diagnostics glob mode samples up to 20 files per request to avoid long-running stalls on broad patterns
-- When `symbol` is provided for position-based actions, missing symbols or out-of-bounds `occurrence` values return an explicit error instead of silently falling back
-</caution>
+<critical>
+- Symbol-aware work (rename, references, definition, code actions) MUST use `lsp` whenever a server is available.
+  It follows shadowing, re-exports, and cross-file usages text tools miss.
+- NEVER do a cross-file rename with `ast_edit`/`sed`/hand edits when `lsp` `rename`/`rename_file` can — text renames silently drop callsites.
+- Reach for `code_actions` on imports, quick-fixes, and server-known refactors before editing by hand.
+</critical>

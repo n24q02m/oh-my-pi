@@ -11,7 +11,7 @@ export * from "./client";
 export * from "./config";
 export * from "./config-writer";
 // JSON-RPC (lightweight HTTP-based MCP calls)
-export { callMCP, parseSSE } from "./json-rpc";
+export * from "./json-rpc";
 // Loader (for SDK integration)
 export * from "./loader";
 // Manager
@@ -26,4 +26,12 @@ export * from "./tool-cache";
 export * from "./transports/http";
 export * from "./transports/stdio";
 // Types
-export type * from "./types";
+export * from "./types";
+
+export type {
+	MCPToolDetails,
+	MCPTextContent,
+	MCPImageContent,
+	MCPResourceContent,
+	MCPContent,
+} from "@oh-my-pi/pi-tui/tools/mcp";

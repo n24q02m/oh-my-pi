@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
-import { disposeAllKernelSessions, executePython } from "@oh-my-pi/pi-coding-agent/ipy/executor";
-import type { KernelExecuteOptions, KernelExecuteResult } from "@oh-my-pi/pi-coding-agent/ipy/kernel";
-import { PythonKernel } from "@oh-my-pi/pi-coding-agent/ipy/kernel";
+import { disposeAllKernelSessions, executePython } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
+import type {
+	KernelExecuteOptions,
+	KernelExecuteResult,
+	KernelShutdownResult,
+} from "@oh-my-pi/pi-coding-agent/eval/py/kernel";
+import { PythonKernel } from "@oh-my-pi/pi-coding-agent/eval/py/kernel";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 class FakeKernel {
@@ -20,9 +24,10 @@ class FakeKernel {
 		return { status: "ok", cancelled: false, timedOut: false, stdinRequested: false };
 	}
 
-	async shutdown(): Promise<void> {
+	async shutdown(): Promise<KernelShutdownResult> {
 		this.shutdownCalls += 1;
 		this.alive = false;
+		return { confirmed: true };
 	}
 
 	isAlive(): boolean {

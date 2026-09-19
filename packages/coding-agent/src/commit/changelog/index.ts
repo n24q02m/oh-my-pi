@@ -1,7 +1,9 @@
 import * as path from "node:path";
-import type { Api, Model } from "@oh-my-pi/pi-ai";
+import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
+import type { Api, ApiKey, Model } from "@oh-my-pi/pi-ai";
+import type { VcsNumstatEntry } from "@oh-my-pi/pi-natives";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { logger } from "@oh-my-pi/pi-utils";
-import type { ControlledGit } from "../../commit/git";
 import { CHANGELOG_CATEGORIES } from "../../commit/types";
 import { detectChangelogBoundaries } from "./detect";
 import { generateChangelogEntries } from "./generate";
@@ -10,12 +12,28 @@ import { parseUnreleasedSection } from "./parse";
 const CHANGELOG_SECTIONS = CHANGELOG_CATEGORIES;
 
 const DEFAULT_MAX_DIFF_CHARS = 120_000;
+function renderStat(entries: VcsNumstatEntry[]): string {
+	if (entries.length === 0) return "";
+	let insertions = 0;
+	let deletions = 0;
+	const lines = entries.map(entry => {
+		const added = entry.added ?? 0;
+		const removed = entry.removed ?? 0;
+		insertions += added;
+		deletions += removed;
+		return ` ${entry.path} | ${added + removed} ${"+".repeat(Math.min(added, 40))}${"-".repeat(Math.min(removed, 40))}`;
+	});
+	lines.push(
+		` ${entries.length} file${entries.length === 1 ? "" : "s"} changed, ${insertions} insertion${insertions === 1 ? "" : "s"}(+), ${deletions} deletion${deletions === 1 ? "" : "s"}(-)`,
+	);
+	return `${lines.join("\n")}\n`;
+}
 
 export interface ChangelogFlowInput {
-	git: ControlledGit;
 	cwd: string;
 	model: Model<Api>;
-	apiKey: string;
+	apiKey: ApiKey;
+	thinkingLevel?: ThinkingLevel;
 	stagedFiles: string[];
 	dryRun: boolean;
 	maxDiffChars?: number;
@@ -23,7 +41,6 @@ export interface ChangelogFlowInput {
 }
 
 export interface ChangelogProposalInput {
-	git: ControlledGit;
 	cwd: string;
 	proposals: Array<{
 		path: string;
@@ -38,26 +55,28 @@ export interface ChangelogProposalInput {
  * Update CHANGELOG.md entries for staged changes.
  */
 export async function runChangelogFlow({
-	git,
 	cwd,
 	model,
 	apiKey,
+	thinkingLevel,
 	stagedFiles,
 	dryRun,
 	maxDiffChars,
 	onProgress,
 }: ChangelogFlowInput): Promise<string[]> {
 	if (stagedFiles.length === 0) return [];
+	const repo = vcs.requireGit(cwd);
 	onProgress?.("Detecting changelog boundaries...");
 	const boundaries = await detectChangelogBoundaries(cwd, stagedFiles);
 	if (boundaries.length === 0) return [];
 
+	const sessionId = Bun.randomUUIDv7();
 	const updated: string[] = [];
 	for (const boundary of boundaries) {
 		onProgress?.(`Generating entries for ${boundary.changelogPath}…`);
-		const diff = await git.getDiffForFiles(boundary.files, true);
+		const diff = await repo.diffText({ cached: true, files: boundary.files });
 		if (!diff.trim()) continue;
-		const stat = await git.getStatForFiles(boundary.files, true);
+		const stat = renderStat(await repo.numstat({ cached: true, files: boundary.files }));
 		const diffForPrompt = truncateDiff(diff, maxDiffChars ?? DEFAULT_MAX_DIFF_CHARS);
 		const changelogContent = await Bun.file(boundary.changelogPath).text();
 		let unreleased: { startLine: number; endLine: number; entries: Record<string, string[]> };
@@ -72,6 +91,8 @@ export async function runChangelogFlow({
 		const generated = await generateChangelogEntries({
 			model,
 			apiKey,
+			sessionId,
+			thinkingLevel,
 			changelogPath: boundary.changelogPath,
 			isPackageChangelog,
 			existingEntries: existingEntries || undefined,
@@ -83,7 +104,7 @@ export async function runChangelogFlow({
 		const updatedContent = applyChangelogEntries(changelogContent, unreleased, generated.entries);
 		if (!dryRun) {
 			await Bun.write(boundary.changelogPath, updatedContent);
-			await git.stageFiles([path.relative(cwd, boundary.changelogPath)]);
+			await repo.stageFiles([path.relative(cwd, boundary.changelogPath)]);
 		}
 		updated.push(boundary.changelogPath);
 	}
@@ -95,12 +116,12 @@ export async function runChangelogFlow({
  * Apply changelog entries provided by the commit agent.
  */
 export async function applyChangelogProposals({
-	git,
 	cwd,
 	proposals,
 	dryRun,
 	onProgress,
 }: ChangelogProposalInput): Promise<string[]> {
+	const repo = vcs.requireGit(cwd);
 	const updated: string[] = [];
 	for (const proposal of proposals) {
 		if (
@@ -128,7 +149,7 @@ export async function applyChangelogProposals({
 		const updatedContent = applyChangelogEntries(changelogContent, unreleased, normalized, normalizedDeletions);
 		if (!dryRun) {
 			await Bun.write(proposal.path, updatedContent);
-			await git.stageFiles([path.relative(cwd, proposal.path)]);
+			await repo.stageFiles([path.relative(cwd, proposal.path)]);
 		}
 		updated.push(proposal.path);
 	}
@@ -138,7 +159,7 @@ export async function applyChangelogProposals({
 
 function truncateDiff(diff: string, maxChars: number): string {
 	if (diff.length <= maxChars) return diff;
-	return `${diff.slice(0, maxChars)}\n... (truncated)`;
+	return `${diff.slice(0, maxChars)}\n[…${diff.length - maxChars}ch elided…]`;
 }
 
 function formatExistingEntries(entries: Record<string, string[]>): string {

@@ -8,11 +8,6 @@ import type { RenderResult } from "@oh-my-pi/pi-coding-agent/web/scrapers/types"
 const SKIP = !Bun.env.WEB_FETCH_INTEGRATION;
 
 describe.skipIf(SKIP)("handleSemanticScholar", () => {
-	it("returns null for non-S2 URLs", async () => {
-		const result = await handleSemanticScholar("https://example.com", 10);
-		expect(result).toBeNull();
-	});
-
 	it("fetches a known paper", async () => {
 		// "Attention Is All You Need" paper
 		const result = await handleSemanticScholar(
@@ -92,11 +87,6 @@ describe.skipIf(SKIP)("handlePubMed", () => {
 		return cachedKnownPubMed;
 	};
 
-	it("returns null for non-PubMed URLs", async () => {
-		const result = await handlePubMed("https://example.com", 10);
-		expect(result).toBeNull();
-	});
-
 	it("fetches a known article from pubmed.ncbi.nlm.nih.gov", async () => {
 		// PMID 33782455 - COVID-19 vaccine paper
 		const result = await fetchKnownPubMed();
@@ -149,11 +139,6 @@ describe.skipIf(SKIP)("handlePubMed", () => {
 });
 
 describe.skipIf(SKIP)("handleArxiv", () => {
-	it("returns null for non-arXiv URLs", async () => {
-		const result = await handleArxiv("https://example.com", 10000);
-		expect(result).toBeNull();
-	});
-
 	it("fetches a known paper", async () => {
 		// "Attention Is All You Need" paper
 		const result = await handleArxiv("https://arxiv.org/abs/1706.03762", 30000);
@@ -179,15 +164,6 @@ describe.skipIf(SKIP)("handleArxiv", () => {
 		}
 	});
 
-	it("handles arxiv.org/abs/ format", async () => {
-		const result = await handleArxiv("https://arxiv.org/abs/1706.03762", 30000);
-		expect(result).not.toBeNull();
-		expect(result?.method).toBe("arxiv");
-		if (!result?.content.includes("Too Many Requests") && !result?.content.includes("Failed to fetch")) {
-			expect(result?.content).toContain("1706.03762");
-		}
-	});
-
 	it("includes paper metadata", async () => {
 		const result = await handleArxiv("https://arxiv.org/abs/1706.03762", 30000);
 		expect(result).not.toBeNull();
@@ -198,22 +174,9 @@ describe.skipIf(SKIP)("handleArxiv", () => {
 			expect(result?.content).toMatch(/Published:/);
 		}
 	});
-
-	it("handles rate limiting gracefully", async () => {
-		const result = await handleArxiv("https://arxiv.org/abs/1706.03762", 5000);
-		expect(result).not.toBeNull();
-		expect(result?.method).toBe("arxiv");
-		// Should return something, even if rate limited
-		expect(result?.content).toBeTruthy();
-	});
 });
 
 describe.skipIf(SKIP)("handleIacr", () => {
-	it("returns null for non-IACR URLs", async () => {
-		const result = await handleIacr("https://example.com", 10000);
-		expect(result).toBeNull();
-	});
-
 	it("fetches a known ePrint", async () => {
 		// Using a well-known paper
 		const result = await handleIacr("https://eprint.iacr.org/2023/123", 30000);
@@ -234,14 +197,6 @@ describe.skipIf(SKIP)("handleIacr", () => {
 			expect(result?.content).toContain("ePrint:");
 			expect(result?.content).toMatch(/Abstract/);
 		}
-	});
-
-	it("handles rate limiting gracefully", async () => {
-		const result = await handleIacr("https://eprint.iacr.org/2023/123", 5000);
-		expect(result).not.toBeNull();
-		expect(result?.method).toBe("iacr");
-		// Should return something, even if rate limited
-		expect(result?.content).toBeTruthy();
 	});
 
 	it("handles PDF URLs", async () => {

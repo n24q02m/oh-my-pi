@@ -1,101 +1,52 @@
 /**
  * Unified Web Search Tool
  *
- * Single tool supporting Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, Codex, Z.AI, and Synthetic
+ * Single tool supporting Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, Codex, Tavily, Kagi, Z.AI, SearXNG, and Synthetic
  * providers with provider-specific parameters exposed conditionally.
- *
- * When EXA_API_KEY is available, additional specialized tools are exposed:
- * - web_search_deep: Natural language web search with synthesized results
- * - web_search_code_context: Search code snippets, docs, and examples
- * - web_search_crawl: Extract content from specific URLs
- * - web_search_linkedin: Search LinkedIn profiles and companies
- * - web_search_company: Comprehensive company research
  */
+
+import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
-import { StringEnum } from "@oh-my-pi/pi-ai";
-import { Type } from "@sinclair/typebox";
-import { renderPromptTemplate } from "../../config/prompt-templates";
-import { callExaTool, findApiKey as findExaKey, formatSearchResults, isSearchResponse } from "../../exa/mcp-client";
-import { renderExaCall, renderExaResult } from "../../exa/render";
-import type { ExaRenderDetails } from "../../exa/types";
+import type { AuthStorage } from "@oh-my-pi/pi-ai";
+import { prompt } from "@oh-my-pi/pi-utils";
+import { ModelRegistry } from "../../config/model-registry";
+import { settings } from "../../config/settings";
 import type { CustomTool, CustomToolContext, RenderResultOptions } from "../../extensibility/custom-tools/types";
-import type { Theme } from "../../modes/theme/theme";
+import type { Theme } from "@oh-my-pi/pi-tui/theme";
 import webSearchSystemPrompt from "../../prompts/system/web-search.md" with { type: "text" };
 import webSearchDescription from "../../prompts/tools/web-search.md" with { type: "text" };
+import { discoverAuthStorage } from "../../sdk";
 import type { ToolSession } from "../../tools";
-import { formatAge } from "../../tools/render-utils";
-import { getSearchProvider, resolveProviderChain, type SearchProvider } from "./provider";
-import { renderSearchCall, renderSearchResult, type SearchRenderDetails } from "./render";
-import type { SearchResponse } from "./types";
-import { SearchProviderError } from "./types";
+import { formatAge } from "@oh-my-pi/pi-tui/render/render-utils";
+import { throwIfAborted } from "../../tools/tool-errors";
+import {
+	formatSearchProviderFailure,
+	formatSearchProviderFailures,
+	getSearchProvider,
+	resolveProviderCandidates,
+	type SearchProvider,
+	type SearchProviderCandidate,
+} from "./provider";
+import { getSearchProviderLabel } from "@oh-my-pi/pi-tui/tools/web-search";
+import { applyQueryConstraints, parseSearchQuery } from "./query";
+import { renderSearchCall, renderSearchResult, type SearchRenderDetails } from "@oh-my-pi/pi-tui/tools/web-search";
+import { DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS, MAX_WEB_SEARCH_TIMEOUT_SECONDS, SearchProviderError } from "./types";
+import { type SearchProviderId, type SearchResponse } from "@oh-my-pi/pi-tui/tools/web-search";
 
-/** Web search parameters schema */
-export const webSearchSchema = Type.Object({
-	query: Type.String({ description: "Search query" }),
-	provider: Type.Optional(
-		StringEnum(
-			["auto", "exa", "brave", "jina", "kimi", "zai", "anthropic", "perplexity", "gemini", "codex", "synthetic"],
-			{
-				description: "Search provider (default: auto)",
-			},
-		),
-	),
-	recency: Type.Optional(
-		StringEnum(["day", "week", "month", "year"], {
-			description: "Recency filter (Brave, Perplexity)",
-		}),
-	),
-	limit: Type.Optional(Type.Number({ description: "Max results to return" })),
-	max_tokens: Type.Optional(Type.Number({ description: "Maximum output tokens" })),
-	temperature: Type.Optional(Type.Number({ description: "Sampling temperature" })),
-	num_search_results: Type.Optional(Type.Number({ description: "Number of search results to retrieve" })),
+/** Web search tool parameters schema */
+export const webSearchSchema = type({
+	query: "string",
+	recency: "'day' | 'week' | 'month' | 'year'?",
+	limit: "number?",
+	max_tokens: "number?",
+	temperature: "number?",
+	num_search_results: "number?",
 });
 
-export type SearchParams = {
-	query: string;
-	provider?:
-		| "auto"
-		| "exa"
-		| "brave"
-		| "jina"
-		| "kimi"
-		| "zai"
-		| "anthropic"
-		| "perplexity"
-		| "gemini"
-		| "codex"
-		| "synthetic";
-	recency?: "day" | "week" | "month" | "year";
-	limit?: number;
-	/** Maximum output tokens. Defaults to 4096. */
-	max_tokens?: number;
-	/** Sampling temperature (0–1). Lower = more focused/factual. Defaults to 0.2. */
-	temperature?: number;
-	/** Number of search results to retrieve. Defaults to 10. */
-	num_search_results?: number;
-	/** Deprecated CLI flag; explicit provider fallback now happens only when provider is unavailable. */
-	no_fallback?: boolean;
-};
+export type SearchToolParams = typeof webSearchSchema.infer;
 
-function formatProviderList(providers: SearchProvider[]): string {
-	return providers.map(provider => provider.label).join(", ");
-}
-
-function formatProviderError(error: unknown, provider: SearchProvider): string {
-	if (error instanceof SearchProviderError) {
-		if (error.provider === "anthropic" && error.status === 404) {
-			return "Anthropic web search returned 404 (model or endpoint not found).";
-		}
-		if (error.status === 401 || error.status === 403) {
-			if (error.provider === "zai") {
-				return error.message;
-			}
-			return `${getSearchProvider(error.provider).label} authorization failed (${error.status}). Check API key or base URL.`;
-		}
-		return error.message;
-	}
-	if (error instanceof Error) return error.message;
-	return `Unknown error from ${provider.label}`;
+export interface SearchQueryParams extends SearchToolParams {
+	provider?: SearchProviderId | "auto";
 }
 
 /** Truncate text for tool output */
@@ -108,27 +59,28 @@ function formatCount(label: string, count: number): string {
 	return `${count} ${label}${count === 1 ? "" : "s"}`;
 }
 
-/** Format response for LLM consumption */
-function formatForLLM(response: SearchResponse): string {
+/** Format response for LLM consumption. `notes` lead the output (e.g. relaxed-constraint warnings). */
+function formatForLLM(response: SearchResponse, notes: readonly string[] = []): string {
 	const parts: string[] = [];
+	for (const note of notes) {
+		parts.push(`Note: ${note}`);
+	}
 
-	parts.push("## Answer");
-	parts.push(response.answer ? response.answer : "No answer text returned.");
-
-	if (response.sources.length > 0) {
-		parts.push("\n## Sources");
-		parts.push(formatCount("source", response.sources.length));
-		for (const [i, src] of response.sources.entries()) {
-			const age = formatAge(src.ageSeconds) || src.publishedDate;
-			const agePart = age ? ` (${age})` : "";
-			parts.push(`[${i + 1}] ${src.title}${agePart}\n    ${src.url}`);
-			if (src.snippet) {
-				parts.push(`    ${truncateText(src.snippet, 240)}`);
-			}
+	if (response.answer) {
+		parts.push(response.answer);
+		if (response.sources.length > 0) {
+			parts.push("\n## Sources");
+			parts.push(formatCount("source", response.sources.length));
 		}
-	} else {
-		parts.push("\n## Sources");
-		parts.push("0 sources");
+	}
+
+	for (const [i, src] of response.sources.entries()) {
+		const age = formatAge(src.ageSeconds) || src.publishedDate;
+		const agePart = age ? ` (${age})` : "";
+		parts.push(`[${i + 1}] ${src.title}${agePart}\n    ${src.url}`);
+		if (src.snippet) {
+			parts.push(`    ${truncateText(src.snippet, 240)}`);
+		}
 	}
 
 	if (response.citations && response.citations.length > 0) {
@@ -149,29 +101,8 @@ function formatForLLM(response: SearchResponse): string {
 		for (const q of response.relatedQuestions) {
 			parts.push(`- ${q}`);
 		}
-	} else {
-		parts.push("\n## Related");
-		parts.push("0 questions");
 	}
 
-	parts.push("\n## Meta");
-	parts.push(`Provider: ${response.provider}`);
-	if (response.model) {
-		parts.push(`Model: ${response.model}`);
-	}
-	if (response.usage) {
-		const usageParts: string[] = [];
-		if (response.usage.inputTokens !== undefined) usageParts.push(`in ${response.usage.inputTokens}`);
-		if (response.usage.outputTokens !== undefined) usageParts.push(`out ${response.usage.outputTokens}`);
-		if (response.usage.totalTokens !== undefined) usageParts.push(`total ${response.usage.totalTokens}`);
-		if (response.usage.searchRequests !== undefined) usageParts.push(`search ${response.usage.searchRequests}`);
-		if (usageParts.length > 0) {
-			parts.push(`Usage: ${usageParts.join(" | ")}`);
-		}
-	}
-	if (response.requestId) {
-		parts.push(`Request: ${truncateText(response.requestId, 64)}`);
-	}
 	if (response.searchQueries && response.searchQueries.length > 0) {
 		parts.push(`Search queries: ${response.searchQueries.length}`);
 		for (const query of response.searchQueries.slice(0, 3)) {
@@ -182,18 +113,148 @@ function formatForLLM(response: SearchResponse): string {
 	return parts.join("\n");
 }
 
+function hasRenderableSearchContent(response: SearchResponse): boolean {
+	if (response.answer?.trim()) return true;
+	if (response.sources.length > 0) return true;
+	if (response.citations?.length) return true;
+	if (response.relatedQuestions?.some(question => question.trim())) return true;
+	if (response.searchQueries?.some(query => query.trim())) return true;
+	return false;
+}
+
+interface ExecuteSearchOptions {
+	authStorage: AuthStorage;
+	modelRegistry?: ModelRegistry;
+	modelName?: string;
+	sessionId?: string;
+	signal?: AbortSignal;
+}
+
 /** Execute web search */
 async function executeSearch(
 	_toolCallId: string,
-	params: SearchParams,
+	params: SearchQueryParams,
+	options: ExecuteSearchOptions,
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchRenderDetails }> {
-	const providers =
-		params.provider && params.provider !== "auto"
-			? (await getSearchProvider(params.provider).isAvailable())
-				? [getSearchProvider(params.provider)]
-				: await resolveProviderChain("auto")
-			: await resolveProviderChain(params.provider);
-	if (providers.length === 0) {
+	const { authStorage, modelRegistry, modelName, sessionId, signal } = options;
+	const explicitProvider = params.provider;
+	let candidates: SearchProviderCandidate[];
+	if (explicitProvider && explicitProvider !== "auto") {
+		candidates = [{ id: explicitProvider, explicit: true }];
+	} else {
+		// `--provider auto` and the default both walk the configured chain;
+		// exclusions still apply.
+		candidates = resolveProviderCandidates();
+	}
+
+	const parsedQuery = parseSearchQuery(params.query);
+
+	// Invariant across providers; read once and tolerate an uninitialized
+	// Settings singleton (e.g. `omp q ...` CLI path, unit tests) so the
+	// provider-fallback loop never aborts before any provider runs.
+	let antigravityEndpointMode: "auto" | "production" | "sandbox" | undefined;
+	try {
+		antigravityEndpointMode = settings.get("providers.antigravityEndpoint");
+	} catch {
+		antigravityEndpointMode = undefined;
+	}
+
+	let geminiModel: string | undefined;
+	try {
+		geminiModel = settings.get("providers.webSearchGeminiModel");
+	} catch {
+		geminiModel = undefined;
+	}
+
+	let timeoutMs = DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS * 1_000;
+	try {
+		const configuredSeconds = settings.get("providers.webSearchTimeoutSeconds");
+		if (Number.isFinite(configuredSeconds) && configuredSeconds > 0) {
+			timeoutMs = Math.ceil(Math.min(configuredSeconds, MAX_WEB_SEARCH_TIMEOUT_SECONDS) * 1_000);
+		}
+	} catch {
+		// Preserve the default for one-shot callers that do not initialize Settings.
+	}
+
+	const failures: Array<{ provider: Pick<SearchProvider, "id" | "label">; error: unknown }> = [];
+	let availableProviderCount = 0;
+	let lastProvider: Pick<SearchProvider, "id" | "label"> | undefined;
+	for (const candidate of candidates) {
+		let provider: SearchProvider | undefined;
+		const providerMeta = { id: candidate.id, label: getSearchProviderLabel(candidate.id) };
+		lastProvider = providerMeta;
+		try {
+			provider = await getSearchProvider(candidate.id);
+			const available = candidate.explicit
+				? await provider.isExplicitlyAvailable(authStorage)
+				: await provider.isAvailable(authStorage);
+			if (!available && !candidate.explicit) continue;
+			if (!available && candidate.explicit) {
+				throw new SearchProviderError(
+					provider.id,
+					`${provider.label} web search is unavailable. Configure its credentials or select the automatic provider chain.`,
+				);
+			}
+			availableProviderCount++;
+			lastProvider = provider;
+
+			const response = await provider.search({
+				query: params.query,
+				parsedQuery,
+				limit: params.limit,
+				recency: params.recency,
+				systemPrompt: webSearchSystemPrompt,
+				maxOutputTokens: params.max_tokens,
+				numSearchResults: params.num_search_results,
+				temperature: params.temperature,
+				signal,
+				timeoutMs,
+				authStorage,
+				modelRegistry,
+				modelName,
+				sessionId,
+				antigravityEndpointMode,
+				geminiModel,
+			});
+
+			// Lenient constraint pass over whatever the provider returned: enforce
+			// site:/inurl:/intitle:/filetype:/date directives the provider could
+			// not (or only partially) honor natively, relaxing any dimension that
+			// would wipe out every result. Citations/answer text stay untouched.
+			let finalResponse = response;
+			const constraintNotes: string[] = [];
+			if (parsedQuery.hasConstraints && response.sources.length > 0) {
+				const filtered = applyQueryConstraints(response.sources, parsedQuery);
+				if (filtered.sources.length !== response.sources.length) {
+					finalResponse = { ...response, sources: filtered.sources };
+				}
+				for (const label of filtered.dropped) {
+					constraintNotes.push(`no results matched \`${label}\`; the constraint was relaxed`);
+				}
+			}
+
+			if (!hasRenderableSearchContent(finalResponse)) {
+				throw new SearchProviderError(provider.id, `${provider.label} returned no renderable search content.`, 204);
+			}
+
+			const text = formatForLLM(finalResponse, constraintNotes);
+
+			return {
+				content: [{ type: "text" as const, text }],
+				details: { response: finalResponse },
+			};
+		} catch (error) {
+			// Surface user-initiated cancellation immediately so the session sees
+			// a clean abort instead of a generic "all providers failed" message.
+			// Without this, an AbortError from `fetch()` is treated as a provider
+			// failure and the loop falls through to the next provider (or to the
+			// summary error), masking the cancellation.
+			throwIfAborted(signal);
+			failures.push({ provider: provider ?? providerMeta, error });
+		}
+	}
+
+	if (availableProviderCount === 0 && failures.length === 0) {
 		const message = "No web search provider configured.";
 		return {
 			content: [{ type: "text" as const, text: `Error: ${message}` }],
@@ -201,388 +262,138 @@ async function executeSearch(
 		};
 	}
 
-	let lastError: unknown;
-	let lastProvider = providers[0];
-
-	for (const provider of providers) {
-		lastProvider = provider;
-		try {
-			const response = await provider.search({
-				query: params.query.replace(/202\d/g, String(new Date().getFullYear())), // LUL
-				limit: params.limit,
-				recency: params.recency,
-				systemPrompt: webSearchSystemPrompt,
-				maxOutputTokens: params.max_tokens,
-				numSearchResults: params.num_search_results,
-				temperature: params.temperature,
-			});
-
-			const text = formatForLLM(response);
-
-			return {
-				content: [{ type: "text" as const, text }],
-				details: { response },
-			};
-		} catch (error) {
-			lastError = error;
-		}
-	}
-
-	const baseMessage = formatProviderError(lastError, lastProvider);
+	const lastFailure = failures[failures.length - 1];
+	const baseMessage = lastFailure
+		? formatSearchProviderFailure(lastFailure.error, lastFailure.provider)
+		: `Unknown error from ${lastProvider?.label ?? "web search provider"}`;
 	const message =
-		providers.length > 1
-			? `All web search providers failed (${formatProviderList(providers)}). Last error: ${baseMessage}`
-			: baseMessage;
+		failures.length > 1 ? `All web search providers failed: ${formatSearchProviderFailures(failures)}` : baseMessage;
 
 	return {
 		content: [{ type: "text" as const, text: `Error: ${message}` }],
-		details: { response: { provider: lastProvider.id, sources: [] }, error: message },
+		details: {
+			response: { provider: lastFailure?.provider.id ?? lastProvider?.id ?? "none", sources: [] },
+			error: message,
+		},
 	};
 }
 
 /**
  * Execute a web search query for CLI/testing workflows.
+ *
+ * `authStorage` may be omitted; in that case we discover one via the standard
+ * factory (`discoverAuthStorage`), which honours `OMP_AUTH_BROKER_URL` and
+ * otherwise opens the local SQLite credential store.
  */
 export async function runSearchQuery(
-	params: SearchParams,
+	params: SearchQueryParams,
+	options: {
+		authStorage?: AuthStorage;
+		modelRegistry?: ModelRegistry;
+		modelName?: string;
+		sessionId?: string;
+		signal?: AbortSignal;
+	} = {},
 ): Promise<{ content: Array<{ type: "text"; text: string }>; details: SearchRenderDetails }> {
-	return executeSearch("cli-web-search", params);
+	const createdAuthStorage = options.authStorage || options.modelRegistry ? undefined : await discoverAuthStorage();
+	const authStorage = options.authStorage ?? options.modelRegistry?.authStorage ?? createdAuthStorage;
+	if (!authStorage) {
+		throw new Error("Failed to initialize authentication storage");
+	}
+	const modelRegistry = options.modelRegistry ?? (createdAuthStorage ? new ModelRegistry(authStorage) : undefined);
+	try {
+		return await executeSearch("cli-web-search", params, {
+			authStorage,
+			modelRegistry,
+			modelName: options.modelName,
+			sessionId: options.sessionId,
+			signal: options.signal,
+		});
+	} finally {
+		createdAuthStorage?.close();
+	}
 }
 
 /**
  * Web search tool implementation.
  *
- * Supports Anthropic, Perplexity, Exa, Brave, Jina, Kimi, Gemini, Codex, Z.AI, and Synthetic providers with automatic fallback.
- * Session is accepted for interface consistency but not used.
+ * Supports the configured web-search provider chain with automatic fallback.
  */
-export class SearchTool implements AgentTool<typeof webSearchSchema, SearchRenderDetails> {
+export class WebSearchTool implements AgentTool<typeof webSearchSchema, SearchRenderDetails> {
 	readonly name = "web_search";
+	readonly approval = "read" as const;
 	readonly label = "Web Search";
 	readonly description: string;
 	readonly parameters = webSearchSchema;
 	readonly strict = true;
+	readonly loadMode = "discoverable";
+	readonly summary = "Search the web for up-to-date information";
 
-	constructor(_session: ToolSession) {
-		this.description = renderPromptTemplate(webSearchDescription);
+	#session: ToolSession;
+
+	constructor(session: ToolSession) {
+		this.#session = session;
+		this.description = prompt.render(webSearchDescription);
 	}
 
 	async execute(
 		_toolCallId: string,
-		params: SearchParams,
-		_signal?: AbortSignal,
+		params: SearchToolParams,
+		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<SearchRenderDetails>,
 		_context?: AgentToolContext,
 	): Promise<AgentToolResult<SearchRenderDetails>> {
-		return executeSearch(_toolCallId, params);
+		const authStorage = this.#session.authStorage ?? (await discoverAuthStorage());
+		const sessionId = this.#session.getSessionId?.() ?? undefined;
+		return executeSearch(_toolCallId, params, {
+			authStorage,
+			modelRegistry: this.#session.modelRegistry,
+			modelName: this.#session.getActiveModel?.()?.id,
+			sessionId,
+			signal,
+		});
 	}
 }
 
-/** Web search tool as CustomTool (for TUI rendering support) */
+/** Web search tool as CustomTool for consumers embedding the custom-tool API. */
 export const webSearchCustomTool: CustomTool<typeof webSearchSchema, SearchRenderDetails> = {
 	name: "web_search",
 	label: "Web Search",
-	description: renderPromptTemplate(webSearchDescription),
+	description: prompt.render(webSearchDescription),
 	parameters: webSearchSchema,
 
-	async execute(toolCallId: string, params: SearchParams, _onUpdate, _ctx: CustomToolContext, _signal?: AbortSignal) {
-		return executeSearch(toolCallId, params);
+	approval: "read",
+	async execute(
+		toolCallId: string,
+		params: SearchToolParams,
+		_onUpdate,
+		ctx: CustomToolContext,
+		signal?: AbortSignal,
+	) {
+		const authStorage = ctx.modelRegistry?.authStorage ?? (await discoverAuthStorage());
+		const sessionId = ctx.sessionManager.getSessionId();
+		return executeSearch(toolCallId, params, {
+			authStorage,
+			modelRegistry: ctx.modelRegistry,
+			modelName: ctx.model?.id,
+			sessionId,
+			signal,
+		});
 	},
 
-	renderCall(args: SearchParams, options: RenderResultOptions, theme: Theme) {
+	renderCall(args: SearchToolParams, options: RenderResultOptions, theme: Theme) {
 		return renderSearchCall(args, options, theme);
 	},
 
-	renderResult(result, options: RenderResultOptions, theme: Theme) {
-		return renderSearchResult(result, options, theme);
+	renderResult(result, options: RenderResultOptions, theme: Theme, args) {
+		return renderSearchResult(result, options, theme, args);
 	},
 };
 
-// ============================================================================
-// Exa-specific tools (available when EXA_API_KEY is present)
-// ============================================================================
-
-/** Schema for deep search */
-const webSearchDeepSchema = Type.Object({
-	query: Type.String({ description: "Research query" }),
-	type: Type.Optional(
-		StringEnum(["keyword", "neural", "auto"], {
-			description: "Search type - neural (semantic), keyword (exact), or auto",
-		}),
-	),
-	include_domains: Type.Optional(
-		Type.Array(Type.String(), { description: "Only include results from these domains" }),
-	),
-	exclude_domains: Type.Optional(Type.Array(Type.String(), { description: "Exclude results from these domains" })),
-	start_published_date: Type.Optional(
-		Type.String({ description: "Filter results published after this date (ISO 8601)" }),
-	),
-	end_published_date: Type.Optional(
-		Type.String({ description: "Filter results published before this date (ISO 8601)" }),
-	),
-	num_results: Type.Optional(
-		Type.Number({ description: "Maximum results (default: 10, max: 100)", minimum: 1, maximum: 100 }),
-	),
-});
-
-/** Schema for code context search */
-const webSearchCodeContextSchema = Type.Object({
-	query: Type.String({ description: "Code or technical search query" }),
-	code_context: Type.Optional(Type.String({ description: "Additional context about what you're looking for" })),
-});
-
-/** Schema for URL crawling */
-const webSearchCrawlSchema = Type.Object({
-	url: Type.String({ description: "URL to crawl and extract content from" }),
-	text: Type.Optional(Type.Boolean({ description: "Include full page text content (default: false)" })),
-	highlights: Type.Optional(Type.Boolean({ description: "Include highlighted relevant snippets (default: false)" })),
-});
-
-/** Schema for LinkedIn search */
-const webSearchLinkedinSchema = Type.Object({
-	query: Type.String({ description: 'LinkedIn search query (e.g., "Software Engineer at OpenAI")' }),
-});
-
-/** Schema for company research */
-const webSearchCompanySchema = Type.Object({
-	company_name: Type.String({ description: "Name of the company to research" }),
-});
-
-/** Helper to execute Exa tool and format response */
-async function executeExaTool(
-	mcpToolName: string,
-	params: Record<string, unknown>,
-	toolName: string,
-): Promise<{ content: Array<{ type: "text"; text: string }>; details: ExaRenderDetails }> {
-	try {
-		const apiKey = await findExaKey();
-		const response = await callExaTool(mcpToolName, params, apiKey);
-
-		if (isSearchResponse(response)) {
-			const formatted = formatSearchResults(response);
-			return {
-				content: [{ type: "text" as const, text: formatted }],
-				details: { response, toolName },
-			};
-		}
-
-		return {
-			content: [{ type: "text" as const, text: JSON.stringify(response, null, 2) }],
-			details: { raw: response, toolName },
-		};
-	} catch (error) {
-		const message = error instanceof Error ? error.message : String(error);
-		return {
-			content: [{ type: "text" as const, text: `Error: ${message}` }],
-			details: { error: message, toolName },
-		};
-	}
+export function getSearchTools(): CustomTool<any, any>[] {
+	return [webSearchCustomTool];
 }
 
-/** Deep search - AI-synthesized research with multiple sources */
-export const webSearchDeepTool: CustomTool<typeof webSearchDeepSchema, ExaRenderDetails> = {
-	name: "web_search_deep",
-	label: "Deep Search",
-	description: `Natural language web search with synthesized results (requires Exa).
-
-Performs AI-powered deep research that synthesizes information from multiple sources.
-Best for complex research queries that need comprehensive answers.
-
-Parameters:
-- query: Research query (required)
-- type: Search type - neural (semantic), keyword (exact), or auto
-- include_domains/exclude_domains: Domain filters
-- start/end_published_date: Date range filter (ISO 8601)
-- num_results: Maximum results (default: 10)`,
-	parameters: webSearchDeepSchema,
-
-	async execute(_toolCallId, params, _onUpdate, _ctx, _signal) {
-		const { num_results, ...rest } = params as Record<string, unknown>;
-		const args = { ...rest, type: "auto", numResults: num_results ?? 10 };
-		return executeExaTool("web_search_exa", args, "web_search_deep");
-	},
-
-	renderCall(args, _options, theme) {
-		return renderExaCall(args as Record<string, unknown>, "Deep Search", theme);
-	},
-
-	renderResult(result, options, theme) {
-		return renderExaResult(result, options, theme);
-	},
-};
-
-/** Code context search - optimized for code snippets and documentation */
-export const webSearchCodeContextTool: CustomTool<typeof webSearchCodeContextSchema, ExaRenderDetails> = {
-	name: "web_search_code_context",
-	label: "Code Search",
-	description: `Search code snippets, documentation, and technical examples (requires Exa).
-
-Optimized for finding:
-- Code examples and snippets
-- API documentation
-- Technical tutorials
-- Stack Overflow answers
-- GitHub code references
-
-Parameters:
-- query: Code or technical search query (required)
-- code_context: Additional context about what you're looking for`,
-	parameters: webSearchCodeContextSchema,
-
-	async execute(_toolCallId, params, _onUpdate, _ctx, _signal) {
-		return executeExaTool("get_code_context_exa", params as Record<string, unknown>, "web_search_code_context");
-	},
-
-	renderCall(args, _options, theme) {
-		return renderExaCall(args as Record<string, unknown>, "Code Search", theme);
-	},
-
-	renderResult(result, options, theme) {
-		return renderExaResult(result, options, theme);
-	},
-};
-
-/** URL crawl - extract content from specific URLs */
-export const webSearchCrawlTool: CustomTool<typeof webSearchCrawlSchema, ExaRenderDetails> = {
-	name: "web_search_crawl",
-	label: "Crawl URL",
-	description: `Extract content from a specific URL (requires Exa).
-
-Fetches and extracts content from a URL with optional text and highlights.
-Useful when you have a specific URL and want its content.
-
-Parameters:
-- url: URL to crawl (required)
-- text: Include full page text content (default: false)
-- highlights: Include highlighted snippets (default: false)`,
-	parameters: webSearchCrawlSchema,
-
-	async execute(_toolCallId, params, _onUpdate, _ctx, _signal) {
-		return executeExaTool("crawling_exa", params as Record<string, unknown>, "web_search_crawl");
-	},
-
-	renderCall(args, _options, theme) {
-		const url = (args as { url: string }).url;
-		return renderExaCall({ query: url }, "Crawl URL", theme);
-	},
-
-	renderResult(result, options, theme) {
-		return renderExaResult(result, options, theme);
-	},
-};
-
-/** LinkedIn search - search LinkedIn profiles and companies */
-export const webSearchLinkedinTool: CustomTool<typeof webSearchLinkedinSchema, ExaRenderDetails> = {
-	name: "web_search_linkedin",
-	label: "LinkedIn Search",
-	description: `Search LinkedIn for people, companies, and professional content (requires Exa + LinkedIn addon).
-
-Returns LinkedIn profiles, company pages, posts, and professional content.
-
-Examples:
-- "Software Engineer at OpenAI"
-- "Y Combinator companies"
-- "CEO fintech startup San Francisco"
-
-Parameters:
-- query: LinkedIn search query (required)`,
-	parameters: webSearchLinkedinSchema,
-
-	async execute(_toolCallId, params, _onUpdate, _ctx, _signal) {
-		return executeExaTool("linkedin_search_exa", params as Record<string, unknown>, "web_search_linkedin");
-	},
-
-	renderCall(args, _options, theme) {
-		return renderExaCall(args as Record<string, unknown>, "LinkedIn Search", theme);
-	},
-
-	renderResult(result, options, theme) {
-		return renderExaResult(result, options, theme);
-	},
-};
-
-/** Company research - comprehensive company information */
-export const webSearchCompanyTool: CustomTool<typeof webSearchCompanySchema, ExaRenderDetails> = {
-	name: "web_search_company",
-	label: "Company Research",
-	description: `Comprehensive company research (requires Exa + Company addon).
-
-Returns detailed company information including:
-- Company overview and description
-- Recent news and announcements
-- Key people and leadership
-- Funding and financial information
-- Products and services
-
-Parameters:
-- company_name: Name of the company to research (required)`,
-	parameters: webSearchCompanySchema,
-
-	async execute(_toolCallId, params, _onUpdate, _ctx, _signal) {
-		return executeExaTool("company_research_exa", params as Record<string, unknown>, "web_search_company");
-	},
-
-	renderCall(args, _options, theme) {
-		const name = (args as { company_name: string }).company_name;
-		return renderExaCall({ query: name }, "Company Research", theme);
-	},
-
-	renderResult(result, options, theme) {
-		return renderExaResult(result, options, theme);
-	},
-};
-
-/** All Exa-specific web search tools */
-export const exaSearchTools: CustomTool<any, ExaRenderDetails>[] = [
-	webSearchDeepTool,
-	webSearchCodeContextTool,
-	webSearchCrawlTool,
-];
-
-/** LinkedIn-specific tool (requires LinkedIn addon on Exa account) */
-export const linkedinSearchTools: CustomTool<any, ExaRenderDetails>[] = [webSearchLinkedinTool];
-
-/** Company-specific tool (requires Company addon on Exa account) */
-export const companySearchTools: CustomTool<any, ExaRenderDetails>[] = [webSearchCompanyTool];
-
-export interface SearchToolsOptions {
-	/** Enable LinkedIn search tool (requires Exa LinkedIn addon) */
-	enableLinkedin?: boolean;
-	/** Enable company research tool (requires Exa Company addon) */
-	enableCompany?: boolean;
-}
-
-/**
- * Get all available web search tools based on API key availability.
- *
- * Returns:
- * - Always: web_search (unified, works with Anthropic/Perplexity/Exa)
- * - Always: web_search_deep, web_search_code_context (public Exa MCP tools)
- * - With EXA_API_KEY: web_search_crawl
- * - With EXA_API_KEY + options.enableLinkedin: web_search_linkedin
- * - With EXA_API_KEY + options.enableCompany: web_search_company
- */
-export async function getSearchTools(options: SearchToolsOptions = {}): Promise<CustomTool<any, any>[]> {
-	const tools: CustomTool<any, any>[] = [webSearchCustomTool];
-
-	tools.push(webSearchDeepTool, webSearchCodeContextTool);
-
-	// Advanced/add-on tools remain key-gated to avoid exposing known unauthenticated failures
-	const exaKey = await findExaKey();
-	if (exaKey) {
-		tools.push(webSearchCrawlTool);
-
-		if (options.enableLinkedin) {
-			tools.push(...linkedinSearchTools);
-		}
-		if (options.enableCompany) {
-			tools.push(...companySearchTools);
-		}
-	}
-
-	return tools;
-}
-export {
-	getSearchProvider,
-	setPreferredSearchProvider,
-} from "./provider";
-export type { SearchProviderId as SearchProvider, SearchResponse } from "./types";
+export { getSearchProvider, setExcludedSearchProviders, setSearchProviderOrder } from "./provider";
+export type { SearchProviderId as SearchProvider, SearchResponse } from "@oh-my-pi/pi-tui/tools/web-search";
+export { isSearchProviderId, isSearchProviderPreference } from "./types";

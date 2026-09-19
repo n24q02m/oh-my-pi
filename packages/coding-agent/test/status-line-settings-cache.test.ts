@@ -1,0 +1,375 @@
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { stripVTControlCharacters } from "node:util";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { StatusLineComponent, type StatusLineSettings } from "@oh-my-pi/pi-tui/status-line";
+import { statusLineHost } from "@oh-my-pi/pi-coding-agent/modes/status-line-host";
+import { STATUS_LINE_PRESETS } from "@oh-my-pi/pi-tui/status-line/presets";
+import { initTheme, theme } from "@oh-my-pi/pi-tui/theme";
+import { visibleWidth } from "@oh-my-pi/pi-tui";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
+import { removeSyncWithRetries, setProjectDir } from "@oh-my-pi/pi-utils";
+import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
+import { StatusLineTestComponents } from "./helpers/status-line";
+
+let settingsState: SettingsTestState | undefined;
+let projectDir = "";
+const statusLines = new StatusLineTestComponents();
+
+beforeEach(async () => {
+	settingsState = beginSettingsTest();
+	projectDir = fs.mkdtempSync(path.join(os.tmpdir(), "omp-status-line-settings-cache-"));
+	setProjectDir(projectDir);
+	await Settings.init({ inMemory: true, cwd: projectDir });
+	await initTheme();
+});
+
+afterEach(() => {
+	statusLines.dispose();
+	restoreSettingsTestState(settingsState);
+	settingsState = undefined;
+	if (projectDir) {
+		removeSyncWithRetries(projectDir);
+	}
+	projectDir = "";
+});
+
+function makeSession(sessionName = "Cache Session") {
+	const messages: unknown[] = [];
+	const model = { id: "test-model", name: "Test Model", contextWindow: 100_000 };
+	return {
+		state: { messages, model },
+		messages,
+		model,
+		systemPrompt: [],
+		agent: { state: { tools: [] } },
+		skills: [],
+		isStreaming: false,
+		isAutoThinking: false,
+		autoResolvedThinkingLevel: () => undefined,
+		isFastModeActive: () => false,
+		isAdvisorActive: () => false,
+		getAdvisorStatusOverview: () => ({ configured: false, advisors: [] }),
+		getAsyncJobSnapshot: () => ({ running: [] }),
+		settings: { get: () => false },
+		modelRegistry: { isUsingOAuth: () => false },
+		sessionManager: {
+			getSessionName: () => sessionName,
+			getUsageStatistics: () => ({
+				input: 0,
+				output: 0,
+				cacheRead: 0,
+				cacheWrite: 0,
+				totalTokens: 0,
+				orchestrationInput: 0,
+				orchestrationOutput: 0,
+				orchestrationCacheRead: 0,
+				premiumRequests: 0,
+				cost: 0,
+			}),
+		},
+		getContextUsage: () => undefined,
+	} as unknown as ConstructorParameters<typeof StatusLineComponent>[0];
+}
+
+function makeComponent(statusLineSettings: StatusLineSettings): StatusLineComponent {
+	const component = statusLines.track(new StatusLineComponent(makeSession(), statusLineHost));
+	component.updateSettings(statusLineSettings);
+	return component;
+}
+
+describe("StatusLineComponent effective settings cache", () => {
+	it("keeps repeated cached renders byte-identical across presets and widths", () => {
+		const cases: StatusLineSettings[] = [
+			{ preset: "default", sessionAccent: false },
+			{ preset: "minimal", sessionAccent: false },
+			{
+				preset: "custom",
+				leftSegments: ["pi", "model"],
+				rightSegments: ["session_name", "context_pct"],
+				separator: "pipe",
+				sessionAccent: false,
+				segmentOptions: { model: { showThinkingLevel: false } },
+			},
+		];
+
+		for (const statusLineSettings of cases) {
+			const component = makeComponent(statusLineSettings);
+			for (const width of [36, 120]) {
+				const first = component.getTopBorder(width);
+				const second = component.getTopBorder(width);
+				expect(second).toEqual(first);
+			}
+		}
+	});
+
+	it("skips the entire segment pipeline until a visible input invalidates it", () => {
+		const session = makeSession();
+		let snapshotCalls = 0;
+		const getSnapshot = session.getAsyncJobSnapshot.bind(session);
+		session.getAsyncJobSnapshot = () => {
+			snapshotCalls++;
+			return getSnapshot();
+		};
+		const component = statusLines.track(new StatusLineComponent(session, statusLineHost));
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["model", "mode"],
+			rightSegments: ["session_name"],
+			sessionAccent: false,
+		});
+
+		const first = component.getTopBorder(120);
+		const second = component.getTopBorder(120);
+		expect(second).toEqual(first);
+		expect(snapshotCalls).toBe(1);
+
+		component.invalidate();
+		component.getTopBorder(120);
+		expect(snapshotCalls).toBe(2);
+
+		component.setPlanModeStatus({ enabled: true, paused: false });
+		const withPlan = stripVTControlCharacters(component.getTopBorder(120).content);
+		expect(withPlan).toContain("Plan");
+		expect(snapshotCalls).toBe(3);
+
+		const mutableModel = session.state.model as { name: string };
+		mutableModel.name = "Renamed Model";
+		const withModel = stripVTControlCharacters(component.getTopBorder(120).content);
+		expect(withModel).toContain("Renamed Model");
+		expect(snapshotCalls).toBe(4);
+
+		const mutableMessages = session.messages as unknown[];
+		mutableMessages.push({ role: "user", content: "new tail" });
+		component.getTopBorder(120);
+		expect(snapshotCalls).toBe(5);
+	});
+
+	it("invalidates on updateSettings and reflects hook visibility changes", () => {
+		const component = makeComponent({
+			preset: "custom",
+			leftSegments: ["pi"],
+			rightSegments: [],
+			separator: "none",
+			showHookStatus: false,
+		});
+		const firstEffective = component.getEffectiveSettingsForTest();
+		component.setHookStatus("lint", "lint running");
+		expect(component.render(80)).toEqual([]);
+
+		component.updateSettings({
+			preset: "custom",
+			leftSegments: ["session_name"],
+			rightSegments: [],
+			separator: "slash",
+			showHookStatus: true,
+			sessionAccent: false,
+			segmentOptions: { path: { maxLength: 12 } },
+		});
+
+		const secondEffective = component.getEffectiveSettingsForTest();
+		expect(secondEffective).not.toBe(firstEffective);
+		expect(secondEffective.separator).toBe("slash");
+		expect(secondEffective.sessionAccent).toBe(false);
+		expect(secondEffective.segmentOptions.path?.maxLength).toBe(12);
+		expect(stripVTControlCharacters(component.getTopBorder(80).content)).toContain("Cache Session");
+		expect(component.render(80)).toEqual(["lint running"]);
+	});
+
+	it("preserves preset option siblings while user segment options win", () => {
+		const component = makeComponent({
+			preset: "default",
+			segmentOptions: {
+				path: { maxLength: 7 },
+				git: { showUntracked: false },
+			},
+		});
+
+		const effective = component.getEffectiveSettingsForTest();
+		expect(effective.segmentOptions.path).toEqual({ abbreviate: true, maxLength: 7, stripWorkPrefix: true });
+		expect(effective.segmentOptions.git?.showBranch).toBe(true);
+		expect(effective.segmentOptions.git?.showStaged).toBe(true);
+		expect(effective.segmentOptions.git?.showUnstaged).toBe(true);
+		expect(effective.segmentOptions.git?.showUntracked).toBe(false);
+	});
+
+	it("uses custom segment arrays only for the custom preset", () => {
+		const defaultComponent = makeComponent({ preset: "default", leftSegments: ["session_name"], rightSegments: [] });
+		expect(defaultComponent.getEffectiveSettingsForTest().leftSegments).toEqual(
+			STATUS_LINE_PRESETS.default.leftSegments,
+		);
+
+		const customComponent = makeComponent({ preset: "custom", leftSegments: [], rightSegments: [] });
+		expect(customComponent.getEffectiveSettingsForTest().leftSegments).toEqual([]);
+		expect(customComponent.getEffectiveSettingsForTest().rightSegments).toEqual([]);
+		expect(customComponent.getTopBorder(120)).toEqual({ content: "", width: 0, revision: 0 });
+	});
+
+	it("renders custom preset defaults when segment arrays are unconfigured", () => {
+		Settings.instance.override("statusLine.preset", "custom");
+		const component = makeComponent({
+			preset: Settings.instance.get("statusLine.preset"),
+			leftSegments: Settings.instance.get("statusLine.leftSegments"),
+			rightSegments: Settings.instance.get("statusLine.rightSegments"),
+			sessionAccent: false,
+		});
+
+		const effective = component.getEffectiveSettingsForTest();
+		expect(effective.leftSegments).toEqual(STATUS_LINE_PRESETS.custom.leftSegments);
+		expect(effective.rightSegments).toEqual(STATUS_LINE_PRESETS.custom.rightSegments);
+
+		const content = stripVTControlCharacters(component.getTopBorder(120).content);
+		expect(content).toContain("Test Model");
+		expect(content).toContain("Cache Session");
+	});
+
+	it("surfaces active subagents even when custom segments omit subagents", () => {
+		const component = makeComponent({ preset: "custom", leftSegments: [], rightSegments: [] });
+
+		component.setRunningSubagents(["sub-1", "sub-2"]);
+
+		const content = stripVTControlCharacters(component.getTopBorder(120).content);
+		expect(content).toContain(`${theme.icon.agents} 2`);
+		expect(content).not.toContain("agents");
+	});
+
+	it("keeps plan and hook state dynamic without settings invalidation", () => {
+		const component = makeComponent({ preset: "custom", leftSegments: ["mode"], rightSegments: [] });
+		const effective = component.getEffectiveSettingsForTest();
+		expect(component.getTopBorder(80).content).toBe("");
+
+		component.setPlanModeStatus({ enabled: true, paused: false });
+		expect(stripVTControlCharacters(component.getTopBorder(80).content)).toContain("Plan");
+		expect(component.getEffectiveSettingsForTest()).toBe(effective);
+
+		component.setHookStatus("hook", "hook running");
+		expect(component.render(80)).toEqual(["hook running"]);
+		component.setHookStatus("hook", "hook done");
+		expect(component.render(80)).toEqual(["hook done"]);
+		expect(component.getEffectiveSettingsForTest()).toBe(effective);
+	});
+
+	it("renders arbitrary extension statuses in deterministic segment order", () => {
+		const component = makeComponent({
+			preset: "custom",
+			leftSegments: ["pi", "status", "model"],
+			rightSegments: [],
+			separator: "powerline-thin",
+			showHookStatus: false,
+			sessionAccent: false,
+			segmentOptions: { model: { showThinkingLevel: false } },
+		});
+
+		component.setHookStatus("z-tests", "Tests passing");
+		component.setHookStatus("a-indexer", "\x1b]8;;https://example.com\x07Indexer ready\x1b]8;;\x07");
+
+		const border = component.getTopBorder(120).content;
+		const content = stripVTControlCharacters(border);
+		expect(border).not.toContain("https://example.com");
+		expect(content.indexOf("Indexer ready")).toBeGreaterThanOrEqual(0);
+		expect(content.indexOf("Indexer ready")).toBeLessThan(content.indexOf("Tests passing"));
+		expect(content.indexOf("Tests passing")).toBeLessThan(content.indexOf("Test Model"));
+		expect(component.render(120)).toEqual([]);
+		expect(visibleWidth(component.getTopBorder(24).content)).toBeLessThanOrEqual(24);
+
+		component.setHookStatus("a-indexer", undefined);
+		component.setHookStatus("z-tests", undefined);
+		const cleared = stripVTControlCharacters(component.getTopBorder(120).content);
+		expect(cleared).not.toContain("Indexer ready");
+		expect(cleared).not.toContain("Tests passing");
+	});
+
+	it("does not mutate shared preset segment options during narrow renders", () => {
+		const before = { ...STATUS_LINE_PRESETS.default.segmentOptions?.path };
+		const component = makeComponent({ preset: "default", sessionAccent: false });
+
+		component.getTopBorder(12);
+		component.getTopBorder(200);
+
+		expect(STATUS_LINE_PRESETS.default.segmentOptions?.path).toEqual(before);
+		expect(component.getEffectiveSettingsForTest().segmentOptions.path).toEqual(before);
+	});
+
+	it("reuses the effective-settings object until settings change", () => {
+		const component = makeComponent({ preset: "default", sessionAccent: false });
+		const effective = component.getEffectiveSettingsForTest();
+
+		for (let i = 0; i < 5; i++) {
+			component.getTopBorder(100);
+			expect(component.getEffectiveSettingsForTest()).toBe(effective);
+		}
+
+		component.updateSettings({ preset: "minimal", sessionAccent: false });
+		const nextEffective = component.getEffectiveSettingsForTest();
+		expect(nextEffective).not.toBe(effective);
+		expect(component.getEffectiveSettingsForTest()).toBe(nextEffective);
+	});
+	it("skips git probes when git integration is disabled", async () => {
+		const headSpy = spyOn(vcs, "gitInfo");
+		const statusSpy = spyOn(vcs, "watch");
+		const repoSpy = spyOn(vcs, "repo");
+		try {
+			Settings.instance.override("git.enabled", false);
+			const component = makeComponent({
+				preset: "custom",
+				leftSegments: ["git", "pr"],
+				rightSegments: [],
+				sessionAccent: false,
+			});
+
+			component.watchBranch(() => {
+				throw new Error("git watcher should not fire while git integration is disabled");
+			});
+			component.getTopBorder(100);
+			await Promise.resolve();
+
+			expect(repoSpy).not.toHaveBeenCalled();
+			expect(headSpy).not.toHaveBeenCalled();
+			expect(statusSpy).not.toHaveBeenCalled();
+		} finally {
+			repoSpy.mockRestore();
+			statusSpy.mockRestore();
+			headSpy.mockRestore();
+		}
+	});
+
+	it("skips git probes when no git-backed segment is visible", async () => {
+		const headSpy = spyOn(vcs, "gitInfo");
+		const statusSpy = spyOn(vcs, "watch");
+		const repoSpy = spyOn(vcs, "repo");
+		try {
+			const component = makeComponent({
+				preset: "custom",
+				leftSegments: ["pi"],
+				rightSegments: ["session_name"],
+				sessionAccent: false,
+			});
+
+			component.watchBranch(() => {
+				throw new Error("git watcher should not fire when no git-backed segment is visible");
+			});
+			component.getTopBorder(100);
+			await Promise.resolve();
+
+			expect(repoSpy).not.toHaveBeenCalled();
+			expect(headSpy).not.toHaveBeenCalled();
+			expect(statusSpy).not.toHaveBeenCalled();
+		} finally {
+			repoSpy.mockRestore();
+			statusSpy.mockRestore();
+			headSpy.mockRestore();
+		}
+	});
+});
+
+describe("StatusLineComponent hook statuses", () => {
+	it("renders every keyed status on a deterministic line", () => {
+		const component = makeComponent({ showHookStatus: true });
+		component.setHookStatus("project-time", "$0.04 (dev)");
+		component.setHookStatus("ponytail", "Ponytail");
+
+		expect(component.render(8)).toEqual(["Ponytail", "$0.04 (…"]);
+	});
+});

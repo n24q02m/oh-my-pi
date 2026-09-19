@@ -7,49 +7,34 @@
  */
 import * as fs from "node:fs/promises";
 import path from "node:path";
+import type { EditStore } from "@oh-my-pi/pi-natives";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import { glob } from "@oh-my-pi/pi-natives";
-import { formatHashLines } from "../patch/hashline";
+import type { ImageContent } from "@oh-my-pi/pi-ai";
+import { formatAge, formatBytes, isProbablyBinary, readImageMetadata } from "@oh-my-pi/pi-utils";
+import {
+	formatHashlineHeader,
+	formatNumberedLines,
+	splitAddressableFileLines,
+} from "@oh-my-pi/pi-tui/tools/hashline-format";
+import { normalizeToLF } from "../edit/normalize";
 import type { FileMentionMessage } from "../session/messages";
 import {
 	DEFAULT_MAX_BYTES,
 	formatHeadTruncationNotice,
 	truncateHead,
 	truncateHeadBytes,
-} from "../session/streaming-output";
+} from "@oh-my-pi/pi-tui/tools/streaming-output";
 import { resolveReadPath } from "../tools/path-utils";
-import { formatAge, formatBytes } from "../tools/render-utils";
-import { fuzzyMatch } from "./fuzzy";
 import { formatDimensionNote, resizeImage } from "./image-resize";
-import { detectSupportedImageMimeTypeFromFile } from "./mime";
+import { VideoError, buildVideoContactSheetPng, formatVideoDetails, probeVideo, videoMimeForPath } from "./video";
+import { createVideoPreviewImage, isVideoPath } from "@oh-my-pi/pi-tui/prompt/video";
 
 /** Regex to match @filepath patterns in text */
-const FILE_MENTION_REGEX = /@([^\s@]+)/g;
+const FILE_MENTION_REGEX = /@(?:"([^"]+)"|'([^']+)'|([^\s@]+))/g;
 const LEADING_PUNCTUATION_REGEX = /^[`"'([{<]+/;
 const TRAILING_PUNCTUATION_REGEX = /[)\]}>.,;:!?"'`]+$/;
 const MENTION_BOUNDARY_REGEX = /[\s([{<"'`]/;
 const DEFAULT_DIR_LIMIT = 500;
-const MIN_FUZZY_QUERY_LENGTH = 5;
-const MAX_RESOLUTION_CANDIDATES = 20_000;
-const PATH_SEPARATOR_REGEX = /[/._\-\s]+/g;
-
-type MentionDiscoveryProfile = {
-	hidden: boolean;
-	gitignore: boolean;
-	includeNodeModules: boolean;
-	maxResults: number;
-	cache: boolean;
-};
-
-function getMentionCandidateDiscoveryProfile(): MentionDiscoveryProfile {
-	return {
-		hidden: true,
-		gitignore: true,
-		cache: true,
-		includeNodeModules: true,
-		maxResults: MAX_RESOLUTION_CANDIDATES,
-	};
-}
 
 // Avoid OOM when users @mention very large files. Above these limits we skip
 // auto-reading and only include the path in the message.
@@ -69,94 +54,21 @@ function sanitizeMentionPath(rawPath: string): string | null {
 	return cleaned.length > 0 ? cleaned : null;
 }
 
-type MentionCandidate = {
-	path: string;
-	pathLower: string;
-	normalizedPath: string;
-};
-
-function normalizeMentionQuery(query: string): string {
-	return query.toLowerCase().replace(PATH_SEPARATOR_REGEX, "");
-}
-
-async function pathExists(filePath: string): Promise<boolean> {
-	try {
-		await Bun.file(filePath).stat();
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-async function listMentionCandidates(cwd: string): Promise<MentionCandidate[]> {
-	let entries: string[];
-	try {
-		const discoveryProfile = getMentionCandidateDiscoveryProfile();
-		const result = await glob({
-			pattern: "**/*",
-			path: cwd,
-			...discoveryProfile,
-		});
-		entries = result.matches.map(match => match.path);
-	} catch {
-		return [];
-	}
-
-	entries.sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
-	const candidates: MentionCandidate[] = [];
-	for (const entry of entries) {
-		const pathLower = entry.toLowerCase();
-		const normalizedPath = normalizeMentionQuery(entry);
-		if (normalizedPath.length === 0) {
-			continue;
-		}
-		candidates.push({ path: entry, pathLower, normalizedPath });
-	}
-	return candidates;
-}
-
 async function resolveMentionPath(
 	filePath: string,
 	cwd: string,
-	getMentionCandidates: () => Promise<MentionCandidate[]>,
-): Promise<string | null> {
+): Promise<{ resolvedPath: string; absolutePath: string } | null> {
+	// Exact resolution only. The TUI @-selector inserts the real, complete path, so a
+	// mention that does not resolve to an existing file or directory is prose, not a file
+	// reference. Fuzzy/prefix guessing here previously dragged in unrelated same-named
+	// files; that disambiguation belongs to the selector's display, not post-send.
 	const absolutePath = resolveReadPath(filePath, cwd);
-	if (await pathExists(absolutePath)) {
-		return filePath;
-	}
-
-	const queryLower = filePath.toLowerCase();
-	const candidates = await getMentionCandidates();
-	const prefixMatches = candidates.filter(candidate => candidate.pathLower.startsWith(queryLower));
-	if (prefixMatches.length === 1) {
-		return prefixMatches[0]?.path ?? null;
-	}
-	if (prefixMatches.length > 1) {
+	try {
+		await Bun.file(absolutePath).stat();
+		return { resolvedPath: filePath, absolutePath };
+	} catch {
 		return null;
 	}
-
-	const normalizedQuery = normalizeMentionQuery(filePath);
-	if (normalizedQuery.length < MIN_FUZZY_QUERY_LENGTH) {
-		return null;
-	}
-
-	const scored = candidates
-		.map(candidate => ({ candidate, match: fuzzyMatch(normalizedQuery, candidate.normalizedPath) }))
-		.filter(entry => entry.match.matches)
-		.sort((a, b) => {
-			if (a.match.score !== b.match.score) {
-				return a.match.score - b.match.score;
-			}
-			return a.candidate.path.localeCompare(b.candidate.path);
-		});
-
-	if (scored.length === 0) {
-		return null;
-	}
-
-	const best = scored[0];
-
-	return best?.candidate.path ?? null;
 }
 
 function buildTextOutput(textContent: string): { output: string; lineCount: number } {
@@ -261,7 +173,10 @@ export function extractFileMentions(text: string): string[] {
 		const index = match.index ?? 0;
 		if (!isMentionBoundary(text, index)) continue;
 
-		const cleaned = sanitizeMentionPath(match[1]);
+		const rawPath = match[1] ?? match[2] ?? match[3];
+		if (!rawPath) continue;
+
+		const cleaned = match[1] !== undefined || match[2] !== undefined ? rawPath.trim() : sanitizeMentionPath(rawPath);
 		if (!cleaned) continue;
 
 		mentions.push(cleaned);
@@ -277,25 +192,20 @@ export function extractFileMentions(text: string): string[] {
 export async function generateFileMentionMessages(
 	filePaths: string[],
 	cwd: string,
-	options?: { autoResizeImages?: boolean; useHashLines?: boolean },
+	options?: { autoResizeImages?: boolean; useHashLines?: boolean; snapshotStore?: EditStore },
 ): Promise<AgentMessage[]> {
 	if (filePaths.length === 0) return [];
 
 	const autoResizeImages = options?.autoResizeImages ?? true;
 
 	const files: FileMentionMessage["files"] = [];
-	let mentionCandidatesPromise: Promise<MentionCandidate[]> | null = null;
-	const getMentionCandidates = (): Promise<MentionCandidate[]> => {
-		mentionCandidatesPromise ??= listMentionCandidates(cwd);
-		return mentionCandidatesPromise;
-	};
 
 	for (const filePath of filePaths) {
-		const resolvedPath = await resolveMentionPath(filePath, cwd, getMentionCandidates);
-		if (!resolvedPath) {
+		const resolved = await resolveMentionPath(filePath, cwd);
+		if (!resolved) {
 			continue;
 		}
-		const absolutePath = resolveReadPath(resolvedPath, cwd);
+		const { resolvedPath, absolutePath } = resolved;
 		try {
 			const stat = await Bun.file(absolutePath).stat();
 			if (stat.isDirectory()) {
@@ -304,7 +214,8 @@ export async function generateFileMentionMessages(
 				continue;
 			}
 
-			const mimeType = await detectSupportedImageMimeTypeFromFile(absolutePath);
+			const imageMetadata = await readImageMetadata(absolutePath);
+			const mimeType = imageMetadata?.mimeType;
 			if (mimeType) {
 				if (stat.size > MAX_AUTO_READ_IMAGE_BYTES) {
 					files.push({
@@ -321,7 +232,7 @@ export async function generateFileMentionMessages(
 				}
 
 				const base64Content = buffer.toBase64();
-				let image = { type: "image" as const, mimeType, data: base64Content };
+				let image: ImageContent = { type: "image", mimeType, data: base64Content };
 				let dimensionNote: string | undefined;
 
 				if (autoResizeImages) {
@@ -329,16 +240,49 @@ export async function generateFileMentionMessages(
 						const resized = await resizeImage({ type: "image", data: base64Content, mimeType });
 						dimensionNote = formatDimensionNote(resized);
 						image = {
-							type: "image" as const,
+							type: "image",
 							mimeType: resized.mimeType,
 							data: resized.data,
 						};
 					} catch {
-						image = { type: "image" as const, mimeType, data: base64Content };
+						image = { type: "image", mimeType, data: base64Content };
 					}
 				}
 
 				files.push({ path: resolvedPath, content: dimensionNote ?? "", image });
+				continue;
+			}
+
+			if (isVideoPath(absolutePath)) {
+				try {
+					const meta = await probeVideo(absolutePath);
+					const sheet = await buildVideoContactSheetPng(absolutePath, meta);
+					let image: ImageContent = { type: "image", data: sheet.png.data, mimeType: sheet.png.mimeType };
+					let dimensionNote: string | undefined;
+					if (autoResizeImages) {
+						try {
+							const resized = await resizeImage(image);
+							dimensionNote = formatDimensionNote(resized);
+							image = { type: "image", mimeType: resized.mimeType, data: resized.data };
+						} catch {
+							// Keep the extracted sheet when resize fails.
+						}
+					}
+					const details = formatVideoDetails(resolvedPath, meta, stat.size, videoMimeForPath(absolutePath));
+					files.push({
+						path: resolvedPath,
+						content: `${details}\nPreview grid: ${sheet.thumbs} frames (${sheet.cols}x${sheet.rows})${dimensionNote ? `\n${dimensionNote}` : ""}`,
+						image: createVideoPreviewImage(image, absolutePath),
+					});
+				} catch (error) {
+					const reason = error instanceof VideoError ? error.message : "video preview failed";
+					files.push({
+						path: resolvedPath,
+						content: `(skipped auto-read: ${reason})`,
+						byteSize: stat.size,
+						skippedReason: "binary",
+					});
+				}
 				continue;
 			}
 
@@ -351,11 +295,26 @@ export async function generateFileMentionMessages(
 				});
 				continue;
 			}
+			if (await isProbablyBinary(absolutePath)) {
+				files.push({
+					path: resolvedPath,
+					content: `(skipped auto-read: binary file, ${formatBytes(stat.size)})`,
+					byteSize: stat.size,
+					skippedReason: "binary",
+				});
+				continue;
+			}
 
 			const content = await Bun.file(absolutePath).text();
-			let { output, lineCount } = buildTextOutput(content);
-			if (options?.useHashLines) {
-				output = formatHashLines(output);
+			const snapshotStore = options?.useHashLines ? options.snapshotStore : undefined;
+			const normalized = snapshotStore ? normalizeToLF(content) : content;
+			const displayText = snapshotStore ? splitAddressableFileLines(normalized).join("\n") : normalized;
+			const textOutput = buildTextOutput(displayText);
+			let { output } = textOutput;
+			const { lineCount } = textOutput;
+			if (snapshotStore) {
+				const tag = snapshotStore.recordSnapshot(absolutePath, normalized);
+				output = `${formatHashlineHeader(resolvedPath, tag)}\n${formatNumberedLines(output)}`;
 			}
 			files.push({ path: resolvedPath, content: output, lineCount });
 		} catch {

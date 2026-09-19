@@ -1,12 +1,17 @@
-import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
 import { type ChildProcess, execSync, spawn } from "node:child_process";
 import * as fs from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
-import { getBundledModel } from "@oh-my-pi/pi-ai/models";
-import { complete, stream } from "@oh-my-pi/pi-ai/stream";
+import { type } from "@oh-my-pi/omptype";
+import { Effort } from "@oh-my-pi/pi-ai";
+import { __resetVertexTokenCache } from "@oh-my-pi/pi-ai/providers/google-auth";
+import { complete, getEnvApiKey, stream } from "@oh-my-pi/pi-ai/stream";
 import type { Api, Context, ImageContent, Model, OptionsForApi, Tool, ToolResultMessage } from "@oh-my-pi/pi-ai/types";
-import { StringEnum } from "@oh-my-pi/pi-ai/utils/schema";
-import { Type } from "@sinclair/typebox";
+import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { $which } from "@oh-my-pi/pi-utils";
+import { removeWithRetries } from "../../utils/src/temp";
 import { e2eApiKey, resolveApiKey } from "./oauth";
 
 // Resolve OAuth tokens at module level (async, runs before tests)
@@ -20,26 +25,22 @@ const oauthTokens = await Promise.all([
 const [anthropicOAuthToken, githubCopilotToken, geminiCliToken, antigravityToken, openaiCodexToken] = oauthTokens;
 
 function hasBedrockCredentials(): boolean {
-	const region = Bun.env.AWS_REGION ?? Bun.env.AWS_DEFAULT_REGION;
+	const region = e2eApiKey("AWS_REGION") ?? e2eApiKey("AWS_DEFAULT_REGION");
 	if (!region) return false;
 
 	// Conservative check: Bedrock needs a region plus either explicit env creds or a profile.
-	// (There are other ways to authenticate, but we avoid running E2E tests accidentally.)
+	// Reads go through e2eApiKey so the live test only runs under E2E=1.
+	const awsProfile = e2eApiKey("AWS_PROFILE");
 	return Boolean(
-		(Bun.env.AWS_ACCESS_KEY_ID && Bun.env.AWS_SECRET_ACCESS_KEY) ||
-			(Bun.env.AWS_PROFILE && Bun.env.AWS_PROFILE.length > 0),
+		(e2eApiKey("AWS_ACCESS_KEY_ID") && e2eApiKey("AWS_SECRET_ACCESS_KEY")) || (awsProfile && awsProfile.length > 0),
 	);
 }
 
 // Calculator tool definition (same as examples)
-// Note: Using StringEnum helper because Google's API doesn't support anyOf/const patterns
-// that Type.Enum generates. Google requires { type: "string", enum: [...] } format.
-const calculatorSchema = Type.Object({
-	a: Type.Number({ description: "First number" }),
-	b: Type.Number({ description: "Second number" }),
-	operation: StringEnum(["add", "subtract", "multiply", "divide"], {
-		description: "The operation to perform. One of 'add', 'subtract', 'multiply', 'divide'.",
-	}),
+const calculatorSchema = type({
+	a: "number",
+	b: "number",
+	operation: "'add'|'subtract'|'multiply'|'divide'",
 });
 
 const calculatorTool: Tool<typeof calculatorSchema> = {
@@ -50,13 +51,12 @@ const calculatorTool: Tool<typeof calculatorSchema> = {
 
 async function basicTextGeneration<TApi extends Api>(model: Model<TApi>, options?: OptionsForApi<TApi>) {
 	const context: Context = {
-		systemPrompt: "You are a helpful assistant. Be concise.",
+		systemPrompt: ["You are a helpful assistant. Be concise."],
 		messages: [{ role: "user", content: "Reply with exactly: 'Hello test successful'", timestamp: Date.now() }],
 	};
 	const response = await complete(model, context, options);
 
 	expect(response.role).toBe("assistant");
-	expect(response.content).toBeTruthy();
 	expect(response.usage.input + response.usage.cacheRead).toBeGreaterThan(0);
 	expect(response.usage.output).toBeGreaterThan(0);
 	expect(response.errorMessage).toBeFalsy();
@@ -68,7 +68,6 @@ async function basicTextGeneration<TApi extends Api>(model: Model<TApi>, options
 	const secondResponse = await complete(model, context, options);
 
 	expect(secondResponse.role).toBe("assistant");
-	expect(secondResponse.content).toBeTruthy();
 	expect(secondResponse.usage.input + secondResponse.usage.cacheRead).toBeGreaterThan(0);
 	expect(secondResponse.usage.output).toBeGreaterThan(0);
 	expect(secondResponse.errorMessage).toBeFalsy();
@@ -79,7 +78,7 @@ async function basicTextGeneration<TApi extends Api>(model: Model<TApi>, options
 
 async function handleToolCall<TApi extends Api>(model: Model<TApi>, options?: OptionsForApi<TApi>) {
 	const context: Context = {
-		systemPrompt: "You are a helpful assistant that uses tools when asked.",
+		systemPrompt: ["You are a helpful assistant that uses tools when asked."],
 		messages: [
 			{
 				role: "user",
@@ -90,7 +89,7 @@ async function handleToolCall<TApi extends Api>(model: Model<TApi>, options?: Op
 		tools: [calculatorTool],
 	};
 
-	const s = await stream(model, context, options);
+	const s = stream(model, context, options);
 	let hasToolStart = false;
 	let hasToolDelta = false;
 	let hasToolEnd = false;
@@ -259,7 +258,6 @@ async function handleImage<TApi extends Api>(model: Model<TApi>, options?: Optio
 	const response = await complete(model, context, options);
 
 	// Check the response mentions red and circle
-	expect(response.content.length > 0).toBeTruthy();
 	const textContent = response.content.find(b => b.type === "text");
 	if (textContent && textContent.type === "text") {
 		const lowerContent = textContent.text.toLowerCase();
@@ -270,7 +268,7 @@ async function handleImage<TApi extends Api>(model: Model<TApi>, options?: Optio
 
 async function multiTurn<TApi extends Api>(model: Model<TApi>, options?: OptionsForApi<TApi>) {
 	const context: Context = {
-		systemPrompt: "You are a helpful assistant that can use tools to answer questions.",
+		systemPrompt: ["You are a helpful assistant that can use tools to answer questions."],
 		messages: [
 			{
 				role: "user",
@@ -308,7 +306,9 @@ async function multiTurn<TApi extends Api>(model: Model<TApi>, options?: Options
 				expect(block.id).toBeTruthy();
 				expect(block.arguments).toBeTruthy();
 
-				const { a, b, operation } = block.arguments;
+				const a = Number(block.arguments.a);
+				const b = Number(block.arguments.b);
+				const operation = typeof block.arguments.operation === "string" ? block.arguments.operation : "";
 				let result: number;
 				switch (operation) {
 					case "add":
@@ -345,7 +345,6 @@ async function multiTurn<TApi extends Api>(model: Model<TApi>, options?: Options
 	expect(hasSeenThinking || hasSeenToolCalls).toBe(true);
 
 	// The accumulated text should reference both calculations
-	expect(allTextContent).toBeTruthy();
 	expect(allTextContent.includes("714")).toBe(true);
 	expect(allTextContent.includes("887")).toBe(true);
 }
@@ -403,12 +402,421 @@ describe("Generate E2E Tests", () => {
 		);
 	});
 
+	describe("google-vertex env auth", () => {
+		it("treats GOOGLE_CLOUD_API_KEY as a configured google-vertex credential", () => {
+			const originalApiKey = Bun.env.GOOGLE_CLOUD_API_KEY;
+			const originalProject = Bun.env.GOOGLE_CLOUD_PROJECT;
+			const originalGcloudProject = Bun.env.GCLOUD_PROJECT;
+			const originalLocation = Bun.env.GOOGLE_CLOUD_LOCATION;
+			const originalApplicationCredentials = Bun.env.GOOGLE_APPLICATION_CREDENTIALS;
+
+			try {
+				Bun.env.GOOGLE_CLOUD_API_KEY = "vertex-test-key";
+				delete Bun.env.GOOGLE_CLOUD_PROJECT;
+				delete Bun.env.GCLOUD_PROJECT;
+				delete Bun.env.GOOGLE_CLOUD_LOCATION;
+				delete Bun.env.GOOGLE_APPLICATION_CREDENTIALS;
+
+				expect(getEnvApiKey("google-vertex")).toBe("vertex-test-key");
+			} finally {
+				if (originalApiKey === undefined) delete Bun.env.GOOGLE_CLOUD_API_KEY;
+				else Bun.env.GOOGLE_CLOUD_API_KEY = originalApiKey;
+				if (originalProject === undefined) delete Bun.env.GOOGLE_CLOUD_PROJECT;
+				else Bun.env.GOOGLE_CLOUD_PROJECT = originalProject;
+				if (originalGcloudProject === undefined) delete Bun.env.GCLOUD_PROJECT;
+				else Bun.env.GCLOUD_PROJECT = originalGcloudProject;
+				if (originalLocation === undefined) delete Bun.env.GOOGLE_CLOUD_LOCATION;
+				else Bun.env.GOOGLE_CLOUD_LOCATION = originalLocation;
+				if (originalApplicationCredentials === undefined) delete Bun.env.GOOGLE_APPLICATION_CREDENTIALS;
+				else Bun.env.GOOGLE_APPLICATION_CREDENTIALS = originalApplicationCredentials;
+			}
+		});
+
+		it("ignores sentinel apiKey values like '<authenticated>' passed from agent loop", async () => {
+			const originalProject = Bun.env.GOOGLE_CLOUD_PROJECT;
+			const originalLocation = Bun.env.GOOGLE_CLOUD_LOCATION;
+			const originalApiKey = Bun.env.GOOGLE_CLOUD_API_KEY;
+			const llm = getBundledModel("google-vertex", "gemini-3-flash-preview");
+			const controller = new AbortController();
+			controller.abort();
+
+			// Capture console.debug to detect SDK warnings
+			const debugMessages: string[] = [];
+			const origDebug = console.debug;
+			console.debug = (...args: unknown[]) => {
+				debugMessages.push(args.map(String).join(" "));
+			};
+
+			try {
+				Bun.env.GOOGLE_CLOUD_PROJECT = "test-project";
+				Bun.env.GOOGLE_CLOUD_LOCATION = "us-central1";
+				delete Bun.env.GOOGLE_CLOUD_API_KEY;
+
+				// The agent loop passes "<authenticated>" as apiKey for credential-less providers.
+				// google-vertex should ignore this sentinel and use ADC (project/location) instead.
+				await complete(
+					llm,
+					{ messages: [{ role: "user", content: "Hello", timestamp: Date.now() }] },
+					{ apiKey: "<authenticated>", signal: controller.signal },
+				);
+
+				// Should NOT trigger the SDK warning about API key taking precedence
+				const hasWarning = debugMessages.some(m => m.includes("API key will take precedence"));
+				expect(hasWarning).toBe(false);
+			} finally {
+				console.debug = origDebug;
+				if (originalProject === undefined) delete Bun.env.GOOGLE_CLOUD_PROJECT;
+				else Bun.env.GOOGLE_CLOUD_PROJECT = originalProject;
+				if (originalLocation === undefined) delete Bun.env.GOOGLE_CLOUD_LOCATION;
+				else Bun.env.GOOGLE_CLOUD_LOCATION = originalLocation;
+				if (originalApiKey === undefined) delete Bun.env.GOOGLE_CLOUD_API_KEY;
+				else Bun.env.GOOGLE_CLOUD_API_KEY = originalApiKey;
+			}
+		});
+
+		it("keeps every system prompt array entry in Vertex systemInstruction", async () => {
+			const llm = getBundledModel("google-vertex", "gemini-3-flash-preview");
+			const controller = new AbortController();
+			const { promise, resolve } = Promise.withResolvers<{
+				config: { systemInstruction?: unknown };
+				contents: unknown[];
+			}>();
+			const events = stream(
+				llm,
+				{
+					systemPrompt: ["Primary instruction.", "Secondary instruction."],
+					messages: [{ role: "user", content: "Hello", timestamp: Date.now() }],
+				},
+				{
+					apiKey: "vertex-test-key",
+					signal: controller.signal,
+					onPayload: payload => {
+						resolve(payload as { config: { systemInstruction?: unknown }; contents: unknown[] });
+						controller.abort();
+					},
+				},
+			);
+
+			const drain = (async () => {
+				for await (const _ of events) {
+				}
+			})();
+
+			const payload = await promise;
+			await drain;
+
+			expect(payload.config.systemInstruction).toEqual({
+				parts: [{ text: "Primary instruction." }, { text: "Secondary instruction." }],
+			});
+			expect(payload.contents).toEqual([{ role: "user", parts: [{ text: "Hello" }] }]);
+		});
+
+		it("allows explicit Vertex API keys without requiring project or location", async () => {
+			const originalApiKey = Bun.env.GOOGLE_CLOUD_API_KEY;
+			const originalProject = Bun.env.GOOGLE_CLOUD_PROJECT;
+			const originalGcloudProject = Bun.env.GCLOUD_PROJECT;
+			const originalLocation = Bun.env.GOOGLE_CLOUD_LOCATION;
+			const llm = getBundledModel("google-vertex", "gemini-3-flash-preview");
+			const controller = new AbortController();
+			controller.abort();
+
+			try {
+				delete Bun.env.GOOGLE_CLOUD_API_KEY;
+				delete Bun.env.GOOGLE_CLOUD_PROJECT;
+				delete Bun.env.GCLOUD_PROJECT;
+				delete Bun.env.GOOGLE_CLOUD_LOCATION;
+
+				const response = await complete(
+					llm,
+					{ messages: [{ role: "user", content: "Hello", timestamp: Date.now() }] },
+					{ apiKey: "vertex-test-key", signal: controller.signal },
+				);
+
+				expect(response.stopReason).toBe("aborted");
+				expect(response.errorMessage).not.toContain("Vertex AI requires a project ID");
+				expect(response.errorMessage).not.toContain("Vertex AI requires a location");
+			} finally {
+				if (originalApiKey === undefined) delete Bun.env.GOOGLE_CLOUD_API_KEY;
+				else Bun.env.GOOGLE_CLOUD_API_KEY = originalApiKey;
+				if (originalProject === undefined) delete Bun.env.GOOGLE_CLOUD_PROJECT;
+				else Bun.env.GOOGLE_CLOUD_PROJECT = originalProject;
+				if (originalGcloudProject === undefined) delete Bun.env.GCLOUD_PROJECT;
+				else Bun.env.GCLOUD_PROJECT = originalGcloudProject;
+				if (originalLocation === undefined) delete Bun.env.GOOGLE_CLOUD_LOCATION;
+				else Bun.env.GOOGLE_CLOUD_LOCATION = originalLocation;
+			}
+		});
+
+		it.each([
+			{ location: "global", host: "aiplatform.googleapis.com" },
+			{ location: "eu", host: "aiplatform.eu.rep.googleapis.com" },
+			{ location: "us", host: "aiplatform.us.rep.googleapis.com" },
+		] as const)("routes Vertex Claude rawPredict to $host for location $location", async ({ location, host }) => {
+			const originalProject = Bun.env.GOOGLE_CLOUD_PROJECT;
+			const originalGcpProject = Bun.env.GCP_PROJECT;
+			const originalGcloudProject = Bun.env.GCLOUD_PROJECT;
+			const originalVertexLocation = Bun.env.GOOGLE_VERTEX_LOCATION;
+			const originalCloudLocation = Bun.env.GOOGLE_CLOUD_LOCATION;
+			const originalLocation = Bun.env.VERTEX_LOCATION;
+			const originalApiKey = Bun.env.GOOGLE_CLOUD_API_KEY;
+			const originalGac = Bun.env.GOOGLE_APPLICATION_CREDENTIALS;
+			// Force the GCE/Cloud Run metadata-server token path: neutralize any host
+			// ADC so resolveAccessTokenUncached() falls through to fetchMetadataToken().
+			// Without this the test reads ~/.config/gcloud/application_default_credentials.json
+			// when present and hangs on the OAuth exchange (form body, not JSON).
+			const homedirSpy = spyOn(os, "homedir").mockReturnValue(
+				path.join(os.tmpdir(), `vertex-adc-absent-${location}-${Date.now()}`),
+			);
+			const model: Model<"anthropic-messages"> = buildModel({
+				id: "claude-sonnet-4@20250514",
+				name: "Claude Sonnet 4",
+				api: "anthropic-messages",
+				provider: "google-vertex",
+				baseUrl:
+					"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models/claude-sonnet-4@20250514:streamRawPredict",
+				reasoning: true,
+				input: ["text", "image"],
+				cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+				contextWindow: 200_000,
+				maxTokens: 64_000,
+			});
+			const captured = Promise.withResolvers<{
+				url: string;
+				authorization: string | null;
+				betaHeader: string | null;
+				body: unknown;
+			}>();
+
+			try {
+				__resetVertexTokenCache();
+				Bun.env.GOOGLE_CLOUD_PROJECT = "vertex-project";
+				Bun.env.GOOGLE_VERTEX_LOCATION = location;
+				delete Bun.env.GCP_PROJECT;
+				delete Bun.env.GCLOUD_PROJECT;
+				delete Bun.env.GOOGLE_CLOUD_LOCATION;
+				delete Bun.env.VERTEX_LOCATION;
+				delete Bun.env.GOOGLE_CLOUD_API_KEY;
+				delete Bun.env.GOOGLE_APPLICATION_CREDENTIALS;
+
+				const events = stream(
+					model,
+					{ messages: [{ role: "user", content: "Hello", timestamp: Date.now() }] },
+					{
+						apiKey: "<authenticated>",
+						thinkingEnabled: true,
+						fetch: async (input, init) => {
+							const url = input instanceof Request ? input.url : input.toString();
+							if (
+								url ===
+								"http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token"
+							) {
+								return new Response(JSON.stringify({ access_token: "vertex-token", expires_in: 3600 }));
+							}
+							const headers = input instanceof Request ? input.headers : new Headers(init?.headers);
+							const bodyText = input instanceof Request ? await input.clone().text() : String(init?.body ?? "");
+							captured.resolve({
+								url,
+								authorization: headers.get("authorization"),
+								betaHeader: headers.get("anthropic-beta"),
+								body: JSON.parse(bodyText),
+							});
+							return new Response(JSON.stringify({ error: { message: "stop after capture" } }), {
+								status: 400,
+							});
+						},
+					},
+				);
+
+				for await (const _event of events) {
+				}
+
+				const request = await captured.promise;
+				// Placeholder baseUrl + GOOGLE_VERTEX_LOCATION must rewrite through
+				// resolveVertexRequest: multi-region eu/us hit REP hosts, not the
+				// invalid {location}-aiplatform.googleapis.com regional pattern.
+				expect(request.url).toBe(
+					`https://${host}/v1/projects/vertex-project/locations/${location}/publishers/anthropic/models/claude-sonnet-4@20250514:streamRawPredict`,
+				);
+				expect(request.authorization).toBe("Bearer vertex-token");
+				expect(request.body).toMatchObject({
+					anthropic_version: "vertex-2023-10-16",
+					messages: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
+					stream: true,
+				});
+				expect((request.body as Record<string, unknown>).model).toBeUndefined();
+				expect((request.body as Record<string, { type?: string }>).thinking?.type).toBe("enabled");
+				expect((request.body as Record<string, unknown>).context_management).toBeUndefined();
+				expect(request.betaHeader ?? "").not.toContain("context-management-2025-06-27");
+			} finally {
+				__resetVertexTokenCache();
+				homedirSpy.mockRestore();
+				if (originalProject === undefined) delete Bun.env.GOOGLE_CLOUD_PROJECT;
+				else Bun.env.GOOGLE_CLOUD_PROJECT = originalProject;
+				if (originalGcpProject === undefined) delete Bun.env.GCP_PROJECT;
+				else Bun.env.GCP_PROJECT = originalGcpProject;
+				if (originalGcloudProject === undefined) delete Bun.env.GCLOUD_PROJECT;
+				else Bun.env.GCLOUD_PROJECT = originalGcloudProject;
+				if (originalVertexLocation === undefined) delete Bun.env.GOOGLE_VERTEX_LOCATION;
+				else Bun.env.GOOGLE_VERTEX_LOCATION = originalVertexLocation;
+				if (originalCloudLocation === undefined) delete Bun.env.GOOGLE_CLOUD_LOCATION;
+				else Bun.env.GOOGLE_CLOUD_LOCATION = originalCloudLocation;
+				if (originalLocation === undefined) delete Bun.env.VERTEX_LOCATION;
+				else Bun.env.VERTEX_LOCATION = originalLocation;
+				if (originalApiKey === undefined) delete Bun.env.GOOGLE_CLOUD_API_KEY;
+				else Bun.env.GOOGLE_CLOUD_API_KEY = originalApiKey;
+				if (originalGac === undefined) delete Bun.env.GOOGLE_APPLICATION_CREDENTIALS;
+				else Bun.env.GOOGLE_APPLICATION_CREDENTIALS = originalGac;
+			}
+		});
+
+		it("routes impersonated_service_account ADC through IAM to the Vertex request", async () => {
+			const originalProject = Bun.env.GOOGLE_CLOUD_PROJECT;
+			const originalGcpProject = Bun.env.GCP_PROJECT;
+			const originalGcloudProject = Bun.env.GCLOUD_PROJECT;
+			const originalVertexLocation = Bun.env.GOOGLE_VERTEX_LOCATION;
+			const originalCloudLocation = Bun.env.GOOGLE_CLOUD_LOCATION;
+			const originalLocation = Bun.env.VERTEX_LOCATION;
+			const originalApiKey = Bun.env.GOOGLE_CLOUD_API_KEY;
+			const originalGac = Bun.env.GOOGLE_APPLICATION_CREDENTIALS;
+			const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-vertex-impersonation-"));
+			const adcPath = path.join(tmpDir, "impersonated-adc.json");
+			await Bun.write(
+				adcPath,
+				JSON.stringify({
+					type: "impersonated_service_account",
+					service_account_impersonation_url:
+						"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/target@project.iam.gserviceaccount.com:generateAccessToken",
+					source_credentials: {
+						type: "authorized_user",
+						client_id: "client-id",
+						client_secret: "client-secret",
+						refresh_token: "refresh-token",
+					},
+					delegates: ["projects/-/serviceAccounts/delegate@project.iam.gserviceaccount.com"],
+				}),
+			);
+			const model: Model<"anthropic-messages"> = buildModel({
+				id: "claude-sonnet-4@20250514",
+				name: "Claude Sonnet 4",
+				api: "anthropic-messages",
+				provider: "google-vertex",
+				baseUrl:
+					"https://{location}-aiplatform.googleapis.com/v1/projects/{project}/locations/{location}/publishers/anthropic/models/claude-sonnet-4@20250514:streamRawPredict",
+				reasoning: true,
+				input: ["text", "image"],
+				cost: { input: 3, output: 15, cacheRead: 0.3, cacheWrite: 3.75 },
+				contextWindow: 200_000,
+				maxTokens: 64_000,
+			});
+			const callOrder: string[] = [];
+			let iamRequest: { url: string; authorization: string | null; body: unknown } | undefined;
+			const captured = Promise.withResolvers<{ url: string; authorization: string | null }>();
+
+			try {
+				__resetVertexTokenCache();
+				Bun.env.GOOGLE_CLOUD_PROJECT = "vertex-project";
+				Bun.env.GOOGLE_VERTEX_LOCATION = "global";
+				delete Bun.env.GCP_PROJECT;
+				delete Bun.env.GCLOUD_PROJECT;
+				delete Bun.env.GOOGLE_CLOUD_LOCATION;
+				delete Bun.env.VERTEX_LOCATION;
+				delete Bun.env.GOOGLE_CLOUD_API_KEY;
+				Bun.env.GOOGLE_APPLICATION_CREDENTIALS = adcPath;
+
+				const events = stream(
+					model,
+					{ messages: [{ role: "user", content: "Hello", timestamp: Date.now() }] },
+					{
+						apiKey: "<authenticated>",
+						fetch: async (input, init) => {
+							const url = input instanceof Request ? input.url : input.toString();
+							const headers = input instanceof Request ? input.headers : new Headers(init?.headers);
+							if (url === "https://oauth2.googleapis.com/token") {
+								callOrder.push("source");
+								return new Response(JSON.stringify({ access_token: "source-token", expires_in: 3600 }));
+							}
+							if (url.startsWith("https://iamcredentials.googleapis.com/")) {
+								callOrder.push("iam");
+								const bodyText =
+									input instanceof Request ? await input.clone().text() : String(init?.body ?? "");
+								iamRequest = { url, authorization: headers.get("authorization"), body: JSON.parse(bodyText) };
+								return new Response(
+									JSON.stringify({
+										accessToken: "impersonated-token",
+										expireTime: new Date(Date.now() + 3_600_000).toISOString(),
+									}),
+								);
+							}
+							callOrder.push("vertex");
+							captured.resolve({ url, authorization: headers.get("authorization") });
+							return new Response(JSON.stringify({ error: { message: "stop after capture" } }), { status: 400 });
+						},
+					},
+				);
+
+				for await (const _event of events) {
+				}
+
+				const request = await captured.promise;
+
+				// Source refresh, then IAM generateAccessToken, then the actual Vertex call.
+				expect(callOrder).toEqual(["source", "iam", "vertex"]);
+
+				// IAM exchange is authorized by the freshly minted source token, posts the
+				// reconstructed canonical URL, and forwards the configured delegates verbatim.
+				expect(iamRequest?.url).toBe(
+					"https://iamcredentials.googleapis.com/v1/projects/-/serviceAccounts/target@project.iam.gserviceaccount.com:generateAccessToken",
+				);
+				expect(iamRequest?.authorization).toBe("Bearer source-token");
+				expect(iamRequest?.body).toEqual({
+					delegates: ["projects/-/serviceAccounts/delegate@project.iam.gserviceaccount.com"],
+					scope: ["https://www.googleapis.com/auth/cloud-platform"],
+					lifetime: "3600s",
+				});
+
+				// The impersonated token (not the source token) authorizes the Vertex request.
+				expect(request.url).toBe(
+					"https://aiplatform.googleapis.com/v1/projects/vertex-project/locations/global/publishers/anthropic/models/claude-sonnet-4@20250514:streamRawPredict",
+				);
+				expect(request.authorization).toBe("Bearer impersonated-token");
+			} finally {
+				__resetVertexTokenCache();
+				await removeWithRetries(tmpDir);
+				if (originalProject === undefined) delete Bun.env.GOOGLE_CLOUD_PROJECT;
+				else Bun.env.GOOGLE_CLOUD_PROJECT = originalProject;
+				if (originalGcpProject === undefined) delete Bun.env.GCP_PROJECT;
+				else Bun.env.GCP_PROJECT = originalGcpProject;
+				if (originalGcloudProject === undefined) delete Bun.env.GCLOUD_PROJECT;
+				else Bun.env.GCLOUD_PROJECT = originalGcloudProject;
+				if (originalVertexLocation === undefined) delete Bun.env.GOOGLE_VERTEX_LOCATION;
+				else Bun.env.GOOGLE_VERTEX_LOCATION = originalVertexLocation;
+				if (originalCloudLocation === undefined) delete Bun.env.GOOGLE_CLOUD_LOCATION;
+				else Bun.env.GOOGLE_CLOUD_LOCATION = originalCloudLocation;
+				if (originalLocation === undefined) delete Bun.env.VERTEX_LOCATION;
+				else Bun.env.VERTEX_LOCATION = originalLocation;
+				if (originalApiKey === undefined) delete Bun.env.GOOGLE_CLOUD_API_KEY;
+				else Bun.env.GOOGLE_CLOUD_API_KEY = originalApiKey;
+				if (originalGac === undefined) delete Bun.env.GOOGLE_APPLICATION_CREDENTIALS;
+				else Bun.env.GOOGLE_APPLICATION_CREDENTIALS = originalGac;
+			}
+		});
+	});
+
 	describe("Google Vertex Provider (gemini-3-flash-preview)", () => {
-		const vertexProject = Bun.env.GOOGLE_CLOUD_PROJECT || Bun.env.GCLOUD_PROJECT;
-		const vertexLocation = Bun.env.GOOGLE_CLOUD_LOCATION;
+		const vertexApiKey = e2eApiKey("GOOGLE_CLOUD_API_KEY");
+		const vertexProject = e2eApiKey("GOOGLE_CLOUD_PROJECT") || e2eApiKey("GCLOUD_PROJECT");
+		const vertexLocation = e2eApiKey("GOOGLE_CLOUD_LOCATION");
 		const isVertexConfigured = Boolean(vertexProject && vertexLocation);
 		const vertexOptions = { project: vertexProject, location: vertexLocation } as const;
 		const llm = getBundledModel("google-vertex", "gemini-3-flash-preview");
+
+		it.skipIf(!vertexApiKey)(
+			"should complete basic text generation with Vertex API key",
+			async () => {
+				await basicTextGeneration(llm, { apiKey: vertexApiKey! });
+			},
+			{ retry: 3 },
+		);
 
 		it.skipIf(!isVertexConfigured)(
 			"should complete basic text generation",
@@ -467,7 +875,7 @@ describe("Generate E2E Tests", () => {
 
 	describe.skipIf(!e2eApiKey("OPENAI_API_KEY"))("OpenAI Completions Provider (gpt-4o-mini)", () => {
 		const llm: Model<"openai-completions"> = {
-			...getBundledModel("openai", "gpt-4o-mini"),
+			...(getBundledModel("openai", "gpt-4o-mini") as Model<"openai-completions">),
 			api: "openai-completions",
 		};
 
@@ -505,7 +913,7 @@ describe("Generate E2E Tests", () => {
 	});
 
 	describe.skipIf(!e2eApiKey("OPENAI_API_KEY"))("OpenAI Responses Provider (gpt-5-mini)", () => {
-		const llm = getBundledModel("openai", "gpt-5-mini");
+		const llm = getBundledModel("openai", "gpt-5-mini") as Model<"openai-responses">;
 
 		it(
 			"should complete basic text generation",
@@ -534,7 +942,7 @@ describe("Generate E2E Tests", () => {
 		it(
 			"should handle thinking",
 			async () => {
-				await handleThinking(llm, { reasoningEffort: "high" });
+				await handleThinking(llm, { reasoning: Effort.High });
 			},
 			{ retry: 2 },
 		);
@@ -542,7 +950,7 @@ describe("Generate E2E Tests", () => {
 		it(
 			"should handle multi-turn with thinking and tools",
 			async () => {
-				await multiTurn(llm, { reasoningEffort: "high" });
+				await multiTurn(llm, { reasoning: Effort.High });
 			},
 			{ retry: 3 },
 		);
@@ -592,43 +1000,7 @@ describe("Generate E2E Tests", () => {
 		);
 	});
 
-	describe.skipIf(!e2eApiKey("OPENAI_API_KEY"))("OpenAI Responses Provider (gpt-5-mini)", () => {
-		const model = getBundledModel("openai", "gpt-5-mini");
-
-		it(
-			"should complete basic text generation",
-			async () => {
-				await basicTextGeneration(model);
-			},
-			{ retry: 3 },
-		);
-
-		it(
-			"should handle tool calling",
-			async () => {
-				await handleToolCall(model);
-			},
-			{ retry: 3 },
-		);
-
-		it(
-			"should handle streaming",
-			async () => {
-				await handleStreaming(model);
-			},
-			{ retry: 3 },
-		);
-
-		it(
-			"should handle image input",
-			async () => {
-				await handleImage(model);
-			},
-			{ retry: 3 },
-		);
-	});
-
-	describe.skipIf(!e2eApiKey("XAI_API_KEY"))("xAI Provider (grok-code-fast-1 via OpenAI Completions)", () => {
+	describe.skipIf(!e2eApiKey("XAI_API_KEY"))("xAI Provider (grok-code-fast-1 via OpenAI Responses)", () => {
 		const llm = getBundledModel("xai", "grok-code-fast-1");
 
 		it(
@@ -658,7 +1030,7 @@ describe("Generate E2E Tests", () => {
 		it(
 			"should handle thinking mode",
 			async () => {
-				await handleThinking(llm, { reasoningEffort: "medium" });
+				await handleThinking(llm, { reasoning: Effort.Medium });
 			},
 			{ retry: 3 },
 		);
@@ -666,7 +1038,7 @@ describe("Generate E2E Tests", () => {
 		it(
 			"should handle multi-turn with thinking and tools",
 			async () => {
-				await multiTurn(llm, { reasoningEffort: "medium" });
+				await multiTurn(llm, { reasoning: Effort.Medium });
 			},
 			{ retry: 3 },
 		);
@@ -702,7 +1074,7 @@ describe("Generate E2E Tests", () => {
 		it(
 			"should handle thinking mode",
 			async () => {
-				await handleThinking(llm, { reasoningEffort: "medium" });
+				await handleThinking(llm, { reasoning: Effort.Medium });
 			},
 			{ retry: 3 },
 		);
@@ -710,7 +1082,7 @@ describe("Generate E2E Tests", () => {
 		it(
 			"should handle multi-turn with thinking and tools",
 			async () => {
-				await multiTurn(llm, { reasoningEffort: "medium" });
+				await multiTurn(llm, { reasoning: Effort.Medium });
 			},
 			{ retry: 3 },
 		);
@@ -746,7 +1118,7 @@ describe("Generate E2E Tests", () => {
 		it(
 			"should handle thinking mode",
 			async () => {
-				await handleThinking(llm, { reasoningEffort: "medium" });
+				await handleThinking(llm, { reasoning: Effort.Medium });
 			},
 			{ retry: 3 },
 		);
@@ -754,7 +1126,7 @@ describe("Generate E2E Tests", () => {
 		it(
 			"should handle multi-turn with thinking and tools",
 			async () => {
-				await multiTurn(llm, { reasoningEffort: "medium" });
+				await multiTurn(llm, { reasoning: Effort.Medium });
 			},
 			{ retry: 3 },
 		);
@@ -790,7 +1162,7 @@ describe("Generate E2E Tests", () => {
 		it(
 			"should handle thinking mode",
 			async () => {
-				await handleThinking(llm, { reasoningEffort: "medium" });
+				await handleThinking(llm, { reasoning: Effort.Medium });
 			},
 			{ retry: 3 },
 		);
@@ -798,7 +1170,7 @@ describe("Generate E2E Tests", () => {
 		it(
 			"should handle multi-turn with thinking and tools",
 			async () => {
-				await multiTurn(llm, { reasoningEffort: "medium" });
+				await multiTurn(llm, { reasoning: Effort.Medium });
 			},
 			{ retry: 2 },
 		);
@@ -842,7 +1214,7 @@ describe("Generate E2E Tests", () => {
 		it.skip(
 			"should handle thinking mode",
 			async () => {
-				await handleThinking(llm, { reasoningEffort: "medium" });
+				await handleThinking(llm, { reasoning: Effort.Medium });
 			},
 			{ retry: 3 },
 		);
@@ -850,7 +1222,7 @@ describe("Generate E2E Tests", () => {
 		it(
 			"should handle multi-turn with thinking and tools",
 			async () => {
-				await multiTurn(llm, { reasoningEffort: "medium" });
+				await multiTurn(llm, { reasoning: Effort.Medium });
 			},
 			{ retry: 3 },
 		);
@@ -886,7 +1258,7 @@ describe("Generate E2E Tests", () => {
 		it(
 			"should handle thinking mode",
 			async () => {
-				await handleThinking(llm, { reasoningEffort: "medium" });
+				await handleThinking(llm, { reasoning: Effort.Medium });
 			},
 			{ retry: 3 },
 		);
@@ -894,7 +1266,7 @@ describe("Generate E2E Tests", () => {
 		it(
 			"should handle multi-turn with thinking and tools",
 			async () => {
-				await multiTurn(llm, { reasoningEffort: "medium" });
+				await multiTurn(llm, { reasoning: Effort.Medium });
 			},
 			{ retry: 3 },
 		);
@@ -938,19 +1310,9 @@ describe("Generate E2E Tests", () => {
 			);
 
 			it(
-				"should handle thinking mode",
-				async () => {
-					// FIXME Skip for now, getting a 422 stauts code, need to test with official SDK
-					// const llm = getModel("mistral", "magistral-medium-latest");
-					// await handleThinking(llm, { reasoningEffort: "medium" });
-				},
-				{ retry: 3 },
-			);
-
-			it(
 				"should handle multi-turn with thinking and tools",
 				async () => {
-					await multiTurn(llm, { reasoningEffort: "medium" });
+					await multiTurn(llm, { reasoning: Effort.Medium });
 				},
 				{ retry: 3 },
 			);
@@ -1076,7 +1438,7 @@ describe("Generate E2E Tests", () => {
 			"should handle thinking",
 			async () => {
 				const thinkingModel = getBundledModel("github-copilot", "gpt-5-mini");
-				await handleThinking(thinkingModel, { apiKey: githubCopilotToken, reasoningEffort: "high" });
+				await handleThinking(thinkingModel, { apiKey: githubCopilotToken, reasoning: Effort.High });
 			},
 			{ retry: 2 },
 		);
@@ -1085,7 +1447,7 @@ describe("Generate E2E Tests", () => {
 			"should handle multi-turn with thinking and tools",
 			async () => {
 				const thinkingModel = getBundledModel("github-copilot", "gpt-5-mini");
-				await multiTurn(thinkingModel, { apiKey: githubCopilotToken, reasoningEffort: "high" });
+				await multiTurn(thinkingModel, { apiKey: githubCopilotToken, reasoning: Effort.High });
 			},
 			{ retry: 3 },
 		);
@@ -1318,7 +1680,7 @@ describe("Generate E2E Tests", () => {
 		it.skipIf(!openaiCodexToken)(
 			"should handle thinking",
 			async () => {
-				await handleThinking(llm, { apiKey: openaiCodexToken, reasoningEffort: "high" });
+				await handleThinking(llm, { apiKey: openaiCodexToken, reasoning: Effort.High });
 			},
 			{ retry: 3 },
 		);
@@ -1350,7 +1712,7 @@ describe("Generate E2E Tests", () => {
 				const response = await complete(
 					llm,
 					{
-						systemPrompt: "You are a helpful assistant that uses tools when asked.",
+						systemPrompt: ["You are a helpful assistant that uses tools when asked."],
 						messages: [
 							{
 								role: "user",
@@ -1361,7 +1723,7 @@ describe("Generate E2E Tests", () => {
 						tools: [calculatorTool],
 					},
 					{
-						reasoning: "xhigh",
+						reasoning: Effort.Max,
 						interleavedThinking: true,
 						onPayload: payload => {
 							capturedPayload = payload;
@@ -1370,7 +1732,6 @@ describe("Generate E2E Tests", () => {
 				);
 
 				expect(response.stopReason, `Error: ${response.errorMessage}`).not.toBe("error");
-				expect(capturedPayload).toBeTruthy();
 
 				const payload = capturedPayload as {
 					additionalModelRequestFields?: {
@@ -1389,7 +1750,7 @@ describe("Generate E2E Tests", () => {
 	});
 
 	// Ollama tests require PI_LOCAL_LLM=1 and ollama installed
-	const ollamaInstalled = !!Bun.env.PI_LOCAL_LLM && !!Bun.which("ollama");
+	const ollamaInstalled = !!Bun.env.PI_LOCAL_LLM && !!$which("ollama");
 
 	describe.skipIf(!ollamaInstalled)("Ollama Provider (gpt-oss-20b via OpenAI Completions)", () => {
 		let llm: Model<"openai-completions"> | undefined;
@@ -1432,7 +1793,7 @@ describe("Generate E2E Tests", () => {
 				setTimeout(checkServer, 1000); // Initial delay
 			});
 
-			llm = {
+			llm = buildModel({
 				id: "gpt-oss:20b",
 				api: "openai-completions",
 				provider: "ollama",
@@ -1448,7 +1809,7 @@ describe("Generate E2E Tests", () => {
 					cacheWrite: 0,
 				},
 				name: "Ollama GPT-OSS 20B",
-			};
+			});
 		}, 30000); // 30 second timeout for setup
 
 		afterAll(() => {
@@ -1490,7 +1851,7 @@ describe("Generate E2E Tests", () => {
 			"should handle thinking mode",
 			async () => {
 				if (!llm) return;
-				await handleThinking(llm, { apiKey: "test", reasoningEffort: "medium" });
+				await handleThinking(llm, { apiKey: "test", reasoning: Effort.Medium });
 			},
 			{ retry: 3 },
 		);
@@ -1499,7 +1860,7 @@ describe("Generate E2E Tests", () => {
 			"should handle multi-turn with thinking and tools",
 			async () => {
 				if (!llm) return;
-				await multiTurn(llm, { apiKey: "test", reasoningEffort: "medium" });
+				await multiTurn(llm, { apiKey: "test", reasoning: Effort.Medium });
 			},
 			{ retry: 3 },
 		);

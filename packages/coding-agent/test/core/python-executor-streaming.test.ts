@@ -1,26 +1,13 @@
 import { describe, expect, it } from "bun:test";
-import { executePythonWithKernel, type PythonKernelExecutor } from "@oh-my-pi/pi-coding-agent/ipy/executor";
-import type { KernelExecuteOptions, KernelExecuteResult } from "@oh-my-pi/pi-coding-agent/ipy/kernel";
-import { DEFAULT_MAX_BYTES } from "@oh-my-pi/pi-coding-agent/session/streaming-output";
-
-class FakeKernel implements PythonKernelExecutor {
-	private result: KernelExecuteResult;
-	private onExecute: (options?: KernelExecuteOptions) => Promise<void> | void;
-
-	constructor(result: KernelExecuteResult, onExecute: (options?: KernelExecuteOptions) => Promise<void> | void) {
-		this.result = result;
-		this.onExecute = onExecute;
-	}
-
-	async execute(_code: string, options?: KernelExecuteOptions): Promise<KernelExecuteResult> {
-		await this.onExecute(options);
-		return this.result;
-	}
-}
+import { executePythonWithKernel } from "@oh-my-pi/pi-coding-agent/eval/py/executor";
+import { DEFAULT_MAX_BYTES } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { FakeKernel } from "./helpers";
 
 describe("executePythonWithKernel streaming", () => {
 	it("truncates large output and tracks totals", async () => {
-		const largeOutput = "a".repeat(DEFAULT_MAX_BYTES + 128);
+		// Many short lines overflow the output window (single over-wide lines are
+		// column-capped instead and no longer count as window truncation).
+		const largeOutput = `${"a".repeat(100)}\n`.repeat(Math.ceil((DEFAULT_MAX_BYTES * 4) / 101));
 		const kernel = new FakeKernel(
 			{ status: "ok", cancelled: false, timedOut: false, stdinRequested: false },
 			options => options?.onChunk?.(largeOutput),
@@ -40,7 +27,7 @@ describe("executePythonWithKernel streaming", () => {
 
 		expect(result.cancelled).toBe(true);
 		expect(result.exitCode).toBeUndefined();
-		expect(result.output).toContain("Command timed out after 2 seconds");
+		expect(result.output).toContain("eval cell timed out after 2s");
 	});
 
 	it("sanitizes ANSI and carriage returns", async () => {

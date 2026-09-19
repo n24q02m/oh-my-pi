@@ -1,4 +1,5 @@
-import { theme } from "../../modes/theme/theme";
+import { $which } from "@oh-my-pi/pi-utils";
+import { theme } from "@oh-my-pi/pi-tui/theme";
 import type { DoctorCheck } from "./types";
 
 export async function runDoctorChecks(): Promise<DoctorCheck[]> {
@@ -12,7 +13,7 @@ export async function runDoctorChecks(): Promise<DoctorCheck[]> {
 	];
 
 	for (const tool of tools) {
-		const path = Bun.which(tool.name);
+		const path = $which(tool.name);
 		checks.push({
 			name: tool.name,
 			status: path ? "ok" : "warning",
@@ -24,7 +25,6 @@ export async function runDoctorChecks(): Promise<DoctorCheck[]> {
 	const apiKeys = [
 		{ name: "ANTHROPIC_API_KEY", description: "Anthropic API" },
 		{ name: "OPENAI_API_KEY", description: "OpenAI API" },
-		{ name: "PERPLEXITY_API_KEY", description: "Perplexity search" },
 		{ name: "EXA_API_KEY", description: "Exa search" },
 	];
 
@@ -48,7 +48,7 @@ export function formatDoctorResults(checks: DoctorCheck[]): string {
 	for (const check of checks) {
 		const icon =
 			check.status === "ok"
-				? theme.status.success
+				? theme.status.enabled
 				: check.status === "warning"
 					? theme.status.warning
 					: theme.status.error;

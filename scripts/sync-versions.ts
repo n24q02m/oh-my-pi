@@ -22,8 +22,8 @@ interface PackageInfo {
 
 const packagesDir = join(process.cwd(), "packages");
 const packageDirs = readdirSync(packagesDir, { withFileTypes: true })
-	.filter((dirent) => dirent.isDirectory())
-	.map((dirent) => dirent.name);
+	.filter(dirent => dirent.isDirectory())
+	.map(dirent => dirent.name);
 
 // Read all package.json files and build version map
 const packages: Record<string, PackageInfo> = {};
@@ -32,7 +32,7 @@ const versionMap: Record<string, string> = {};
 for (const dir of packageDirs) {
 	const pkgPath = join(packagesDir, dir, "package.json");
 	try {
-		const pkg = await Bun.file(pkgPath).json<PackageJson>();
+		const pkg = (await Bun.file(pkgPath).json()) as PackageJson;
 		packages[dir] = { path: pkgPath, data: pkg };
 		versionMap[pkg.name] = pkg.version;
 	} catch (e) {
@@ -50,10 +50,10 @@ for (const [name, version] of Object.entries(versionMap).sort()) {
 const versions = new Set(Object.values(versionMap));
 if (versions.size > 1) {
 	console.error("\n❌ ERROR: Not all packages have the same version!");
-	console.error("Expected lockstep versioning. Run one of:");
-	console.error("  npm run version:patch");
-	console.error("  npm run version:minor");
-	console.error("  npm run version:major");
+	console.error("Expected lockstep versioning. Run the release script with the next version:");
+	console.error("  bun scripts/release.ts <version>");
+	console.error("Or update all package versions consistently before running this script.");
+
 	process.exit(1);
 }
 
@@ -61,7 +61,8 @@ console.log("\n✅ All packages at same version (lockstep)");
 
 // Update all inter-package dependencies
 let totalUpdates = 0;
-for (const [dir, pkg] of Object.entries(packages)) {
+for (const dir in packages) {
+	const pkg = packages[dir];
 	let updated = false;
 
 	// Check dependencies
@@ -98,7 +99,7 @@ for (const [dir, pkg] of Object.entries(packages)) {
 
 	// Write if updated
 	if (updated) {
-		await Bun.write(pkg.path, JSON.stringify(pkg.data, null, "\t") + "\n");
+		await Bun.write(pkg.path, `${JSON.stringify(pkg.data, null, "\t")}\n`);
 	}
 }
 

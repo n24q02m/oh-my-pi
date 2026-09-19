@@ -1,18 +1,43 @@
     (function() {
       'use strict';
 
-      // ============================================================
-      // DATA LOADING
-      // ============================================================
+      const THEME_STORAGE_KEY = 'omp-export-theme';
+      const themeSelect = document.getElementById('theme-select');
+      let themePreference = 'auto';
+      try {
+        const stored = localStorage.getItem(THEME_STORAGE_KEY);
+        if (stored === 'light' || stored === 'dark' || stored === 'auto') themePreference = stored;
+      } catch {}
 
-      const base64 = document.getElementById('session-data').textContent;
-      const binary = atob(base64);
-      const bytes = new Uint8Array(binary.length);
-      for (let i = 0; i < binary.length; i++) {
-        bytes[i] = binary.charCodeAt(i);
+      function applyThemePreference(next) {
+        themePreference = next;
+        if (next === 'light' || next === 'dark') document.documentElement.dataset.theme = next;
+        else delete document.documentElement.dataset.theme;
+        if (themeSelect) themeSelect.value = next;
+        try {
+          localStorage.setItem(THEME_STORAGE_KEY, next);
+        } catch {}
       }
-      const data = JSON.parse(new TextDecoder('utf-8').decode(bytes));
-      const { header, entries, leafId: defaultLeafId, systemPrompt, codexInjectionInfo, tools } = data;
+
+      applyThemePreference(themePreference);
+      if (themeSelect) themeSelect.addEventListener('change', () => applyThemePreference(themeSelect.value));
+
+      // ============================================================
+      // BOOT
+      // ============================================================
+      //
+      // Two boot paths share this template:
+      //  - Static export: session JSON rides base64-embedded in #session-data.
+      //  - Share viewer: share-loader.js sets `window.__OMP_SESSION_DATA__` to
+      //    a promise resolving to the session JSON (fetched + decrypted).
+      // The entire app lives in bootSession(); its body keeps the original
+      // one-level indentation to avoid a whole-file reindent.
+      function bootSession(data) {
+      const { header, entries, leafId: defaultLeafId, systemPrompt, tools, subSessions } = data;
+
+      // Session render context: scopes entry lookups and tool-view host
+      // wiring to one transcript (main session or an embedded subagent).
+      const mainSctx = { entries, prefix: '', idPrefix: 'entry-' };
 
       // ============================================================
       // URL PARAMETER HANDLING
@@ -44,9 +69,15 @@
         if (entry.type === 'message' && entry.message.role === 'assistant') {
           const content = entry.message.content;
           if (Array.isArray(content)) {
-            for (const block of content) {
+            for (let blockIndex = 0; blockIndex < content.length; blockIndex++) {
+              const block = content[blockIndex];
               if (block.type === 'toolCall') {
-                toolCallMap.set(block.id, { name: block.name, arguments: block.arguments });
+                toolCallMap.set(block.id, {
+                  name: block.name,
+                  arguments: block.arguments,
+                  entryId: entry.id,
+                  blockIndex,
+                });
               }
             }
           }
@@ -54,11 +85,11 @@
       }
 
       // Label lookup (entryId -> label string)
-      // Labels are stored in 'label' entries that reference their target via parentId
+      // Labels are stored in 'label' entries that reference their target via targetId
       const labelMap = new Map();
       for (const entry of entries) {
-        if (entry.type === 'label' && entry.parentId && entry.label) {
-          labelMap.set(entry.parentId, entry.label);
+        if (entry.type === 'label' && entry.targetId && entry.label) {
+          labelMap.set(entry.targetId, entry.label);
         }
       }
 
@@ -98,14 +129,18 @@
           }
         }
 
-        // Sort children by timestamp
-        function sortChildren(node) {
+        // Sort children by timestamp. Use an explicit stack so valid, deep
+        // conversation chains do not exhaust the browser call stack.
+        const sortStack = [...roots];
+        while (sortStack.length > 0) {
+          const node = sortStack.pop();
           node.children.sort((a, b) =>
             new Date(a.entry.timestamp).getTime() - new Date(b.entry.timestamp).getTime()
           );
-          node.children.forEach(sortChildren);
+          for (let i = node.children.length - 1; i >= 0; i--) {
+            sortStack.push(node.children[i]);
+          }
         }
-        roots.forEach(sortChildren);
 
         return roots;
       }
@@ -153,19 +188,29 @@
         const result = [];
         const multipleRoots = roots.length > 1;
 
-        // Mark which subtrees contain the active leaf
+        // Mark which subtrees contain the active leaf. Use iterative post-order
+        // traversal so valid, deep conversation chains do not exhaust the
+        // browser call stack.
         const containsActive = new Map();
-        function markActive(node) {
+        const allNodes = [];
+        const activeStack = [...roots];
+        while (activeStack.length > 0) {
+          const node = activeStack.pop();
+          allNodes.push(node);
+          for (let i = node.children.length - 1; i >= 0; i--) {
+            activeStack.push(node.children[i]);
+          }
+        }
+        for (let i = allNodes.length - 1; i >= 0; i--) {
+          const node = allNodes[i];
           let has = activePathIds.has(node.entry.id);
           for (const child of node.children) {
-            if (markActive(child)) has = true;
+            if (containsActive.get(child)) has = true;
           }
           containsActive.set(node, has);
-          return has;
         }
-        roots.forEach(markActive);
 
-        // Stack: [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild]
+        // Stack: [node, indent, showConnector, isLast, gutters, isVirtualRootChild]
         const stack = [];
 
         // Add roots (prioritize branch containing active leaf)
@@ -174,11 +219,11 @@
         );
         for (let i = orderedRoots.length - 1; i >= 0; i--) {
           const isLast = i === orderedRoots.length - 1;
-          stack.push([orderedRoots[i], multipleRoots ? 1 : 0, multipleRoots, multipleRoots, isLast, [], multipleRoots]);
+          stack.push([orderedRoots[i], multipleRoots ? 1 : 0, multipleRoots, isLast, [], multipleRoots]);
         }
 
         while (stack.length > 0) {
-          const [node, indent, justBranched, showConnector, isLast, gutters, isVirtualRootChild] = stack.pop();
+          const [node, indent, showConnector, isLast, gutters, isVirtualRootChild] = stack.pop();
 
           result.push({ node, indent, showConnector, isLast, gutters, isVirtualRootChild, multipleRoots });
 
@@ -190,18 +235,10 @@
             Number(containsActive.get(b)) - Number(containsActive.get(a))
           );
 
-          // Calculate child indent (matches tree-selector.ts)
-          let childIndent;
-          if (multipleChildren) {
-            // Parent branches: children get +1
-            childIndent = indent + 1;
-          } else if (justBranched && indent > 0) {
-            // First generation after a branch: +1 for visual grouping
-            childIndent = indent + 1;
-          } else {
-            // Single-child chain: stay flat
-            childIndent = indent;
-          }
+          // Real branch points add visual depth, and a virtual root's direct
+          // children (the session roots) nest one level under the shared
+          // column-0 root. Linear continuations otherwise stay aligned.
+          const childIndent = multipleChildren || isVirtualRootChild ? indent + 1 : indent;
 
           // Build gutters for children
           const connectorDisplayed = showConnector && !isVirtualRootChild;
@@ -214,7 +251,7 @@
           // Add children in reverse order for stack
           for (let i = orderedChildren.length - 1; i >= 0; i--) {
             const childIsLast = i === orderedChildren.length - 1;
-            stack.push([orderedChildren[i], childIndent, multipleChildren, multipleChildren, childIsLast, childGutters, false]);
+            stack.push([orderedChildren[i], childIndent, multipleChildren, childIsLast, childGutters, false]);
           }
         }
 
@@ -238,7 +275,9 @@
 
           const gutter = gutters.find(g => g.position === level);
           if (gutter) {
-            prefixChars.push(posInLevel === 0 ? (gutter.show ? '│' : ' ') : ' ');
+            // Standard tree semantics: `│` only while more siblings continue
+            // below (`show`), space below a `└─`.
+            prefixChars.push(posInLevel === 0 && gutter.show ? '│' : ' ');
           } else if (connector && level === connectorPosition) {
             if (posInLevel === 0) {
               prefixChars.push(isLast ? '└' : '├');
@@ -262,10 +301,12 @@
       let searchQuery = '';
 
       function hasTextContent(content) {
-        if (typeof content === 'string') return content.trim().length > 0;
+        if (typeof content === 'string') return Boolean(canonicalizeMessage(content));
         if (Array.isArray(content)) {
           for (const c of content) {
-            if (c.type === 'text' && c.text && c.text.trim().length > 0) return true;
+            if (c.type === 'text' && c.text) {
+              if (canonicalizeMessage(c.text)) return true;
+            }
           }
         }
         return false;
@@ -292,6 +333,7 @@
             parts.push(msg.role);
             if (msg.content) parts.push(extractContent(msg.content));
             if (msg.role === 'bashExecution' && msg.command) parts.push(msg.command);
+            if (msg.role === 'jsExecution' && msg.code) parts.push(msg.code);
             break;
           }
           case 'custom_message':
@@ -305,10 +347,13 @@
             parts.push('branch summary', entry.summary);
             break;
           case 'model_change':
-            parts.push('model', entry.modelId);
+            parts.push('model', entry.model);
             break;
           case 'thinking_level_change':
             parts.push('thinking', entry.thinkingLevel);
+            break;
+          case 'mode_change':
+            parts.push('mode', entry.mode);
             break;
         }
 
@@ -338,7 +383,7 @@
           }
 
           // Apply filter mode
-          const isSettingsEntry = ['label', 'custom', 'model_change', 'thinking_level_change', 'mode_change'].includes(entry.type);
+          const isSettingsEntry = ['label', 'custom', 'model_change', 'thinking_level_change', 'mode_change', 'ttsr_injection', 'session_init', 'credential_pin'].includes(entry.type);
           let passesFilter = true;
 
           switch (filterMode) {
@@ -411,10 +456,12 @@
             const cmd = rawCmd.replace(/[\n\t]/g, ' ').trim().slice(0, 50);
             return `[bash: ${cmd}${rawCmd.length > 50 ? '...' : ''}]`;
           }
+          case 'search':
           case 'grep':
-            return `[grep: /${args.pattern || ''}/ in ${shortenPath(String(args.path || '.'))}]`;
+            return `[grep: /${args.pattern || ''}/ in ${shortenPath(String((args.paths || [args.path || '.']).join(', ')))}]`;
           case 'find':
-            return `[find: ${args.pattern || ''} in ${shortenPath(String(args.path || '.'))}]`;
+          case 'glob':
+            return `[glob: ${shortenPath(String((args.paths || [args.pattern || '.']).join(', ')))}]`;
           case 'ls':
             return `[ls: ${shortenPath(String(args.path || '.'))}]`;
           default: {
@@ -430,6 +477,18 @@
         return div.innerHTML;
       }
 
+      function canonicalizeMessage(text) {
+        if (!text) return '';
+        const trimmed = text.trim();
+        for (let i = 0; i < trimmed.length; i++) {
+          const code = trimmed.charCodeAt(i);
+          if (code !== 0x2e && code !== 0x2026 && code !== 0x20 && code !== 0x09 && code !== 0x0a && code !== 0x0d) {
+            return trimmed;
+          }
+        }
+        return '';
+      }
+
       /**
        * Truncate string to maxLen chars, append "..." if truncated.
        */
@@ -438,22 +497,29 @@
         return s.slice(0, maxLen) + '...';
       }
 
+      function normalizeTreeText(s) {
+        return s.replace(/[\n\t]/g, ' ').trim();
+      }
+
       /**
        * Get display text for tree node (returns HTML string).
        */
       function getTreeNodeDisplayHtml(entry, label) {
-        const normalize = s => s.replace(/[\n\t]/g, ' ').trim();
         const labelHtml = label ? `<span class="tree-label">[${escapeHtml(label)}]</span> ` : '';
 
         switch (entry.type) {
           case 'message': {
             const msg = entry.message;
             if (msg.role === 'user') {
-              const content = truncate(normalize(extractContent(msg.content)));
+              const content = truncate(normalizeTreeText(extractContent(msg.content)));
               return labelHtml + `<span class="tree-role-user">user:</span> ${escapeHtml(content)}`;
             }
+            if (msg.role === 'developer') {
+              const content = truncate(normalizeTreeText(extractContent(msg.content)));
+              return labelHtml + `<span class="tree-role-developer">developer:</span> ${escapeHtml(content)}`;
+            }
             if (msg.role === 'assistant') {
-              const textContent = truncate(normalize(extractContent(msg.content)));
+              const textContent = truncate(normalizeTreeText(extractContent(msg.content)));
               if (textContent) {
                 return labelHtml + `<span class="tree-role-assistant">assistant:</span> ${escapeHtml(textContent)}`;
               }
@@ -473,28 +539,161 @@
               return labelHtml + `<span class="tree-role-tool">[${msg.toolName || 'tool'}]</span>`;
             }
             if (msg.role === 'bashExecution') {
-              const cmd = truncate(normalize(msg.command || ''));
+              const cmd = truncate(normalizeTreeText(msg.command || ''));
               return labelHtml + `<span class="tree-role-tool">[bash]:</span> ${escapeHtml(cmd)}`;
+            }
+            if (msg.role === 'jsExecution') {
+              const code = truncate(normalizeTreeText(msg.code || ''));
+              return labelHtml + `<span class="tree-role-tool">[js]:</span> ${escapeHtml(code)}`;
             }
             return labelHtml + `<span class="tree-muted">[${msg.role}]</span>`;
           }
           case 'compaction':
             return labelHtml + `<span class="tree-compaction">[compaction: ${Math.round(entry.tokensBefore/1000)}k tokens]</span>`;
           case 'branch_summary': {
-            const summary = truncate(normalize(entry.summary || ''));
+            const summary = truncate(normalizeTreeText(entry.summary || ''));
             return labelHtml + `<span class="tree-branch-summary">[branch summary]:</span> ${escapeHtml(summary)}`;
           }
           case 'custom_message': {
             const content = typeof entry.content === 'string' ? entry.content : extractContent(entry.content);
-            return labelHtml + `<span class="tree-custom">[${escapeHtml(entry.customType)}]:</span> ${escapeHtml(truncate(normalize(content)))}`;
+            return labelHtml + `<span class="tree-custom">[${escapeHtml(entry.customType)}]:</span> ${escapeHtml(truncate(normalizeTreeText(content)))}`;
           }
           case 'model_change':
-            return labelHtml + `<span class="tree-muted">[model: ${entry.modelId}]</span>`;
+            return labelHtml + `<span class="tree-muted">[model: ${escapeHtml(entry.model)}]</span>`;
           case 'thinking_level_change':
             return labelHtml + `<span class="tree-muted">[thinking: ${entry.thinkingLevel}]</span>`;
+          case 'mode_change':
+            return labelHtml + `<span class="tree-muted">[mode: ${escapeHtml(entry.mode)}]</span>`;
           default:
             return labelHtml + `<span class="tree-muted">[${entry.type}]</span>`;
         }
+      }
+
+      /**
+       * Split an OMP interleaved assistant into sidebar text/tool rows.
+       * Pi stores those continuations as separate entries; OMP keeps one
+       * content array. Do not mutate session entries or parentIds.
+       */
+      function buildInterleavedAssistantRows(flatNode, toolResultNodes, includeTools) {
+        const entry = flatNode.node.entry;
+        if (entry.type !== 'message' || entry.message.role !== 'assistant') return null;
+
+        const content = entry.message.content;
+        if (!Array.isArray(content)) return null;
+
+        let sawToolCall = false;
+        let hasTextAfterToolCall = false;
+        for (const block of content) {
+          if (block.type === 'toolCall') {
+            sawToolCall = true;
+          } else if (sawToolCall && block.type === 'text' && block.text && canonicalizeMessage(block.text)) {
+            hasTextAfterToolCall = true;
+            break;
+          }
+        }
+        if (!hasTextAfterToolCall) return null;
+
+        const rows = [];
+        let text = '';
+        let textBlockIndex = null;
+        let navigationId = entry.id;
+        let isFirstAssistantRow = true;
+        const flushText = () => {
+          const normalized = canonicalizeMessage(text);
+          text = '';
+          if (!normalized) return;
+          rows.push({
+            flatNode,
+            assistantText: normalized,
+            anchorId: assistantBlockDomId(entry.id, textBlockIndex, mainSctx),
+            navigationId,
+            showLabel: isFirstAssistantRow,
+            timelineId: entry.id,
+          });
+          textBlockIndex = null;
+          isFirstAssistantRow = false;
+        };
+
+        for (let blockIndex = 0; blockIndex < content.length; blockIndex++) {
+          const block = content[blockIndex];
+          if (block.type === 'text' && block.text) {
+            if (textBlockIndex === null && canonicalizeMessage(block.text)) textBlockIndex = blockIndex;
+            text += block.text;
+          } else if (block.type === 'toolCall') {
+            flushText();
+            if (!includeTools) {
+              navigationId = entry.id;
+              continue;
+            }
+            const anchorId = assistantBlockDomId(entry.id, blockIndex, mainSctx);
+            const resultNode = toolResultNodes.get(block.id);
+            if (resultNode) {
+              navigationId = resultNode.node.entry.id;
+              rows.push({
+                flatNode: resultNode,
+                anchorId,
+                navigationId,
+                timelineId: entry.id,
+              });
+            } else {
+              navigationId = entry.id;
+              rows.push({
+                flatNode,
+                assistantToolCall: block,
+                anchorId,
+                navigationId,
+                timelineId: entry.id,
+              });
+            }
+          }
+        }
+        flushText();
+
+        return rows;
+      }
+
+      function projectSidebarRows(filteredNodes, includeTools = true) {
+        const toolResultNodes = new Map();
+        if (includeTools) {
+          for (const flatNode of filteredNodes) {
+            const entry = flatNode.node.entry;
+            if (entry.type === 'message' && entry.message.role === 'toolResult' && entry.message.toolCallId) {
+              toolResultNodes.set(entry.message.toolCallId, flatNode);
+            }
+          }
+        }
+
+        const projectedByAssistantId = new Map();
+        const claimedToolResultIds = new Set();
+        for (const flatNode of filteredNodes) {
+          const rows = buildInterleavedAssistantRows(flatNode, toolResultNodes, includeTools);
+          if (!rows) continue;
+          projectedByAssistantId.set(flatNode.node.entry.id, rows);
+          for (const row of rows) {
+            const entry = row.flatNode.node.entry;
+            if (entry.type === 'message' && entry.message.role === 'toolResult') {
+              claimedToolResultIds.add(entry.id);
+            }
+          }
+        }
+
+        const rows = [];
+        for (const flatNode of filteredNodes) {
+          const entry = flatNode.node.entry;
+          if (!includeTools && entry.type === 'message' && entry.message.role === 'toolResult') continue;
+          const projected = projectedByAssistantId.get(entry.id);
+          if (projected) {
+            rows.push(...projected);
+          } else if (!claimedToolResultIds.has(entry.id)) {
+            let anchorId;
+            if (entry.type === 'message' && entry.message.role === 'toolResult') {
+              const toolCall = toolCallMap.get(entry.message.toolCallId);
+              if (toolCall) anchorId = assistantBlockDomId(toolCall.entryId, toolCall.blockIndex, mainSctx);
+            }
+            rows.push({ flatNode, anchorId, navigationId: entry.id });
+          }
+        }
+        return rows;
       }
 
       // ============================================================
@@ -503,6 +702,7 @@
 
       let currentLeafId = leafId;
       let currentTargetId = urlTargetId || leafId;
+      let currentTargetAnchorId = null;
       let treeRendered = false;
 
       function renderTree() {
@@ -510,22 +710,45 @@
         const activePathIds = buildActivePathIds(currentLeafId);
         const flatNodes = flattenTree(tree, activePathIds);
         const filtered = filterNodes(flatNodes, currentLeafId);
+        const allSidebarRows = projectSidebarRows(flatNodes);
+        const sidebarRows = projectSidebarRows(filtered, filterMode !== 'no-tools');
         const container = document.getElementById('tree-container');
+        const activeRowIndex = currentTargetAnchorId
+          ? sidebarRows.findIndex(row => row.anchorId === currentTargetAnchorId)
+          : -1;
+        const activeTimelineId = activeRowIndex >= 0 ? sidebarRows[activeRowIndex].timelineId : undefined;
+        // Block-anchor selection uses the projected-row prefix, not parentId
+        // ancestry — tool-result chains can be reversed relative to content.
+        const isSidebarRowOnPath = (row, rowIndex) => {
+          if (activeRowIndex >= 0) {
+            if (rowIndex > activeRowIndex) return false;
+            if (activeTimelineId && row.timelineId === activeTimelineId) return true;
+          }
+          const entry = row.flatNode.node.entry;
+          return activePathIds.has(row.navigationId || entry.id);
+        };
 
         // Full render only on first call or when filter/search changes
         if (!treeRendered) {
           container.innerHTML = '';
 
-          for (const flatNode of filtered) {
+          for (let rowIndex = 0; rowIndex < sidebarRows.length; rowIndex++) {
+            const row = sidebarRows[rowIndex];
+            const flatNode = row.flatNode;
             const entry = flatNode.node.entry;
-            const isOnPath = activePathIds.has(entry.id);
-            const isTarget = entry.id === currentTargetId;
+            const pathId = row.navigationId || entry.id;
+            const isOnPath = isSidebarRowOnPath(row, rowIndex);
+            const isTarget = currentTargetAnchorId
+              ? row.anchorId === currentTargetAnchorId
+              : entry.id === currentTargetId;
 
             const div = document.createElement('div');
             div.className = 'tree-node';
             if (isOnPath) div.classList.add('in-path');
             if (isTarget) div.classList.add('active');
             div.dataset.id = entry.id;
+            div.dataset.pathId = pathId;
+            if (row.anchorId) div.dataset.anchorId = row.anchorId;
 
             const prefix = buildTreePrefix(flatNode);
             const prefixSpan = document.createElement('span');
@@ -538,12 +761,21 @@
 
             const content = document.createElement('span');
             content.className = 'tree-content';
-            content.innerHTML = getTreeNodeDisplayHtml(entry, flatNode.node.label);
+            if (row.assistantText !== undefined) {
+              const label = row.showLabel ? flatNode.node.label : undefined;
+              const labelHtml = label ? `<span class="tree-label">[${escapeHtml(label)}]</span> ` : '';
+              content.innerHTML = labelHtml + `<span class="tree-role-assistant">assistant:</span> ${escapeHtml(truncate(normalizeTreeText(row.assistantText)))}`;
+            } else if (row.assistantToolCall) {
+              const call = row.assistantToolCall;
+              content.innerHTML = `<span class="tree-role-tool">${escapeHtml(formatToolCall(call.name, call.arguments || {}))}</span>`;
+            } else {
+              content.innerHTML = getTreeNodeDisplayHtml(entry, flatNode.node.label);
+            }
 
             div.appendChild(prefixSpan);
             div.appendChild(marker);
             div.appendChild(content);
-            div.addEventListener('click', () => navigateTo(entry.id));
+            div.addEventListener('click', () => navigateTo(row.navigationId || entry.id, 'target', null, row.anchorId));
 
             container.appendChild(div);
           }
@@ -552,10 +784,15 @@
         } else {
           // Just update markers and classes
           const nodes = container.querySelectorAll('.tree-node');
-          for (const node of nodes) {
+          for (let rowIndex = 0; rowIndex < nodes.length; rowIndex++) {
+            const node = nodes[rowIndex];
+            const row = sidebarRows[rowIndex];
+            if (!row) continue;
             const id = node.dataset.id;
-            const isOnPath = activePathIds.has(id);
-            const isTarget = id === currentTargetId;
+            const isOnPath = isSidebarRowOnPath(row, rowIndex);
+            const isTarget = currentTargetAnchorId
+              ? node.dataset.anchorId === currentTargetAnchorId
+              : id === currentTargetId;
 
             node.classList.toggle('in-path', isOnPath);
             node.classList.toggle('active', isTarget);
@@ -567,7 +804,7 @@
           }
         }
 
-        document.getElementById('tree-status').textContent = `${filtered.length} / ${flatNodes.length} entries`;
+        document.getElementById('tree-status').textContent = `${sidebarRows.length} / ${allSidebarRows.length} rows`;
 
         // Scroll active node into view after layout
         setTimeout(() => {
@@ -604,29 +841,12 @@
         return text.replace(/\t/g, '   ');
       }
 
-      /** Safely coerce value to string for display. Returns null if invalid type. */
-      function str(value) {
-        if (typeof value === 'string') return value;
-        if (value == null) return '';
-        return null;
+      function assistantBlockDomId(entryId, blockIndex, sctx) {
+        return `${sctx.idPrefix}${entryId}-block-${blockIndex}`;
       }
 
-      function getLanguageFromPath(filePath) {
-        const ext = filePath.split('.').pop()?.toLowerCase();
-        const extToLang = {
-          ts: 'typescript', tsx: 'typescript', js: 'javascript', jsx: 'javascript',
-          py: 'python', rb: 'ruby', rs: 'rust', go: 'go', java: 'java',
-          c: 'c', cpp: 'cpp', h: 'c', hpp: 'cpp', cs: 'csharp',
-          php: 'php', sh: 'bash', bash: 'bash', zsh: 'bash',
-          sql: 'sql', html: 'html', css: 'css', scss: 'scss',
-          json: 'json', yaml: 'yaml', yml: 'yaml', xml: 'xml',
-          md: 'markdown', dockerfile: 'dockerfile'
-        };
-        return extToLang[ext];
-      }
-
-      function findToolResult(toolCallId) {
-        for (const entry of entries) {
+      function findToolResult(toolCallId, entryList) {
+        for (const entry of entryList) {
           if (entry.type === 'message' && entry.message.role === 'toolResult') {
             if (entry.message.toolCallId === toolCallId) {
               return entry.message;
@@ -692,122 +912,227 @@
         return out;
       }
 
-      function renderToolCall(call) {
-        const result = findToolResult(call.id);
-        const isError = result?.isError || false;
-        const statusClass = result ? (isError ? 'error' : 'success') : 'pending';
+      // ============================================================
+      // TOOL CALL RENDERING
+      // ============================================================
+      //
+      // Tool calls render through the bundled <omp-tool-view> web component
+      // (tool-views.generated.js — the same React renderers collab-web uses).
+      // Payloads are handed over via a global store keyed by data-key, which
+      // survives innerHTML serialization and cloneNode round trips.
 
-        const getResultText = () => {
-          if (!result) return '';
-          const textBlocks = result.content.filter(c => c.type === 'text');
-          return textBlocks.map(c => c.text).join('\n');
-        };
+      const TOOL_VIEW_DATA = new Map();
+      globalThis.__OMP_TOOL_VIEW_DATA = TOOL_VIEW_DATA;
+      let toolViewSeq = 0;
 
-        const getResultImages = () => {
-          if (!result) return [];
-          return result.content.filter(c => c.type === 'image');
-        };
+      function renderToolCall(call, sctx, blockId) {
+        const result = findToolResult(call.id, sctx.entries);
+        const statusClass = result ? (result.isError ? 'error' : 'success') : 'pending';
+        const key = 'tv' + (++toolViewSeq);
+        TOOL_VIEW_DATA.set(key, {
+          name: call.name,
+          args: call.arguments || {},
+          result: result || undefined,
+          host: {
+            hasAgent: (id) => !!lookupSubSession(sctx.prefix, id),
+            openAgent: (id) => openSubSession(joinKey(sctx.prefix, id)),
+          },
+        });
+        return '<omp-tool-view class="tool-execution ' + statusClass + '" id="' + blockId + '" data-key="' + key + '" open></omp-tool-view>';
+      }
 
-        const renderResultImages = () => {
-          const images = getResultImages();
-          if (images.length === 0) return '';
-          return '<div class="tool-images">' + 
-            images.map(img => `<img src="data:${img.mimeType};base64,${img.data}" class="tool-image" />`).join('') + 
-            '</div>';
-        };
+      // ============================================================
+      // SUB-SESSION OVERLAY
+      // ============================================================
+      //
+      // Task tool cards expose agent chips (wired through the payload `host`
+      // above); clicking one opens that subagent's transcript in a stacked
+      // overlay. Keys are slash-joined agent ids relative to the main
+      // session: top-level agent 'ToolAsk', its child 'ToolAsk/Helper'.
 
-        let html = `<div class="tool-execution ${statusClass}">`;
-        const args = call.arguments || {};
-        const name = call.name;
+      function joinKey(prefix, id) {
+        return prefix ? prefix + '/' + id : id;
+      }
 
-        const invalidArg = '<span class="tool-error">[invalid arg]</span>';
+      function lookupSubSession(prefix, id) {
+        return subSessions ? subSessions[joinKey(prefix, id)] : undefined;
+      }
 
-        switch (name) {
-          case 'bash': {
-            const command = str(args.command);
-            const cmdDisplay = command === null ? invalidArg : escapeHtml(command || '...');
-            html += `<div class="tool-command">$ ${cmdDisplay}</div>`;
-            if (result) {
-              const output = getResultText().trim();
-              if (output) html += formatExpandableOutput(output, 5);
-            }
-            break;
+      // Render context per sub-session (entries scoped to that transcript).
+      const subSctxCache = new Map();
+      function getSubSctx(key) {
+        let sctx = subSctxCache.get(key);
+        if (!sctx) {
+          sctx = {
+            entries: subSessions[key].entries,
+            prefix: key,
+            idPrefix: 'sub-' + key.replace(/[^A-Za-z0-9_-]/g, '_') + '-entry-',
+          };
+          subSctxCache.set(key, sctx);
+        }
+        return sctx;
+      }
+
+      /**
+       * Root-to-leaf path through an arbitrary entry list (subagent
+       * transcripts are linear chains; same parent-walk as getPath).
+       */
+      function getPathIn(entryList, targetId) {
+        const map = new Map();
+        for (const e of entryList) map.set(e.id, e);
+        let current = targetId ? map.get(targetId) : undefined;
+        if (!current && entryList.length > 0) current = entryList[entryList.length - 1];
+        const path = [];
+        while (current) {
+          path.unshift(current);
+          if (!current.parentId || current.parentId === current.id) break;
+          current = map.get(current.parentId);
+        }
+        return path;
+      }
+
+      const overlayStack = [];               // slash-joined keys, root-first chain
+      const subSessionBodyCache = new Map(); // key -> rendered body element
+      let subOverlayEl = null;
+      let subOverlayLastFocus = null;
+
+      function ensureSubOverlay() {
+        if (subOverlayEl) return subOverlayEl;
+        subOverlayEl = document.createElement('div');
+        subOverlayEl.id = 'subsession-overlay';
+        subOverlayEl.innerHTML = `
+          <div class="subsession-backdrop"></div>
+          <div class="subsession-panel" role="dialog" aria-modal="true" aria-label="Subagent session" tabindex="-1">
+            <div class="subsession-header">
+              <nav class="subsession-breadcrumb" aria-label="Subagent breadcrumb"></nav>
+              <button type="button" class="subsession-close" title="Close (Esc)" aria-label="Close subagent view">&times;</button>
+            </div>
+            <div class="subsession-meta"></div>
+            <div class="subsession-body"></div>
+          </div>`;
+        subOverlayEl.querySelector('.subsession-backdrop').addEventListener('click', popSubSession);
+        subOverlayEl.querySelector('.subsession-close').addEventListener('click', closeAllSubSessions);
+        document.body.appendChild(subOverlayEl);
+        return subOverlayEl;
+      }
+
+      function buildSubSessionBody(key) {
+        let body = subSessionBodyCache.get(key);
+        if (body) return body;
+        const sub = subSessions[key];
+        const sctx = getSubSctx(key);
+        body = document.createElement('div');
+        body.className = 'subsession-messages';
+        for (const entry of getPathIn(sub.entries, sub.leafId)) {
+          const node = renderEntryToNode(entry, sctx);
+          if (node) body.appendChild(node);
+        }
+        if (!body.firstChild) {
+          const empty = document.createElement('div');
+          empty.className = 'subsession-empty';
+          empty.textContent = '(no renderable entries)';
+          body.appendChild(empty);
+        }
+        subSessionBodyCache.set(key, body);
+        return body;
+      }
+
+      function subSessionMetaText(key) {
+        const sub = subSessions[key];
+        const stats = computeStats(sub.entries);
+        const parts = [];
+        if (stats.models.length > 0) parts.push(stats.models.join(', '));
+        parts.push(sub.entries.length + (sub.entries.length === 1 ? ' entry' : ' entries'));
+        return parts.join(' · ');
+      }
+
+      function renderSubOverlay() {
+        const key = overlayStack[overlayStack.length - 1];
+        const el = ensureSubOverlay();
+
+        const crumbs = el.querySelector('.subsession-breadcrumb');
+        crumbs.innerHTML = '';
+        const segments = key.split('/');
+        for (let i = 0; i < segments.length; i++) {
+          if (i > 0) {
+            const sep = document.createElement('span');
+            sep.className = 'subsession-crumb-sep';
+            sep.textContent = '›';
+            crumbs.appendChild(sep);
           }
-          case 'read': {
-            const filePath = str(args.file_path ?? args.path);
-            const offset = args.offset;
-            const limit = args.limit;
-
-            let pathHtml = filePath === null ? invalidArg : escapeHtml(shortenPath(filePath || ''));
-            if (filePath !== null && (offset !== undefined || limit !== undefined)) {
-              const startLine = offset ?? 1;
-              const endLine = limit !== undefined ? startLine + limit - 1 : '';
-              pathHtml += `<span class="line-numbers">:${startLine}${endLine ? '-' + endLine : ''}</span>`;
-            }
-
-            html += `<div class="tool-header"><span class="tool-name">read</span> <span class="tool-path">${pathHtml}</span></div>`;
-            if (result) {
-              html += renderResultImages();
-              const output = getResultText();
-              const lang = filePath ? getLanguageFromPath(filePath) : null;
-              if (output) html += formatExpandableOutput(output, 10, lang);
-            }
-            break;
-          }
-          case 'write': {
-            const filePath = str(args.file_path ?? args.path);
-            const content = str(args.content);
-
-            html += `<div class="tool-header"><span class="tool-name">write</span> <span class="tool-path">${filePath === null ? invalidArg : escapeHtml(shortenPath(filePath || ''))}</span>`;
-            if (content !== null && content) {
-              const lines = content.split('\n');
-              if (lines.length > 10) html += ` <span class="line-count">(${lines.length} lines)</span>`;
-            }
-            html += '</div>';
-
-            if (content === null) {
-              html += `<div class="tool-error">[invalid content arg - expected string]</div>`;
-            } else if (content) {
-              const lang = filePath ? getLanguageFromPath(filePath) : null;
-              html += formatExpandableOutput(content, 10, lang);
-            }
-            if (result) {
-              const output = getResultText().trim();
-              if (output) html += `<div class="tool-output"><div>${escapeHtml(output)}</div></div>`;
-            }
-            break;
-          }
-          case 'edit': {
-            const filePath = str(args.file_path ?? args.path);
-            html += `<div class="tool-header"><span class="tool-name">edit</span> <span class="tool-path">${filePath === null ? invalidArg : escapeHtml(shortenPath(filePath || ''))}</span></div>`;
-
-            if (result?.details?.diff) {
-              const diffLines = result.details.diff.split('\n');
-              html += '<div class="tool-diff">';
-              for (const line of diffLines) {
-                const cls = line.match(/^\+/) ? 'diff-added' : line.match(/^-/) ? 'diff-removed' : 'diff-context';
-                html += `<div class="${cls}">${escapeHtml(replaceTabs(line))}</div>`;
-              }
-              html += '</div>';
-            } else if (result) {
-              const output = getResultText().trim();
-              if (output) html += `<div class="tool-output"><pre>${escapeHtml(output)}</pre></div>`;
-            }
-            break;
-          }
-          default: {
-            html += `<div class="tool-header"><span class="tool-name">${escapeHtml(name)}</span></div>`;
-            html += `<div class="tool-output"><pre>${escapeHtml(JSON.stringify(args, null, 2))}</pre></div>`;
-            if (result) {
-              const output = getResultText();
-              if (output) html += formatExpandableOutput(output, 10);
-            }
+          if (i === segments.length - 1) {
+            const span = document.createElement('span');
+            span.className = 'subsession-crumb current';
+            span.textContent = segments[i];
+            crumbs.appendChild(span);
+          } else {
+            const btn = document.createElement('button');
+            btn.type = 'button';
+            btn.className = 'subsession-crumb';
+            btn.textContent = segments[i];
+            const ancestorKey = segments.slice(0, i + 1).join('/');
+            btn.addEventListener('click', () => popSubSessionTo(ancestorKey));
+            crumbs.appendChild(btn);
           }
         }
 
-        html += '</div>';
-        return html;
+        el.querySelector('.subsession-meta').textContent = subSessionMetaText(key);
+
+        const bodyHost = el.querySelector('.subsession-body');
+        bodyHost.innerHTML = '';
+        bodyHost.appendChild(buildSubSessionBody(key));
+        bodyHost.scrollTop = 0;
+
+        el.classList.add('open');
+        el.querySelector('.subsession-panel').focus();
       }
+
+      function openSubSession(key) {
+        if (!subSessions || !subSessions[key]) return;
+        if (overlayStack.length === 0) {
+          subOverlayLastFocus = document.activeElement;
+        }
+        overlayStack.push(key);
+        renderSubOverlay();
+      }
+
+      function popSubSession() {
+        if (overlayStack.length === 0) return;
+        overlayStack.pop();
+        if (overlayStack.length === 0) {
+          hideSubOverlay();
+        } else {
+          renderSubOverlay();
+        }
+      }
+
+      function popSubSessionTo(key) {
+        // Rebuild the chain root..key (the stack is always a prefix chain).
+        const segments = key.split('/');
+        overlayStack.length = 0;
+        for (let i = 1; i <= segments.length; i++) {
+          overlayStack.push(segments.slice(0, i).join('/'));
+        }
+        renderSubOverlay();
+      }
+
+      function closeAllSubSessions() {
+        if (overlayStack.length === 0) return;
+        overlayStack.length = 0;
+        hideSubOverlay();
+      }
+
+      function hideSubOverlay() {
+        if (subOverlayEl) {
+          subOverlayEl.classList.remove('open');
+          subOverlayEl.querySelector('.subsession-body').innerHTML = '';
+        }
+        if (subOverlayLastFocus && typeof subOverlayLastFocus.focus === 'function') {
+          subOverlayLastFocus.focus();
+        }
+        subOverlayLastFocus = null;
+      }
+
 
       /**
        * Build a shareable URL for a specific message.
@@ -890,11 +1215,12 @@
         </button>`;
       }
 
-      function renderEntry(entry) {
+      function renderEntry(entry, sctx) {
         const ts = formatTimestamp(entry.timestamp);
         const tsHtml = ts ? `<div class="message-timestamp">${ts}</div>` : '';
-        const entryId = `entry-${entry.id}`;
-        const copyBtnHtml = renderCopyLinkButton(entry.id);
+        const entryId = `${sctx.idPrefix}${entry.id}`;
+        // Share links target main-session entries only; overlays skip them.
+        const copyBtnHtml = sctx.prefix === '' ? renderCopyLinkButton(entry.id) : '';
 
         if (entry.type === 'message') {
           const msg = entry.message;
@@ -923,23 +1249,41 @@
             return html;
           }
 
+          if (msg.role === 'developer') {
+            let html = `<div class="user-message developer-message" id="${entryId}">${copyBtnHtml}${tsHtml}`;
+            const content = msg.content;
+            const text = typeof content === 'string' ? content :
+              content.filter(c => c.type === 'text').map(c => c.text).join('\n');
+            if (text.trim()) {
+              html += `<div class="markdown-content">${safeMarkedParse(text)}</div>`;
+            }
+            html += '</div>';
+            return html;
+          }
+
           if (msg.role === 'assistant') {
             let html = `<div class="assistant-message" id="${entryId}">${copyBtnHtml}${tsHtml}`;
 
-            for (const block of msg.content) {
-              if (block.type === 'text' && block.text.trim()) {
-                html += `<div class="assistant-text markdown-content">${safeMarkedParse(block.text)}</div>`;
-              } else if (block.type === 'thinking' && block.thinking.trim()) {
-                html += `<div class="thinking-block">
-                  <div class="thinking-text">${escapeHtml(block.thinking)}</div>
+            // Walk message.content once. Do not bucket blocks by type.
+            for (let blockIndex = 0; blockIndex < msg.content.length; blockIndex++) {
+              const block = msg.content[blockIndex];
+              const blockId = assistantBlockDomId(entry.id, blockIndex, sctx);
+              if (block.type === 'text') {
+                const canon = canonicalizeMessage(block.text);
+                if (canon) {
+                  html += `<div class="assistant-text markdown-content" id="${blockId}">${safeMarkedParse(block.text)}</div>`;
+                }
+              } else if (block.type === 'thinking') {
+                const thinking = canonicalizeMessage(block.thinking);
+                if (!thinking) continue;
+                html += `<div class="thinking-block" id="${blockId}">
+                  <div class="thinking-text">${escapeHtml(thinking)}</div>
                   <div class="thinking-collapsed">Thinking ...</div>
                 </div>`;
-              }
-            }
-
-            for (const block of msg.content) {
-              if (block.type === 'toolCall') {
-                html += renderToolCall(block);
+              } else if (block.type === 'image') {
+                html += `<div class="message-images" id="${blockId}"><img src="data:${block.mimeType};base64,${block.data}" class="message-image" /></div>`;
+              } else if (block.type === 'toolCall') {
+                html += renderToolCall(block, sctx, blockId);
               }
             }
 
@@ -967,21 +1311,33 @@
             return html;
           }
 
+          if (msg.role === 'jsExecution') {
+            const isError = msg.cancelled || (msg.exitCode !== 0 && msg.exitCode !== null);
+            let html = `<div class="tool-execution ${isError ? 'error' : 'success'}" id="${entryId}">${tsHtml}`;
+            html += `<div class="tool-command">$ ${escapeHtml(msg.code)}</div>`;
+            if (msg.output) html += formatExpandableOutput(msg.output, 10);
+            if (msg.cancelled) {
+              html += '<div style="color: var(--warning)">(cancelled)</div>';
+            } else if (msg.exitCode !== 0 && msg.exitCode !== null) {
+              html += `<div style="color: var(--error)">(exit ${msg.exitCode})</div>`;
+            }
+            html += '</div>';
+            return html;
+          }
+
           if (msg.role === 'toolResult') return '';
         }
 
         if (entry.type === 'model_change') {
-          let html = `<div class="model-change" id="${entryId}">${tsHtml}Switched to model: <span class="model-name">${escapeHtml(entry.provider)}/${escapeHtml(entry.modelId)}</span>`;
-
-          if (entry.provider === 'openai-codex' && codexInjectionInfo) {
-            const fullContent = `# Codex Instructions\n${codexInjectionInfo.instructions}\n\n# Codex-Pi Bridge\n${codexInjectionInfo.bridge}`;
-            html += ` <span class="codex-bridge-toggle" onclick="event.stopPropagation(); this.parentElement.classList.toggle('show-bridge')">[bridge prompt]</span>`;
-            html += `<div class="codex-bridge-content"><pre>${escapeHtml(fullContent)}</pre></div>`;
-          }
-
-          html += '</div>';
+          const html = `<div class="model-change" id="${entryId}">${tsHtml}Switched to model: <span class="model-name">${escapeHtml(entry.model)}</span></div>`;
           return html;
         }
+
+        if (entry.type === 'thinking_level_change') {
+          const html = `<div class="thinking-change" id="${entryId}">${tsHtml}Thinking level: <span class="thinking-level">${escapeHtml(entry.thinkingLevel)}</span></div>`;
+          return html;
+        }
+
 
         if (entry.type === 'compaction') {
           return `<div class="compaction" id="${entryId}" onclick="this.classList.toggle('expanded')">
@@ -1013,7 +1369,7 @@
       // ============================================================
 
       function computeStats(entryList) {
-        let userMessages = 0, assistantMessages = 0, toolResults = 0;
+        let userMessages = 0, developerMessages = 0, assistantMessages = 0, toolResults = 0;
         let customMessages = 0, compactions = 0, branchSummaries = 0, toolCalls = 0;
         const tokens = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
         const cost = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
@@ -1023,6 +1379,7 @@
           if (entry.type === 'message') {
             const msg = entry.message;
             if (msg.role === 'user') userMessages++;
+            if (msg.role === 'developer') developerMessages++;
             if (msg.role === 'assistant') {
               assistantMessages++;
               if (msg.model) models.add(msg.provider ? `${msg.provider}/${msg.model}` : msg.model);
@@ -1050,7 +1407,7 @@
           }
         }
 
-        return { userMessages, assistantMessages, toolResults, customMessages, compactions, branchSummaries, toolCalls, tokens, cost, models: Array.from(models) };
+        return { userMessages, developerMessages, assistantMessages, toolResults, customMessages, compactions, branchSummaries, toolCalls, tokens, cost, models: Array.from(models) };
       }
 
       const globalStats = computeStats(entries);
@@ -1066,6 +1423,7 @@
 
         const msgParts = [];
         if (globalStats.userMessages) msgParts.push(`${globalStats.userMessages} user`);
+        if (globalStats.developerMessages) msgParts.push(`${globalStats.developerMessages} developer`);
         if (globalStats.assistantMessages) msgParts.push(`${globalStats.assistantMessages} assistant`);
         if (globalStats.toolResults) msgParts.push(`${globalStats.toolResults} tool results`);
         if (globalStats.customMessages) msgParts.push(`${globalStats.customMessages} custom`);
@@ -1075,7 +1433,7 @@
         let html = `
           <div class="header">
             <h1>Session: ${escapeHtml(header?.id || 'unknown')}</h1>
-            <div class="help-bar">Ctrl+T toggle thinking · Ctrl+O toggle tools</div>
+            <div class="help-bar">T toggle thinking · O toggle tools</div>
             <div class="header-info">
               <div class="info-item"><span class="info-label">Date:</span><span class="info-value">${header?.timestamp ? new Date(header.timestamp).toLocaleString() : 'unknown'}</span></div>
               <div class="info-item"><span class="info-label">Models:</span><span class="info-value">${globalStats.models.join(', ') || 'unknown'}</span></div>
@@ -1094,11 +1452,12 @@
         }
 
         if (tools && tools.length > 0) {
-          html += `<div class="tools-list">
-            <div class="tools-header">Available Tools</div>
-            <div class="tools-content">
-              ${tools.map(t => `<div class="tool-item"><span class="tool-item-name">${escapeHtml(t.name)}</span> - <span class="tool-item-desc">${escapeHtml(t.description)}</span></div>`).join('')}
-            </div>
+          const namesHtml = tools.map(t => `<span class="tool-name-chip">${escapeHtml(t.name)}</span>`).join('');
+          const fullHtml = tools.map(t => `<div class="tool-item"><span class="tool-item-name">${escapeHtml(t.name)}</span> - <span class="tool-item-desc">${escapeHtml(t.description)}</span></div>`).join('');
+          html += `<div class="tools-list collapsed" onclick="this.classList.toggle('collapsed')">
+            <div class="tools-header">Available Tools (${tools.length})</div>
+            <div class="tools-collapsed">${namesHtml}</div>
+            <div class="tools-content">${fullHtml}</div>
           </div>`;
         }
 
@@ -1112,14 +1471,16 @@
       // Cache for rendered entry DOM nodes
       const entryCache = new Map();
 
-      function renderEntryToNode(entry) {
-        // Check cache first
-        if (entryCache.has(entry.id)) {
+      function renderEntryToNode(entry, sctx) {
+        // Cache main-session nodes only; sub-session bodies are cached whole
+        // per key in subSessionBodyCache, so each entry renders once anyway.
+        const cacheable = sctx.prefix === '';
+        if (cacheable && entryCache.has(entry.id)) {
           return entryCache.get(entry.id).cloneNode(true);
         }
 
         // Render to HTML string, then parse to node
-        const html = renderEntry(entry);
+        const html = renderEntry(entry, sctx);
         if (!html) return null;
 
         const template = document.createElement('template');
@@ -1127,18 +1488,24 @@
         const node = template.content.firstElementChild;
 
         // Cache the node
-        if (node) {
+        if (cacheable && node) {
           entryCache.set(entry.id, node.cloneNode(true));
         }
         return node;
       }
 
-      function navigateTo(targetId, scrollMode = 'target', scrollToEntryId = null) {
+      function navigateTo(targetId, scrollMode = 'target', scrollToEntryId = null, scrollTargetDomId = null) {
+        const leafChanged = currentLeafId !== targetId;
         currentLeafId = targetId;
         currentTargetId = scrollToEntryId || targetId;
+        currentTargetAnchorId = scrollTargetDomId;
         const path = getPath(targetId);
 
-        renderTree();
+        if (leafChanged) {
+          forceTreeRerender();
+        } else {
+          renderTree();
+        }
 
         document.getElementById('header-container').innerHTML = renderHeader();
 
@@ -1147,7 +1514,7 @@
         const fragment = document.createDocumentFragment();
 
         for (const entry of path) {
-          const node = renderEntryToNode(entry);
+          const node = renderEntryToNode(entry, mainSctx);
           if (node) {
             fragment.appendChild(node);
           }
@@ -1173,7 +1540,7 @@
             content.scrollTop = content.scrollHeight;
           } else if (scrollMode === 'target') {
             const scrollTargetId = scrollToEntryId || targetId;
-            const targetEl = document.getElementById(`entry-${scrollTargetId}`);
+            const targetEl = document.getElementById(scrollTargetDomId || `entry-${scrollTargetId}`);
             if (targetEl) {
               targetEl.scrollIntoView({ block: 'center' });
               if (scrollToEntryId) {
@@ -1222,7 +1589,8 @@
           },
           // Text content: escape HTML tags
           text(token) {
-            return escapeHtmlTags(escapeHtml(token.text));
+            if (token.tokens) return this.parser.parseInline(token.tokens);
+            return token.escaped ? token.text : escapeHtmlTags(escapeHtml(token.text));
           },
           // Inline code: escape HTML
           codespan(token) {
@@ -1257,6 +1625,113 @@
       const sidebar = document.getElementById('sidebar');
       const overlay = document.getElementById('sidebar-overlay');
       const hamburger = document.getElementById('hamburger');
+      const sidebarResizer = document.getElementById('sidebar-resizer');
+      const SIDEBAR_WIDTH_STORAGE_KEY = 'pi-share:v1:sidebar-width';
+      const MIN_CONTENT_WIDTH = 320;
+
+      function isMobileLayout() {
+        return window.matchMedia('(max-width: 900px)').matches;
+      }
+
+      function getSidebarBounds() {
+        const rootStyles = getComputedStyle(document.documentElement);
+        const minWidth = parseFloat(rootStyles.getPropertyValue('--sidebar-min-width')) || 240;
+        const maxWidth = parseFloat(rootStyles.getPropertyValue('--sidebar-max-width')) || 720;
+        const viewportMaxWidth = window.innerWidth - MIN_CONTENT_WIDTH;
+        return {
+          minWidth,
+          maxWidth: Math.max(minWidth, Math.min(maxWidth, viewportMaxWidth))
+        };
+      }
+
+      function clampSidebarWidth(width) {
+        const { minWidth, maxWidth } = getSidebarBounds();
+        return Math.max(minWidth, Math.min(maxWidth, width));
+      }
+
+      function applySidebarWidth(width) {
+        document.documentElement.style.setProperty('--sidebar-width', `${Math.round(clampSidebarWidth(width))}px`);
+      }
+
+      function loadSidebarWidth() {
+        try {
+          const raw = localStorage.getItem(SIDEBAR_WIDTH_STORAGE_KEY);
+          if (raw === null) return null;
+          const width = Number(raw);
+          return Number.isFinite(width) ? width : null;
+        } catch {
+          return null;
+        }
+      }
+
+      function saveSidebarWidth(width) {
+        try {
+          localStorage.setItem(SIDEBAR_WIDTH_STORAGE_KEY, String(Math.round(clampSidebarWidth(width))));
+        } catch {
+          // Ignore storage failures (e.g. private browsing restrictions)
+        }
+      }
+
+      function setupSidebarResize() {
+        const savedWidth = loadSidebarWidth();
+        if (savedWidth !== null) {
+          applySidebarWidth(savedWidth);
+        }
+
+        if (!sidebarResizer) return;
+
+        let cleanupDrag = null;
+
+        const stopDrag = (pointerId) => {
+          if (cleanupDrag) {
+            cleanupDrag(pointerId);
+            cleanupDrag = null;
+          }
+        };
+
+        sidebarResizer.addEventListener('pointerdown', (e) => {
+          if (isMobileLayout()) return;
+
+          e.preventDefault();
+          const startX = e.clientX;
+          const startWidth = sidebar.getBoundingClientRect().width;
+          document.body.classList.add('sidebar-resizing');
+          sidebarResizer.setPointerCapture?.(e.pointerId);
+
+          const onPointerMove = (event) => {
+            applySidebarWidth(startWidth + (event.clientX - startX));
+          };
+
+          cleanupDrag = (pointerIdToRelease) => {
+            document.body.classList.remove('sidebar-resizing');
+            sidebarResizer.releasePointerCapture?.(pointerIdToRelease);
+            window.removeEventListener('pointermove', onPointerMove);
+            window.removeEventListener('pointerup', onPointerUp);
+            window.removeEventListener('pointercancel', onPointerCancel);
+            saveSidebarWidth(sidebar.getBoundingClientRect().width);
+          };
+
+          const onPointerUp = (event) => stopDrag(event.pointerId);
+          const onPointerCancel = (event) => stopDrag(event.pointerId);
+
+          window.addEventListener('pointermove', onPointerMove);
+          window.addEventListener('pointerup', onPointerUp);
+          window.addEventListener('pointercancel', onPointerCancel);
+        });
+
+        sidebarResizer.addEventListener('dblclick', () => {
+          if (isMobileLayout()) return;
+          applySidebarWidth(400);
+          saveSidebarWidth(400);
+        });
+
+        window.addEventListener('resize', () => {
+          if (isMobileLayout()) return;
+          applySidebarWidth(sidebar.getBoundingClientRect().width);
+        });
+      }
+
+      setupSidebarResize();
 
       hamburger.addEventListener('click', () => {
         sidebar.classList.add('open');
@@ -1274,13 +1749,13 @@
       document.getElementById('sidebar-close').addEventListener('click', closeSidebar);
 
       // Toggle states
-      let thinkingExpanded = true;
+      let thinkingExpanded = false;
       let toolOutputsExpanded = false;
 
       const toggleThinking = () => {
         thinkingExpanded = !thinkingExpanded;
         document.querySelectorAll('.thinking-text').forEach(el => {
-          el.style.display = thinkingExpanded ? '' : 'none';
+          el.style.display = thinkingExpanded ? 'block' : 'none';
         });
         document.querySelectorAll('.thinking-collapsed').forEach(el => {
           el.style.display = thinkingExpanded ? 'none' : 'block';
@@ -1300,17 +1775,28 @@
       // Keyboard shortcuts
       document.addEventListener('keydown', (e) => {
         if (e.key === 'Escape') {
+          if (overlayStack.length > 0) {
+            e.preventDefault();
+            popSubSession();
+            return;
+          }
           searchInput.value = '';
           searchQuery = '';
           navigateTo(leafId, 'bottom');
         }
-        if (e.ctrlKey && e.key === 't') {
+        if (e.key === 't' || e.key === 'T' || e.key === 'o' || e.key === 'O') {
+          // Skip when typing in the sidebar search (or any other editable target)
+          // so the chord can't fire on a user's letter input. Avoid Ctrl/Cmd-based
+          // chords entirely — every major browser reserves Ctrl+T (new tab) and
+          // Ctrl+O (open file), so the shortcut would never reach the page.
+          const t = e.target;
+          const editable =
+            t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable);
+          if (editable) return;
+          if (e.ctrlKey || e.metaKey || e.altKey) return;
           e.preventDefault();
-          toggleThinking();
-        }
-        if (e.ctrlKey && e.key === 'o') {
-          e.preventDefault();
-          toggleToolOutputs();
+          if (e.key === 't' || e.key === 'T') toggleThinking();
+          else toggleToolOutputs();
         }
       });
 
@@ -1325,5 +1811,28 @@
       } else if (entries.length > 0) {
         // Fallback: use last entry if no leafId
         navigateTo(entries[entries.length - 1].id, 'none');
+      }
+      } // end bootSession
+
+      function showLoadError(err) {
+        const messages = document.getElementById('messages');
+        if (!messages) return;
+        const div = document.createElement('div');
+        div.className = 'share-load-error';
+        div.textContent = 'Failed to load session: ' + (err && err.message ? err.message : String(err));
+        messages.appendChild(div);
+      }
+
+      const pending = window.__OMP_SESSION_DATA__;
+      if (pending && typeof pending.then === 'function') {
+        pending.then(bootSession, showLoadError);
+      } else {
+        const base64 = document.getElementById('session-data').textContent;
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i);
+        }
+        bootSession(JSON.parse(new TextDecoder('utf-8').decode(bytes)));
       }
     })();

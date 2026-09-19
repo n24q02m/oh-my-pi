@@ -2,8 +2,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ptree, Snowflake } from "@oh-my-pi/pi-utils";
+import { settings } from "../../config/settings";
+import type { AgentStorage } from "../../session/agent-storage";
 import { throwIfAborted } from "../../tools/tool-errors";
 import { ensureTool } from "../../utils/tools-manager";
+import { extractWithParallel, findParallelApiKey, getParallelExtractContent } from "../parallel";
 import type { RenderResult, SpecialHandler } from "./types";
 import { buildResult, formatMediaDuration, formatNumber } from "./types";
 
@@ -99,13 +102,50 @@ export const handleYouTube: SpecialHandler = async (
 	url: string,
 	timeout: number,
 	userSignal?: AbortSignal,
+	storage?: AgentStorage | null,
 ): Promise<RenderResult | null> => {
 	throwIfAborted(userSignal);
 	const yt = parseYouTubeUrl(url);
 	if (!yt) return null;
 
-	// Ensure yt-dlp is available (auto-download if missing)
 	const signal = ptree.combineSignals(userSignal, timeout * 1000);
+	const fetchedAt = new Date().toISOString();
+	const notes: string[] = [];
+	const videoUrl = `https://www.youtube.com/watch?v=${yt.videoId}`;
+
+	// Prefer Parallel extract when it sits in the reader chain and creds exist
+	const fetchPreference = settings.get("providers.fetch");
+	if ((fetchPreference === "auto" || fetchPreference === "parallel") && findParallelApiKey(storage)) {
+		try {
+			const parallelResult = await extractWithParallel(
+				[videoUrl],
+				{
+					objective: "Extract the main content of this YouTube video page",
+					excerpts: true,
+					fullContent: false,
+					signal,
+				},
+				storage,
+			);
+			const firstDocument = parallelResult.results[0];
+			if (firstDocument) {
+				const content = getParallelExtractContent(firstDocument);
+				if (content.trim().length > 100) {
+					return buildResult(content, {
+						url,
+						finalUrl: videoUrl,
+						method: "parallel",
+						fetchedAt,
+						notes: ["Used Parallel extract for YouTube"],
+					});
+				}
+			}
+		} catch {
+			throwIfAborted(signal);
+		}
+	}
+
+	// Ensure yt-dlp is available (auto-download if missing)
 	const ytdlp = await ensureTool("yt-dlp", { signal, silent: true });
 	if (!ytdlp) {
 		return {
@@ -120,9 +160,6 @@ export const handleYouTube: SpecialHandler = async (
 		};
 	}
 
-	const fetchedAt = new Date().toISOString();
-	const notes: string[] = [];
-	const videoUrl = `https://www.youtube.com/watch?v=${yt.videoId}`;
 	const execOptions = {
 		mode: "group" as const,
 		signal,
@@ -251,11 +288,16 @@ export const handleYouTube: SpecialHandler = async (
 			}
 		}
 	} finally {
-		throwIfAborted(signal);
 		// Cleanup temp files (fire-and-forget with error suppression)
 		Array.fromAsync(new Bun.Glob(`${tmpBase}*`).scan({ absolute: true }))
 			.then(tmpFiles => Promise.all(tmpFiles.map(f => fs.unlink(f).catch(() => {}))))
 			.catch(() => {});
+	}
+	// Only a user-initiated abort is fatal; the per-fetch time budget expiring
+	// just means partial metadata/transcript, which we surface as a note.
+	throwIfAborted(userSignal);
+	if (signal?.aborted) {
+		notes.push("Fetch time budget exhausted; metadata/transcript may be incomplete");
 	}
 
 	// Build markdown output

@@ -5,7 +5,11 @@
 		"fileTypes": [".rs"],
 		"rootMarkers": ["Cargo.toml", "rust-analyzer.toml"],
 		"initOptions": {},
-		"settings": {},
+		"settings": {
+			"rust-analyzer": {
+				"checkOnSave": false
+			}
+		},
 		"capabilities": {
 			"flycheck": true,
 			"ssr": true,
@@ -14,10 +18,16 @@
 			"relatedTests": true
 		}
 	},
+	"tlaplus": {
+		"command": "tlapm_lsp",
+		"args": ["--stdio"],
+		"fileTypes": [".tla", ".tlaplus"],
+		"rootMarkers": ["*.tla"]
+	},
 	"clangd": {
 		"command": "clangd",
 		"args": ["--background-index", "--clang-tidy", "--header-insertion=iwyu"],
-		"fileTypes": [".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx", ".m", ".mm"],
+		"fileTypes": [".c", ".cpp", ".cc", ".cxx", ".h", ".hpp", ".hxx", ".cu", ".cuh", ".m", ".mm"],
 		"rootMarkers": ["compile_commands.json", "CMakeLists.txt", ".clangd", ".clang-format", "Makefile"]
 	},
 	"zls": {
@@ -33,7 +43,10 @@
 		"rootMarkers": ["go.mod", "go.work", "go.sum"],
 		"settings": {
 			"gopls": {
-				"analyses": { "unusedparams": true, "shadow": true },
+				"analyses": {
+					"unusedparams": true,
+					"shadow": true
+				},
 				"staticcheck": true,
 				"gofumpt": true
 			}
@@ -53,10 +66,16 @@
 			}
 		}
 	},
+	"typescript-native": {
+		"command": "tsc",
+		"args": ["--lsp", "--stdio"],
+		"fileTypes": [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"],
+		"rootMarkers": ["package.json", "tsconfig.json", "jsconfig.json"]
+	},
 	"biome": {
 		"command": "biome",
 		"args": ["lsp-proxy"],
-		"fileTypes": [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".jsonc"],
+		"fileTypes": [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json", ".jsonc", ".css"],
 		"rootMarkers": ["biome.json", "biome.jsonc"],
 		"isLinter": true
 	},
@@ -176,6 +195,12 @@
 		"fileTypes": [".py"],
 		"rootMarkers": ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile"]
 	},
+	"ty": {
+		"command": "ty",
+		"args": ["server"],
+		"fileTypes": [".py", ".pyi"],
+		"rootMarkers": ["pyproject.toml", "ty.toml", "setup.py", "setup.cfg", "requirements.txt", "Pipfile"]
+	},
 	"ruff": {
 		"command": "ruff",
 		"args": ["server"],
@@ -189,9 +214,9 @@
 		"fileTypes": [".java"],
 		"rootMarkers": ["pom.xml", "build.gradle", "build.gradle.kts", "settings.gradle", ".project"]
 	},
-	"kotlin-language-server": {
-		"command": "kotlin-language-server",
-		"args": [],
+	"kotlin-lsp": {
+		"command": "kotlin-lsp",
+		"args": ["--stdio"],
 		"fileTypes": [".kt", ".kts"],
 		"rootMarkers": ["build.gradle", "build.gradle.kts", "pom.xml", "settings.gradle", "settings.gradle.kts"]
 	},
@@ -234,6 +259,12 @@
 				"fetchDeps": false
 			}
 		}
+	},
+	"expert": {
+		"command": "expert",
+		"args": ["--stdio"],
+		"fileTypes": [".ex", ".exs", ".heex", ".eex"],
+		"rootMarkers": ["mix.exs", "mix.lock"]
 	},
 	"erlangls": {
 		"command": "erlang_ls",
@@ -301,10 +332,18 @@
 		"rootMarkers": [".luarc.json", ".luarc.jsonc", ".luacheckrc", ".stylua.toml", "stylua.toml"],
 		"settings": {
 			"Lua": {
-				"runtime": { "version": "LuaJIT" },
-				"diagnostics": { "globals": ["vim"] },
-				"workspace": { "checkThirdParty": false },
-				"telemetry": { "enable": false }
+				"runtime": {
+					"version": "LuaJIT"
+				},
+				"diagnostics": {
+					"globals": ["vim"]
+				},
+				"workspace": {
+					"checkThirdParty": false
+				},
+				"telemetry": {
+					"enable": false
+				}
 			}
 		}
 	},
@@ -326,8 +365,12 @@
 		"fileTypes": [".cs", ".csx"],
 		"rootMarkers": ["*.sln", "*.csproj", "omnisharp.json", ".git"],
 		"settings": {
-			"FormattingOptions": { "EnableEditorConfigSupport": true },
-			"RoslynExtensionsOptions": { "EnableAnalyzersSupport": true }
+			"FormattingOptions": {
+				"EnableEditorConfigSupport": true
+			},
+			"RoslynExtensionsOptions": {
+				"EnableAnalyzersSupport": true
+			}
 		}
 	},
 	"yamlls": {
@@ -338,18 +381,18 @@
 		"settings": {
 			"yaml": {
 				"validate": true,
-				"format": { "enable": true },
+				"format": {
+					"enable": true
+				},
 				"hover": true,
 				"completion": true
 			},
-			"redhat": { "telemetry": { "enabled": false } }
+			"redhat": {
+				"telemetry": {
+					"enabled": false
+				}
+			}
 		}
-	},
-	"taplo": {
-		"command": "taplo",
-		"args": ["lsp", "stdio"],
-		"fileTypes": [".toml"],
-		"rootMarkers": [".taplo.toml", "taplo.toml", ".git"]
 	},
 	"terraformls": {
 		"command": "terraform-ls",
@@ -402,7 +445,8 @@
 		"command": "marksman",
 		"args": ["server"],
 		"fileTypes": [".md", ".markdown"],
-		"rootMarkers": [".marksman.toml", ".git"]
+		"rootMarkers": [".marksman.toml", ".git"],
+		"warmupTimeoutMs": 2000
 	},
 	"texlab": {
 		"command": "texlab",
@@ -415,7 +459,9 @@
 					"executable": "latexmk",
 					"args": ["-pdf", "-interaction=nonstopmode", "-synctex=1", "%f"]
 				},
-				"chktex": { "onOpenAndSave": true }
+				"chktex": {
+					"onOpenAndSave": true
+				}
 			}
 		}
 	},
@@ -438,7 +484,9 @@
 		"rootMarkers": [".git"],
 		"initOptions": {
 			"isNeovim": true,
-			"diagnostic": { "enable": true }
+			"diagnostic": {
+				"enable": true
+			}
 		}
 	},
 	"emmet-language-server": {
@@ -446,8 +494,7 @@
 		"args": ["--stdio"],
 		"fileTypes": [".html", ".css", ".scss", ".less", ".jsx", ".tsx", ".vue", ".svelte"],
 		"rootMarkers": [".git"]
-	}
-	,
+	},
 	"sourcekit-lsp": {
 		"command": "sourcekit-lsp",
 		"args": [],

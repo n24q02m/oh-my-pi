@@ -3,9 +3,12 @@
  *
  * Normalizes Copilot quota usage into the shared UsageReport schema.
  */
+
+import { toBoolean, toNumber } from "@oh-my-pi/pi-catalog/utils";
+import { COPILOT_GITHUB_HEADERS } from "@oh-my-pi/pi-catalog/wire/github-copilot";
+import * as AIError from "../error";
 import type {
 	UsageAmount,
-	UsageCacheEntry,
 	UsageFetchContext,
 	UsageFetchParams,
 	UsageLimit,
@@ -14,17 +17,8 @@ import type {
 	UsageStatus,
 	UsageWindow,
 } from "../usage";
-import { isRecord, toBoolean, toNumber } from "../utils";
-
-const COPILOT_HEADERS = {
-	"User-Agent": "GitHubCopilotChat/0.35.0",
-	"Editor-Version": "vscode/1.107.0",
-	"Editor-Plugin-Version": "copilot-chat/0.35.0",
-	"Copilot-Integration-Id": "vscode-chat",
-} as const;
-
-const DEFAULT_CACHE_TTL_MS = 60_000;
-const MAX_CACHE_TTL_MS = 300_000;
+import { isRecord } from "../utils";
+import { parseIsoTimestamp } from "./shared";
 
 type CopilotQuotaDetail = {
 	entitlement: number;
@@ -79,29 +73,14 @@ function resolveGitHubApiBaseUrl(params: UsageFetchParams): string {
 	return `https://api.${enterpriseUrl}`;
 }
 
-function buildCacheKey(params: UsageFetchParams): string {
-	const parts: string[] = [params.provider];
-	const { credential } = params;
-	if (credential.accountId) parts.push(credential.accountId);
-	if (credential.email) parts.push(credential.email);
-	const token =
-		credential.apiKey || credential.accessToken || credential.refreshToken || credential.metadata?.username;
-	if (token && typeof token === "string") {
-		const fingerprint = Bun.hash(token).toString(16);
-		parts.push(fingerprint);
-	}
-	return parts.join(":");
-}
-
-function buildWindow(resetDate: string | undefined, now: number): UsageWindow | undefined {
+function buildWindow(resetDate: string | undefined): UsageWindow | undefined {
 	if (!resetDate) return undefined;
-	const resetAt = Date.parse(resetDate);
-	if (!Number.isFinite(resetAt)) return undefined;
+	const resetAt = parseIsoTimestamp(resetDate);
+	if (resetAt === undefined) return undefined;
 	return {
 		id: "monthly",
 		label: "Monthly",
 		resetsAt: resetAt,
-		resetInMs: resetAt - now,
 	};
 }
 
@@ -165,7 +144,7 @@ async function fetchJson(ctx: UsageFetchContext, url: string, init: RequestInit)
 	const response = await ctx.fetch(url, init);
 	if (!response.ok) {
 		const text = await response.text();
-		throw new Error(`${response.status} ${response.statusText}: ${text}`);
+		throw new AIError.ProviderHttpError(`${response.status} ${response.statusText}: ${text}`, response.status);
 	}
 	return response.json();
 }
@@ -202,10 +181,10 @@ async function fetchInternalUsage(
 		"Content-Type": "application/json",
 		Accept: "application/json",
 		Authorization: `Bearer ${token}`,
-		...COPILOT_HEADERS,
+		...COPILOT_GITHUB_HEADERS,
 	};
 	const data = await fetchJson(ctx, `${githubApiBaseUrl}/copilot_internal/user`, { headers, signal });
-	if (!isRecord(data)) throw new Error("Invalid Copilot usage response");
+	if (!isRecord(data)) throw new AIError.ProviderHttpError("Invalid Copilot usage response", 200);
 	return data as CopilotUsageResponse;
 }
 
@@ -229,7 +208,7 @@ async function fetchBillingUsage(
 		},
 	);
 
-	if (!isRecord(data)) throw new Error("Invalid Copilot billing usage response");
+	if (!isRecord(data)) throw new AIError.ProviderHttpError("Invalid Copilot billing usage response", 200);
 	return data as BillingUsageResponse;
 }
 
@@ -267,10 +246,9 @@ function buildLimitFromQuota(
 
 function normalizeQuotaSnapshots(
 	data: CopilotUsageResponse,
-	now: number,
 	accountId?: string,
 ): { limits: UsageLimit[]; window?: UsageWindow } {
-	const window = buildWindow(data.quota_reset_date, now);
+	const window = buildWindow(data.quota_reset_date);
 	const snapshots = data.quota_snapshots ?? {};
 	const limits: UsageLimit[] = [];
 	const premium = parseQuotaDetail(snapshots.premium_interactions);
@@ -339,15 +317,6 @@ function normalizeBillingUsage(data: BillingUsageResponse): UsageLimit[] {
 	return limits;
 }
 
-function resolveCacheTtl(now: number, report: UsageReport | null): UsageCacheEntry["expiresAt"] {
-	if (!report) return now + DEFAULT_CACHE_TTL_MS;
-	const resetInMs = report.limits
-		.map(limit => limit.window?.resetInMs)
-		.find((value): value is number => typeof value === "number" && Number.isFinite(value));
-	if (!resetInMs || resetInMs <= 0) return now + DEFAULT_CACHE_TTL_MS;
-	return now + Math.min(MAX_CACHE_TTL_MS, resetInMs);
-}
-
 export const githubCopilotUsageProvider: UsageProvider = {
 	id: "github-copilot",
 	supports: ({ provider, credential }) => {
@@ -359,10 +328,6 @@ export const githubCopilotUsageProvider: UsageProvider = {
 	},
 	fetchUsage: async (params, ctx) => {
 		if (!githubCopilotUsageProvider.supports?.(params)) return null;
-		const now = ctx.now();
-		const cacheKey = buildCacheKey(params);
-		const cached = await ctx.cache.get(cacheKey);
-		if (cached && cached.expiresAt > now) return cached.value;
 
 		const githubApiBaseUrl = resolveGitHubApiBaseUrl(params);
 		let report: UsageReport | null = null;
@@ -390,7 +355,7 @@ export const githubCopilotUsageProvider: UsageProvider = {
 					);
 					report = {
 						provider: "github-copilot",
-						fetchedAt: now,
+						fetchedAt: Date.now(),
 						limits: normalizeBillingUsage(billing),
 						metadata: {
 							accountId: billing.user,
@@ -405,10 +370,10 @@ export const githubCopilotUsageProvider: UsageProvider = {
 			if (!report && params.credential.apiKey) {
 				try {
 					const usage = await fetchInternalUsage(ctx, githubApiBaseUrl, params.credential.apiKey, params.signal);
-					const normalized = normalizeQuotaSnapshots(usage, now, username);
+					const normalized = normalizeQuotaSnapshots(usage, username);
 					report = {
 						provider: "github-copilot",
-						fetchedAt: now,
+						fetchedAt: Date.now(),
 						limits: normalized.limits,
 						metadata: {
 							accountId: username,
@@ -437,10 +402,10 @@ export const githubCopilotUsageProvider: UsageProvider = {
 				if (!accountId && accessToken) {
 					accountId = await resolveGitHubUsername(ctx, githubApiBaseUrl, accessToken, params.signal);
 				}
-				const normalized = normalizeQuotaSnapshots(usage, now, accountId);
+				const normalized = normalizeQuotaSnapshots(usage, accountId);
 				report = {
 					provider: "github-copilot",
-					fetchedAt: now,
+					fetchedAt: Date.now(),
 					limits: normalized.limits,
 					metadata: {
 						accountId,
@@ -455,8 +420,6 @@ export const githubCopilotUsageProvider: UsageProvider = {
 			}
 		}
 
-		const expiresAt = resolveCacheTtl(now, report);
-		await ctx.cache.set(cacheKey, { value: report, expiresAt });
 		return report;
 	},
 };

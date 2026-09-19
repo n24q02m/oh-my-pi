@@ -1,17 +1,25 @@
-import { describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it } from "bun:test";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { createSessionTeardown } from "@oh-my-pi/pi-coding-agent/modes/session-teardown";
+import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import {
 	collectPendingToolCalls,
 	createInterruptedTurnAbortMessage,
 	describePendingToolCalls,
-	findLastSessionLiveness,
 	SESSION_EXIT_CUSTOM_TYPE,
-	SESSION_LIVENESS_CUSTOM_TYPE,
-	type SessionLivenessData,
 	TOOL_EXECUTION_START_CUSTOM_TYPE,
 	type ToolExecutionStartData,
 } from "@oh-my-pi/pi-coding-agent/session/exit-diagnostics";
+import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { postmortem, TempDir } from "@oh-my-pi/pi-utils";
 
 const pendingAssistant: AssistantMessage = {
 	role: "assistant",
@@ -38,7 +46,203 @@ const pendingAssistant: AssistantMessage = {
 	timestamp: Date.now(),
 };
 
-describe("session exit diagnostics replay", () => {
+describe("session exit diagnostics", () => {
+	let session: AgentSession | undefined;
+	let authStorage: AuthStorage | undefined;
+	let tempDir: TempDir | undefined;
+
+	afterEach(async () => {
+		await session?.dispose();
+		session = undefined;
+		authStorage?.close();
+		authStorage = undefined;
+		tempDir?.removeSync();
+		tempDir = undefined;
+	});
+
+	it("records a durable tool start marker and shutdown diagnostic before a pending result exists", async () => {
+		tempDir = TempDir.createSync("@pi-session-exit-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const agent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+
+		agent.emitExternalEvent({ type: "message_end", message: pendingAssistant });
+		await Promise.resolve();
+		agent.emitExternalEvent({
+			type: "tool_execution_start",
+			toolCallId: "toolu_repro",
+			toolName: "bash",
+			args: { command: "bun run check:ts" },
+		});
+		await Promise.resolve();
+
+		const marker = sessionManager
+			.getEntries()
+			.find(entry => entry.type === "custom" && entry.customType === TOOL_EXECUTION_START_CUSTOM_TYPE);
+		if (marker?.type !== "custom") throw new Error("Expected tool execution start marker");
+		expect(marker.data).toMatchObject({
+			toolCallId: "toolu_repro",
+			toolName: "bash",
+			args: { command: "bun run check:ts" },
+		});
+
+		const pending = collectPendingToolCalls(sessionManager.getBranch());
+		expect(pending).toMatchObject([
+			{
+				toolCallId: "toolu_repro",
+				toolName: "bash",
+				args: { command: "bun run check:ts" },
+			},
+		]);
+		expect(describePendingToolCalls(sessionManager.getBranch())).toContain("bun run check:ts");
+
+		await session.dispose();
+		session = undefined;
+		// dispose() released the in-memory transcript; the exit marker's contract
+		// is durability, so assert against the persisted file.
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+		const reopened = await SessionManager.open(sessionFile, tempDir.path());
+		const exitEntry = reopened
+			.getEntries()
+			.find(entry => entry.type === "custom" && entry.customType === SESSION_EXIT_CUSTOM_TYPE);
+		await reopened.close();
+		if (exitEntry?.type !== "custom") throw new Error("Expected session exit marker");
+		expect(exitEntry.data).toMatchObject({
+			reason: "dispose",
+			kind: "normal",
+			pendingToolCalls: [
+				{
+					toolCallId: "toolu_repro",
+					toolName: "bash",
+					args: { command: "bun run check:ts" },
+				},
+			],
+		});
+	});
+
+	it("signal teardown persists the postmortem reason, not the generic dispose", async () => {
+		tempDir = TempDir.createSync("@pi-session-exit-signal-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		authStorage.setRuntimeApiKey("anthropic", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const agent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+		const activeSession = session;
+
+		// The assistant message persists through an async queue; the tool start
+		// marker is appended synchronously and is what makes the session durable
+		// enough for #recordSessionExit to write the exit entry (same setup as
+		// the plain-dispose test above).
+		agent.emitExternalEvent({ type: "message_end", message: pendingAssistant });
+		await Promise.resolve();
+		agent.emitExternalEvent({
+			type: "tool_execution_start",
+			toolCallId: "toolu_repro",
+			toolName: "bash",
+			args: { command: "bun run check:ts" },
+		});
+		await Promise.resolve();
+
+		// Mirror InteractiveMode.init(): the postmortem "session-teardown"
+		// callback runs FIRST on SIGTERM/SIGHUP/uncaughtException (reverse
+		// registration order) and calls dispose(). Without reason threading,
+		// #doDispose would persist the generic "dispose"/"normal" and cancel the
+		// reason-specific agent-session recorder — losing the real trigger.
+		const teardown = createSessionTeardown({
+			getDraftText: () => "",
+			beginDispose: () => activeSession.beginDispose(),
+			saveDraft: async () => {},
+			disposeSession: reason => activeSession.dispose({ reason }),
+		});
+
+		await teardown(postmortem.Reason.SIGTERM);
+		session = undefined;
+
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+		const reopened = await SessionManager.open(sessionFile, tempDir.path());
+		const exitEntry = reopened
+			.getEntries()
+			.find(entry => entry.type === "custom" && entry.customType === SESSION_EXIT_CUSTOM_TYPE);
+		await reopened.close();
+		if (exitEntry?.type !== "custom") throw new Error("Expected session exit marker");
+		expect(exitEntry.data).toMatchObject({
+			reason: "sigterm",
+			kind: "signal",
+		});
+	});
+
+	it("does not materialize an empty session just to write an exit marker", async () => {
+		tempDir = TempDir.createSync("@pi-empty-session-exit-");
+		authStorage = await AuthStorage.create(path.join(tempDir.path(), "auth.db"));
+		const modelRegistry = new ModelRegistry(authStorage);
+		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const sessionManager = SessionManager.create(tempDir.path(), tempDir.path());
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected persistent session file path");
+		const agent = new Agent({
+			initialState: {
+				model,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			convertToLlm,
+		});
+		session = new AgentSession({
+			agent,
+			sessionManager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+
+		await session.dispose();
+		session = undefined;
+
+		expect(fs.existsSync(sessionFile)).toBe(false);
+		expect(
+			sessionManager
+				.getEntries()
+				.some(entry => entry.type === "custom" && entry.customType === SESSION_EXIT_CUSTOM_TYPE),
+		).toBe(false);
+	});
+
 	it("treats assistant tool calls as pending even when stopReason is not toolUse", () => {
 		const sessionManager = SessionManager.inMemory();
 		sessionManager.appendMessage({ ...pendingAssistant, stopReason: "stop" });
@@ -103,6 +307,18 @@ describe("session exit diagnostics replay", () => {
 			stopReason: "aborted",
 		});
 		expect(recovered?.errorMessage).toContain("process exited");
+
+		sessionManager.appendMessage(recovered!);
+		expect(createInterruptedTurnAbortMessage(sessionManager.getBranch())).toBeUndefined();
+		expect(
+			sessionManager
+				.buildSessionContext()
+				.messages.some(
+					message =>
+						message.role === "toolResult" &&
+						message.content.some(part => part.type === "text" && part.text === "partial result stays in history"),
+				),
+		).toBe(true);
 	});
 
 	it("reconstructs a normal exit that reports pending tool calls", () => {
@@ -253,59 +469,5 @@ describe("session exit diagnostics replay", () => {
 		expect(createInterruptedTurnAbortMessage(normalExit.getBranch())).toBeUndefined();
 		expect(createInterruptedTurnAbortMessage(completedTurn.getBranch())).toBeUndefined();
 		expect(createInterruptedTurnAbortMessage(supersededExit.getBranch())).toBeUndefined();
-	});
-
-	it("reconstructs an unclosed liveness tail when the prior process outcome was not observable", () => {
-		const sessionManager = SessionManager.inMemory();
-		sessionManager.appendMessage({ role: "user", content: "inspect the file", timestamp: Date.now() });
-		sessionManager.appendMessage(pendingAssistant);
-		const liveness = {
-			recordedAt: "2026-07-11T02:20:08.800Z",
-			operationId: "toolu_repro",
-			operation: "tool_execution",
-			phase: "start",
-			toolName: "bash",
-		} satisfies SessionLivenessData;
-		sessionManager.appendCustomEntry(SESSION_LIVENESS_CUSTOM_TYPE, liveness);
-
-		const recovered = createInterruptedTurnAbortMessage(sessionManager.getBranch());
-
-		expect(recovered).toMatchObject({
-			role: "assistant",
-			stopReason: "aborted",
-		});
-		expect(recovered?.errorMessage).toContain("could not be observed");
-	});
-
-	it("does not recover a completed tool operation as interrupted", () => {
-		const sessionManager = SessionManager.inMemory();
-		const operationId = "toolu_repro";
-		sessionManager.appendMessage({ role: "user", content: "inspect the file", timestamp: Date.now() });
-		sessionManager.appendMessage(pendingAssistant);
-		sessionManager.appendCustomEntry(SESSION_LIVENESS_CUSTOM_TYPE, {
-			recordedAt: "2026-07-11T02:20:08.800Z",
-			operation: "tool_execution",
-			operationId,
-			phase: "start",
-			toolName: "bash",
-		});
-		sessionManager.appendMessage({
-			role: "toolResult",
-			toolCallId: "toolu_repro",
-			toolName: "bash",
-			content: [{ type: "text", text: "ok" }],
-			isError: false,
-			timestamp: Date.now(),
-		});
-		sessionManager.appendCustomEntry(SESSION_LIVENESS_CUSTOM_TYPE, {
-			recordedAt: "2026-07-11T02:20:09.800Z",
-			operation: "tool_execution",
-			operationId,
-			phase: "end",
-			toolName: "bash",
-		});
-
-		expect(findLastSessionLiveness(sessionManager.getBranch())).toBeUndefined();
-		expect(createInterruptedTurnAbortMessage(sessionManager.getBranch())).toBeUndefined();
 	});
 });

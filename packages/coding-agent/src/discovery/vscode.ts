@@ -83,6 +83,7 @@ async function loadMCPConfig(
 
 		const server: MCPServer = {
 			name,
+			enabled: typeof expanded.enabled === "boolean" ? expanded.enabled : undefined,
 			command: typeof expanded.command === "string" ? expanded.command : undefined,
 			args: Array.isArray(expanded.args) ? (expanded.args as string[]) : undefined,
 			env: expanded.env && typeof expanded.env === "object" ? (expanded.env as Record<string, string>) : undefined,
@@ -94,6 +95,7 @@ async function loadMCPConfig(
 			transport: ["stdio", "sse", "http"].includes(expanded.transport as string)
 				? (expanded.transport as "stdio" | "sse" | "http")
 				: undefined,
+			timeout: typeof expanded.timeout === "number" ? expanded.timeout : undefined,
 			_source: createSourceMeta(PROVIDER_ID, path, level),
 		};
 
