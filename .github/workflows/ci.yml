@@ -239,8 +239,29 @@ jobs:
          - uses: actions/checkout@v4
 
          # ---- PR path: latest release addons from npm ----
-         - name: Fetch release native addons (npm)
+         # The release addons are only valid test artifacts while the workspace
+         # natives state IS the released state. When the workspace version
+         # drifts from npm@latest (native changes on main awaiting release),
+         # the published addon predates the checkout's Rust sources and every
+         # native-backed suite would test against a stale addon — build the
+         # linux-x64 pair from source instead.
+         - name: Resolve native addon source
            if: github.event_name == 'pull_request'
+           id: addon_source
+           shell: bash
+           run: |
+              set -euo pipefail
+              released="$(npm view @oh-my-pi/pi-natives-linux-x64@latest version 2>/dev/null || true)"
+              workspace="$(node -p "require('./packages/natives/package.json').version")"
+              if [ -n "$released" ] && [ "$released" = "$workspace" ]; then
+                echo "build_needed=false" >> "$GITHUB_OUTPUT"
+                echo "Release addons $released match the workspace; testing against npm artifacts."
+              else
+                echo "build_needed=true" >> "$GITHUB_OUTPUT"
+                echo "Workspace natives $workspace differ from latest release ${released:-<unresolvable>}; building from source."
+              fi
+         - name: Fetch release native addons (npm)
+           if: github.event_name == 'pull_request' && steps.addon_source.outputs.build_needed == 'false'
            shell: bash
            run: |
               set -euo pipefail
@@ -253,7 +274,7 @@ jobs:
          # A corrupt download must fail here, not as a confusing dlopen error
          # in every downstream test shard.
          - name: Smoke release addons
-           if: github.event_name == 'pull_request'
+           if: github.event_name == 'pull_request' && steps.addon_source.outputs.build_needed == 'false'
            shell: bash
            run: |
               set -euo pipefail
@@ -288,6 +309,22 @@ jobs:
                 echo "::notice title=Native sources changed::PR CI tests against the latest release addons by design; native changes are validated post-merge on main and at release."
               fi
 
+         # ---- PR path: source build when release addons drifted ----
+         - id: cache_pr
+           if: github.event_name == 'pull_request' && steps.addon_source.outputs.build_needed == 'true'
+           uses: ./.github/actions/bazel-cache
+           with:
+              scope: linux
+         - name: Build native addons from source (release drift)
+           if: github.event_name == 'pull_request' && steps.addon_source.outputs.build_needed == 'true'
+           run: |
+              set -eo pipefail
+              if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
+              for target in \
+                natives-linux-x64-baseline \
+                natives-linux-x64-modern; do
+                bazelisk --bazelrc="${{ steps.cache_pr.outputs.rc }}" build "//:$target"
+              done
          # ---- main path: bazel build of all Linux-hosted targets ----
          - id: cache
            if: github.event_name != 'pull_request'
