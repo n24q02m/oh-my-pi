@@ -240,11 +240,11 @@ jobs:
 
          # ---- PR path: latest release addons from npm ----
          # The release addons are only valid test artifacts while the workspace
-         # natives state IS the released state. When the workspace version
-         # drifts from npm@latest (native changes on main awaiting release),
-         # the published addon predates the checkout's Rust sources and every
-         # native-backed suite would test against a stale addon — build the
-         # linux-x64 pair from source instead.
+         # natives state IS the released state. When the workspace drifts from
+         # npm@latest — by version or by native-source content since the
+         # release cut — the published addon predates the checkout's Rust
+         # sources and every native-backed suite would test against a stale
+         # addon: build the linux-x64 pair from source instead.
          - name: Resolve native addon source
            if: github.event_name == 'pull_request'
            id: addon_source
@@ -254,8 +254,28 @@ jobs:
               released="$(npm view @oh-my-pi/pi-natives-linux-x64@latest version 2>/dev/null || true)"
               workspace="$(node -p "require('./packages/natives/package.json').version")"
               if [ -n "$released" ] && [ "$released" = "$workspace" ]; then
-                echo "build_needed=false" >> "$GITHUB_OUTPUT"
-                echo "Release addons $released match the workspace; testing against npm artifacts."
+                # Equal versions do not prove equal bits: native changes on
+                # main since the release cut leave the released addon stale
+                # while version strings still match, and PR CI silently tests
+                # native behavior that no longer exists in the source tree.
+                # Diff the native sources against the release tag; fall back
+                # to the npm artifacts when the tag is unreachable.
+                release_ref="refs/natives-release/v${released}"
+                if git fetch -q --no-tags --depth=1 origin "refs/tags/v${released}:${release_ref}" 2>/dev/null; then
+                  if ! git diff --quiet "${release_ref}" HEAD -- \
+                      crates/ bazel/ MODULE.bazel MODULE.bazel.lock BUILD.bazel \
+                      .bazelrc .bazelignore .bazelversion Cargo.toml Cargo.lock \
+                      rust-toolchain.toml rustfmt.toml; then
+                    echo "build_needed=true" >> "$GITHUB_OUTPUT"
+                    echo "Native sources changed since release $released despite the matching version; building from source."
+                  else
+                    echo "build_needed=false" >> "$GITHUB_OUTPUT"
+                    echo "Release addons $released match the workspace and the native sources are unchanged since the release; testing against npm artifacts."
+                  fi
+                else
+                  echo "build_needed=false" >> "$GITHUB_OUTPUT"
+                  echo "Release tag v${released} is unavailable on this remote; falling back to the npm artifacts."
+                fi
               else
                 echo "build_needed=true" >> "$GITHUB_OUTPUT"
                 echo "Workspace natives $workspace differ from latest release ${released:-<unresolvable>}; building from source."
