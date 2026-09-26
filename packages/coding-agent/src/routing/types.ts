@@ -31,6 +31,8 @@ export interface TierSpec {
 /** A tier bound to a concrete pool model. */
 export interface ModelTier extends TierSpec {
 	model: Model;
+	/** Prefix-cache TTL for the sticky hold, minutes; carried through from the `ConfiguredTier`. */
+	ttlMinutes?: number;
 }
 
 export type RouteReason =

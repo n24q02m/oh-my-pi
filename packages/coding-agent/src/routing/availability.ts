@@ -15,6 +15,12 @@ export interface ConfiguredTier {
 	capability: string;
 	/** Reporting only; the router never optimizes cost directly. */
 	costHintUsdPerMTokOut?: number;
+	/**
+	 * Prefix-cache TTL for the sticky hold, in minutes. Provider cache lifetimes
+	 * differ per provider (Anthropic ~5 min sliding, OpenAI varies), so this is
+	 * per-tier config; omit to use `jevRouting.sticky.defaultTtlMinutes`.
+	 */
+	ttlMinutes?: number;
 	availability?: TierAvailability;
 }
 
@@ -35,6 +41,7 @@ export function toJevTiers(value: unknown): ConfiguredTier[] {
 			capability: record.capability,
 		};
 		if (typeof record.costHintUsdPerMTokOut === "number") tier.costHintUsdPerMTokOut = record.costHintUsdPerMTokOut;
+		if (typeof record.ttlMinutes === "number" && record.ttlMinutes > 0) tier.ttlMinutes = record.ttlMinutes;
 		if (record.availability && typeof record.availability === "object") {
 			tier.availability = record.availability as TierAvailability;
 		}

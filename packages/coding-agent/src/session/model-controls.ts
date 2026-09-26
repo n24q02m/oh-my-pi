@@ -1,5 +1,12 @@
 import { type Agent, ThinkingLevel } from "@oh-my-pi/pi-agent-core";
-import type { Model, ProviderSessionState, ServiceTier, ServiceTierByFamily, ServiceTierFamily } from "@oh-my-pi/pi-ai";
+import type {
+	Model,
+	ProviderSessionState,
+	ServiceTier,
+	ServiceTierByFamily,
+	ServiceTierFamily,
+	Usage,
+} from "@oh-my-pi/pi-ai";
 import { Effort, realizesPriorityServiceTier, resolveModelServiceTier, serviceTierFamily } from "@oh-my-pi/pi-ai";
 import {
 	clearAnthropicFastModeFallback,
@@ -36,6 +43,15 @@ import type { EditMode } from "@oh-my-pi/pi-tui/tools/edit";
 import type { AgentSessionEvent } from "./agent-session-events";
 import type { ModelCycleResult, ResolvedRoleModel, RoleModelCycle, RoleModelCycleResult } from "./agent-session-types";
 import { formatRoleModelValue, resolveRoleModelFull } from "./role-models";
+import {
+	escalationsForceReroute,
+	isLargeContext,
+	lastTurnWarmth,
+	resolveStickyConfig,
+	stickyGate,
+	tierTtlMs,
+	type StickyHold,
+} from "../routing/sticky";
 import {
 	filterAvailable,
 	resolveRoutingJudge,
@@ -80,6 +96,8 @@ export interface ModelControlsHost {
 	emit(event: AgentSessionEvent): void;
 	emitSessionEvent(event: AgentSessionEvent): Promise<void>;
 	emitNotice(level: "info" | "warning" | "error", message: string, source?: string): void;
+	/** Session facts the sticky routing gate reads per turn: the compaction epoch and the live context estimate. */
+	routingContext(): { compactionEpoch: number; contextTokens?: number };
 }
 
 /** Owns model selection, thinking effort, role cycling, and service tiers. */
@@ -689,6 +707,18 @@ export class ModelControls {
 
 	/** Tier id the router last placed this session on; `undefined` until routing first engages. */
 	#routedTierId: string | undefined;
+	/**
+	 * Sticky hold for the current session segment (routing/sticky.ts): the tier
+	 * routing resolved, the compaction epoch it was resolved in, and the
+	 * idle-gap clock. Per-session state — nothing process-global: a new session
+	 * starts unheld, compaction ends the segment, and the per-tier TTL or the
+	 * escalation escape hatch ends it early.
+	 */
+	#stickyHold: StickyHold | undefined;
+	/** User-turn indices where a routed turn escalated, within the current segment — the escape hatch's window. */
+	#routingEscalationTurns: number[] = [];
+	/** User turns the sticky gate has seen; the escape window's clock. */
+	#routingTurn = 0;
 
 	/**
 	 * Per-turn Jev model-tier routing (spec: jev-routing-spec.md). Runs BEFORE
@@ -704,8 +734,12 @@ export class ModelControls {
 	 * - User override: a current model outside the pool that routing did NOT
 	 *   place (`#routedTierId` unset) is treated as an explicit user choice —
 	 *   routing does not touch it.
-	 * - Sticky-session: none — every user turn re-routes fresh (spec §7 leaves
-	 *   this to the implementation; re-probing is the conservative choice).
+	 * - Sticky hold (routing/sticky.ts): a resolved tier is held for the session
+	 *   segment — the judge only runs at session start, after a compaction, when
+	 *   the tier's cache TTL expires, or when the escalation escape hatch fires.
+	 *   A hold skips the judgment call only while the prefix cache is
+	 *   demonstrably warm; without a cache-warmth signal the gate falls back to
+	 *   re-routing fresh (the pre-sticky conservative behavior).
 	 * - Never throws into the turn.
 	 */
 	async applyJevRouting(promptText: string, generation: number): Promise<void> {
@@ -725,8 +759,15 @@ export class ModelControls {
 		}
 		if (tiers.length < 2) return;
 
+		const sticky = resolveStickyConfig(this.#host.settings);
+		const snapshot = this.#host.routingContext();
+		const nowMs = Date.now();
+		++this.#routingTurn;
+
 		// Layer-0: deterministic availability filter before any judgment call.
-		const filtered = filterAvailable(tiers, {});
+		// The live context size feeds `maxContextTokens` gating; a held tier the
+		// filter excludes (window, quota, context ceiling) cannot be held.
+		const filtered = filterAvailable(tiers, { contextTokens: snapshot.contextTokens });
 		if (filtered.available.length === 0) {
 			this.#host.emitNotice(
 				"warning",
@@ -741,12 +782,58 @@ export class ModelControls {
 		// User override: a current model outside the pool that routing did not
 		// place is an explicit choice — leave it alone.
 		const currentInPool = current !== undefined && tiers.some(t => modelsAreEqual(t.model, current));
-		if (!currentInPool && this.#routedTierId === undefined) return;
+		const currentTier = currentInPool ? tiers.find(t => modelsAreEqual(t.model, current)) : undefined;
+		if (!currentInPool) {
+			if (this.#routedTierId === undefined) return;
+			// The user left the pool after routing engaged: the old hold no longer
+			// describes the session. Re-route fresh.
+			this.#stickyHold = undefined;
+		} else if (this.#stickyHold && currentTier && this.#stickyHold.tierId !== currentTier.id) {
+			// Explicit in-pool model switch: the user's pick is authoritative —
+			// adopt it as the held tier for the rest of the segment.
+			this.#stickyHold = { tierId: currentTier.id, compactionEpoch: snapshot.compactionEpoch, lastTurnAtMs: nowMs };
+			this.#routingEscalationTurns = [];
+			return;
+		}
+
+		// Sticky gate: decides whether the judge runs at all this turn.
+		let routeUpOnly = false;
+		const hold = this.#stickyHold;
+		if (sticky.enabled && hold && currentTier && hold.tierId === currentTier.id) {
+			const warmth = lastTurnWarmth(this.#lastAssistantTurn(), currentTier.model);
+			const gate = stickyGate(hold, {
+				epoch: snapshot.compactionEpoch,
+				nowMs,
+				ttlMs: tierTtlMs(currentTier, sticky),
+				warmth,
+				largeContext: isLargeContext(snapshot.contextTokens, top.model.contextWindow),
+			});
+			if (
+				gate.action === "hold" &&
+				filtered.available.some(t => t.id === currentTier.id) &&
+				this.#host.promptGeneration() === generation
+			) {
+				// Cache-warm sticky hold: no judgment call, no tier switch.
+				hold.lastTurnAtMs = nowMs;
+				return;
+			}
+			routeUpOnly = gate.action === "reroute" ? gate.routeUpOnly : false;
+		}
+
+		// Fresh route: the judge only sees the tiers Layer-0 left available. On an
+		// expired-but-still-warm large context the decision is route-up-only — the
+		// held tier and above, never a cheaper cold prefill of a long context.
+		let candidates = filtered.available;
+		if (routeUpOnly && currentTier) {
+			const heldIndex = tiers.findIndex(t => t.id === currentTier.id);
+			const upward = filtered.available.filter(t => tiers.findIndex(x => x.id === t.id) >= heldIndex);
+			if (upward.length > 0) candidates = upward;
+		}
 
 		let decision: RouteDecision;
-		if (filtered.available.length === 1) {
+		if (candidates.length === 1) {
 			// Arithmetic already decided — no judgment call needed.
-			decision = { tier: filtered.available[0].id, reason: "jev-confident" };
+			decision = { tier: candidates[0].id, reason: "jev-confident" };
 		} else {
 			const judge = resolveRoutingJudge({
 				settings: this.#host.settings,
@@ -757,7 +844,7 @@ export class ModelControls {
 			});
 			if (!judge) return; // no TypeSafe auth -> no router -> keep current
 			try {
-				decision = await routeTurn(judge, promptText, filtered.available, this.#routingPolicy());
+				decision = await routeTurn(judge, promptText, candidates, this.#routingPolicy());
 			} catch (error) {
 				// Caller abort propagates; anything else is fail-expensive.
 				if (this.#host.promptGeneration() !== generation) return;
@@ -773,6 +860,9 @@ export class ModelControls {
 
 		const target = tiers.find(t => t.id === decision.tier) ?? top;
 		this.#routedTierId = target.id;
+		// (Re-)arm the sticky hold: the segment continues from this decision.
+		this.#stickyHold = { tierId: target.id, compactionEpoch: snapshot.compactionEpoch, lastTurnAtMs: nowMs };
+		this.#routingEscalationTurns = [];
 		if (current && modelsAreEqual(target.model, current)) return;
 		try {
 			await this.setModelTemporary(target.model, undefined, { ephemeral: true });
@@ -785,6 +875,44 @@ export class ModelControls {
 			logger.debug("jev-routing: model switch failed; staying on current model", {
 				error: error instanceof Error ? error.message : String(error),
 			});
+		}
+	}
+
+	/**
+	 * Usage of the most recent assistant turn — the sticky gate's cache-warmth
+	 * signal. `undefined` (or a turn from another model) means the signal is
+	 * missing, and the gate falls back to re-routing fresh.
+	 */
+	#lastAssistantTurn(): { provider: string; model: string; usage: Usage } | undefined {
+		const messages = this.#host.agent.state.messages;
+		for (let i = messages.length - 1; i >= 0; i--) {
+			const message = messages[i];
+			if (message.role !== "assistant") continue;
+			const { provider, model, usage } = message;
+			if (!usage) return undefined; // legacy transcript without usage metadata
+			return { provider, model, usage };
+		}
+		return undefined;
+	}
+
+	/**
+	 * Records that a routed turn escalated mid-turn (the routing verdict was
+	 * re-run on a stronger tier — `routing/route.ts` `verifyAndEscalate`). When
+	 * `jevRouting.sticky.escapeThreshold` escalations land within
+	 * `jevRouting.sticky.escapeWindowTurns` turns, the sticky segment pinned the
+	 * wrong tier: the hold and its escalation log clear, forcing a fresh route
+	 * on the next turn.
+	 *
+	 * Call this from the turn path that observes the escalation decision; the
+	 * counter, window, and prefix clearing are fully live here.
+	 */
+	noteRoutingEscalation(): void {
+		if (!cfgJevRoutingEnabled.get(this.#host.settings)) return;
+		const config = resolveStickyConfig(this.#host.settings);
+		this.#routingEscalationTurns.push(this.#routingTurn);
+		if (escalationsForceReroute(this.#routingEscalationTurns, this.#routingTurn, config)) {
+			this.#stickyHold = undefined;
+			this.#routingEscalationTurns = [];
 		}
 	}
 

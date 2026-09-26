@@ -33,6 +33,11 @@ import {
 } from "../tiny/dtype";
 import { DEFAULT_TTS_VOICE, TTS_LOCAL_VOICE_OPTIONS, TTS_LOCAL_VOICE_VALUES } from "../tts/models";
 import { EDIT_MODES } from "../edit/settings";
+import {
+	DEFAULT_STICKY_ESCAPE_THRESHOLD,
+	DEFAULT_STICKY_ESCAPE_WINDOW_TURNS,
+	DEFAULT_STICKY_TTL_MINUTES,
+} from "../routing/settings";
 import { DEFAULT_WEB_SEARCH_TIMEOUT_SECONDS, MAX_WEB_SEARCH_TIMEOUT_SECONDS } from "../web/search/types";
 import {
 	SERVICE_TIER_ANTHROPIC_OPTIONS,
@@ -5695,6 +5700,53 @@ export const SETTINGS_SCHEMA = {
 			condition: "jevRoutingActive",
 		},
 	},
+	"jevRouting.sticky.enabled": {
+		type: "boolean",
+		default: true,
+		ui: {
+			tab: "model",
+			group: "Routing",
+			label: "Sticky Tier Hold",
+			description:
+				"Hold the routed tier across turns instead of re-judging every turn — a per-turn switch cold-prefills the target exactly when the current prefix cache is warmest. The hold ends at a compaction, an idle gap longer than the tier's cache TTL, or when escalations breach the escape window. Without a cache-warmth signal the gate falls back to re-routing fresh.",
+			condition: "jevRoutingActive",
+		},
+	},
+	"jevRouting.sticky.defaultTtlMinutes": {
+		type: "number",
+		default: DEFAULT_STICKY_TTL_MINUTES,
+		ui: {
+			tab: "model",
+			group: "Routing",
+			label: "Sticky TTL (minutes)",
+			description:
+				"Idle gap after which a held tier is re-probed, for tiers without their own ttlMinutes. Prefix-cache lifetimes differ per provider (Anthropic ~5 min sliding, OpenAI varies by tier/load) — prefer per-tier ttlMinutes in jevRouting.tiers.",
+			condition: "jevRoutingActive",
+		},
+	},
+	"jevRouting.sticky.escapeThreshold": {
+		type: "number",
+		default: DEFAULT_STICKY_ESCAPE_THRESHOLD,
+		ui: {
+			tab: "model",
+			group: "Routing",
+			label: "Sticky Escape Threshold",
+			description:
+				"Escalations within the window that end the sticky segment early — the hold pinned the wrong tier, so the next turn re-routes fresh.",
+			condition: "jevRoutingActive",
+		},
+	},
+	"jevRouting.sticky.escapeWindowTurns": {
+		type: "number",
+		default: DEFAULT_STICKY_ESCAPE_WINDOW_TURNS,
+		ui: {
+			tab: "model",
+			group: "Routing",
+			label: "Sticky Escape Window (turns)",
+			description: "Rolling window of user turns the escape threshold counts escalations in.",
+			condition: "jevRoutingActive",
+		},
+	},
 	"features.unexpectedStopDetection": {
 		type: "enum",
 		values: ["none", "mechanical", "smart"] as const,
@@ -6338,6 +6390,11 @@ export interface JevRoutingTier {
 	model: string;
 	/** Free-text eligibility test handed to the judge — never a model name. */
 	capability: string;
+	/**
+	 * Prefix-cache TTL for the sticky hold, in minutes. Provider cache lifetimes
+	 * differ per provider; omit to use `jevRouting.sticky.defaultTtlMinutes`.
+	 */
+	ttlMinutes?: number;
 	availability?: {
 		window?: { startHour: number; endHour: number; utcOffsetMinutes: number };
 		maxContextTokens?: number;
